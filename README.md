@@ -89,7 +89,9 @@ If you want the current source of truth, start here:
 
 ## Phase 0 Bring-Up
 
-Copy `.env.example` to `.env`, then:
+Copy `.env.example` to `.env`. The example file keeps the database URL pointed at
+`localhost:5433` for host-run commands like `python -m paper_context.cli serve`; the Compose
+services override that hostname to `db:5432` internally. Then:
 
 ```bash
 uv sync --extra dev

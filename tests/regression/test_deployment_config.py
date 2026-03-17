@@ -44,13 +44,24 @@ def test_no_standalone_mcp_port_exposed() -> None:
     assert "8001:8001" not in _compose_text()
 
 
-def test_migrate_service_isan_isolated_runner() -> None:
+def test_migrate_service_is_an_isolated_runner() -> None:
     block = _service_block(_compose_text(), "migrate")
     assert "alembic" in block
     assert "upgrade" in block
     assert "head" in block
     assert "profiles:" in block
     assert "- migrate" in block
+    assert "PAPER_CONTEXT_DATABASE__URL" in block
+    assert "@db:5432/" in block
+
+
+@pytest.mark.parametrize("service", ["app", "worker", "migrate"])
+def test_compose_services_override_database_hostname_for_container_network(
+    service: str,
+) -> None:
+    block = _service_block(_compose_text(), service)
+    assert "PAPER_CONTEXT_DATABASE__URL" in block
+    assert "@db:5432/" in block
 
 
 def test_worker_depends_on_app_service() -> None:

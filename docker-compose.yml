@@ -78,6 +78,8 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      PAPER_CONTEXT_DATABASE__URL: postgresql+psycopg://paper_context:paper_context@db:5432/paper_context
     depends_on:
       db:
         condition: service_healthy
