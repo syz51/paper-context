@@ -119,7 +119,8 @@ The repo targets Python 3.14 and includes a local and hosted quality gate:
 - Local hooks: `uv run pre-commit install --hook-type pre-commit --hook-type pre-push`
 - Manual full run: `uv run pre-commit run --all-files`
 - Type checking: `uv run mypy src`
-- Tests: `uv run pytest`
+- Tests with coverage gate: `uv run pytest`
+- Coverage threshold: `99%` total coverage enforced in `pytest`, local pre-commit/pre-push hooks, and GitHub Actions
 
 GitHub Actions mirrors that baseline with a PR/push quality workflow and a separate security workflow for dependency review and CodeQL scanning.
 

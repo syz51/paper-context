@@ -36,10 +36,12 @@ repos:
           - bandit[toml]
   - repo: local
     hooks:
-      - id: pytest
-        name: pytest
+      - id: pytest-coverage
+        name: pytest (coverage)
         entry: uv run pytest
         language: system
         pass_filenames: false
+        always_run: true
         stages:
+          - pre-commit
           - pre-push

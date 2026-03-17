@@ -27,6 +27,7 @@ dev = [
   "mypy>=1.15,<2.0",
   "pre-commit>=4.5.1,<5.0",
   "pytest>=9.0.2,<10.0",
+  "pytest-cov>=7.0.0,<8.0.0",
   "ruff>=0.11,<1.0",
 ]
 
@@ -39,6 +40,21 @@ packages = ["src/paper_context"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = [
+  "--cov=paper_context",
+  "--cov-branch",
+  "--cov-report=term-missing",
+]
+
+[tool.coverage.run]
+branch = true
+data_file = ".pytest_cache/.coverage"
+source = ["paper_context"]
+
+[tool.coverage.report]
+fail_under = 99
+show_missing = true
+skip_covered = false
 
 [tool.ruff]
 target-version = "py314"
