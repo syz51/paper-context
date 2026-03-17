@@ -4,9 +4,9 @@ Paper Context is my personal, design-first experiment for building a retrieval s
 
 > **Status**
 >
-> This repository is open sourced for my own personal use, experimentation, and idea testing around retrieval and agent-facing AI workflows.
-> The main artifact today is the documentation set in `docs/`, not a runnable implementation.
-> It is intentionally docs-first, still evolving, and not production-ready.
+> The repository now includes a phase-0 runtime skeleton alongside the design docs:
+> Docker Compose for Postgres + pgvector + PGMQ, a FastAPI health surface, a FastMCP health surface, Alembic migrations, a direct-SQL PGMQ adapter, and a synthetic worker smoke path.
+> The ingestion and retrieval logic beyond the queue/bootstrap flow are still intentionally incomplete.
 
 ## Why This Exists
 
@@ -45,14 +45,14 @@ The retrieval path is intentionally deterministic: metadata filtering, sparse re
 
 ```text
 .
+├── alembic/
+├── docker/
 ├── docs/
-│   ├── README.md
-│   ├── architecture.md
-│   ├── ingestion-and-indexing.md
-│   ├── retrieval.md
-│   ├── data-model.md
-│   ├── apis-and-tools.md
-│   └── evaluation-and-roadmap.md
+├── src/paper_context/
+├── tests/
+├── docker-compose.yml
+├── Dockerfile
+├── pyproject.toml
 └── AGENTS.md
 ```
 
@@ -87,15 +87,30 @@ If you want the current source of truth, start here:
 - Test retrieval quality for passages, tables, and context packs
 - Keep the API and MCP contracts narrow, explicit, and version-aware
 
-## Usage Expectations
+## Phase 0 Bring-Up
 
-Right now, this repository is most useful as:
+Copy `.env.example` to `.env`, then:
 
-- A working design for a paper-context MVP
-- A place to refine ingestion and retrieval decisions before full implementation
-- A public record of how my approach to retrieval for papers is evolving
+```bash
+uv sync --extra dev
+docker compose up --build -d db
+alembic upgrade head
+python -m paper_context.cli api
+python -m paper_context.cli mcp
+python -m paper_context.cli verify-synthetic-job
+```
 
-It is not yet a repo you can clone and run as an application. I have intentionally not added install or setup instructions because the implementation in this repository is still taking shape.
+Or run the full stack in Compose:
+
+```bash
+docker compose up --build
+```
+
+Phase 0 exit checks:
+
+- API health: `GET /healthz`, readiness: `GET /readyz`
+- MCP health: `GET /healthz`, readiness: `GET /readyz`, mounted MCP transport at `/mcp`
+- Synthetic job verification: `python -m paper_context.cli verify-synthetic-job`
 
 ## Contributing
 

@@ -1,0 +1,88 @@
+services:
+  db:
+    build:
+      context: .
+      dockerfile: docker/db.Dockerfile
+    environment:
+      POSTGRES_DB: paper_context
+      POSTGRES_USER: paper_context
+      POSTGRES_PASSWORD: paper_context
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paper_context -d paper_context"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PAPER_CONTEXT_DATABASE__URL: postgresql+psycopg://paper_context:paper_context@db:5432/paper_context
+      PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -lc "alembic upgrade head &&
+      python -m paper_context.cli api"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ./var/artifacts:/var/lib/paper-context/artifacts
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PAPER_CONTEXT_DATABASE__URL: postgresql+psycopg://paper_context:paper_context@db:5432/paper_context
+      PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python -m paper_context.cli mcp
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8001:8001"
+    volumes:
+      - .:/app
+      - ./var/artifacts:/var/lib/paper-context/artifacts
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PAPER_CONTEXT_DATABASE__URL: postgresql+psycopg://paper_context:paper_context@db:5432/paper_context
+      PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
+    depends_on:
+      api:
+        condition: service_healthy
+    command: python -m paper_context.cli worker
+    volumes:
+      - .:/app
+      - ./var/artifacts:/var/lib/paper-context/artifacts
+
+volumes:
+  postgres_data:
