@@ -46,12 +46,12 @@ The retrieval path is intentionally deterministic: metadata filtering, sparse re
 ```text
 .
 ├── alembic/
-├── docker/
 ├── docs/
 ├── src/paper_context/
 ├── tests/
 ├── docker-compose.yml
 ├── Dockerfile
+├── Dockerfile.db
 ├── pyproject.toml
 └── AGENTS.md
 ```
@@ -110,6 +110,10 @@ Phase 0 exit checks:
 - App health: `GET /healthz`, readiness: `GET /readyz`
 - Mounted MCP transport: `GET /mcp`
 - Synthetic job verification: `python -m paper_context.cli verify-synthetic-job`
+
+`Dockerfile.db` is the local Postgres image used by Compose today. It keeps the PGMQ + `pgvector`
+setup self-contained for local bring-up and leaves room for future integration or regression tests
+to reuse the same database image.
 
 ## Developer Quality Gate
 

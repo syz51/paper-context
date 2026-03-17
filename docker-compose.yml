@@ -2,7 +2,7 @@ services:
   db:
     build:
       context: .
-      dockerfile: docker/db.Dockerfile
+      dockerfile: Dockerfile.db
     environment:
       POSTGRES_DB: paper_context
       POSTGRES_USER: paper_context
