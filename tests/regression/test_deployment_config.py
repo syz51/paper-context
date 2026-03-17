@@ -44,6 +44,12 @@ def test_no_standalone_mcp_port_exposed() -> None:
     assert "8001:8001" not in _compose_text()
 
 
+def test_db_service_configures_pg_partman_background_worker_for_local_role() -> None:
+    block = _service_block(_compose_text(), "db")
+    assert "pg_partman_bgw.role=paper_context" in block
+    assert "pg_partman_bgw.dbname=paper_context" in block
+
+
 def test_migrate_service_is_an_isolated_runner() -> None:
     block = _service_block(_compose_text(), "migrate")
     assert "alembic" in block
