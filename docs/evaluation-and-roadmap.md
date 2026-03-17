@@ -1,0 +1,153 @@
+# Evaluation and Roadmap
+
+> **Default:** Validate the deterministic retrieval stack first: parser quality, normalization, indexing, retrieval ranking, provenance, and interface stability. Deferred work stays separate from MVP requirements.
+
+This document defines how to validate the MVP and what is intentionally deferred. It links back to the subsystem docs that own the design details.
+
+## Retrieval and end-to-end evaluation
+
+Reference docs:
+
+- [Retrieval](./retrieval.md)
+- [APIs and Tools](./apis-and-tools.md)
+- [Data Model](./data-model.md)
+
+Required checks:
+
+- labeled retrieval queries return the expected passages for methods, results, limitations, and implementation details
+- table-oriented queries return the expected result or parameter tables
+- context packs contain the expected child results, parent context, provenance, and warnings
+- one response never mixes index versions
+- FastAPI and FastMCP return semantically aligned results for the same underlying record
+
+## Fallback parser quality checks
+
+Reference doc:
+
+- [Ingestion and Indexing](./ingestion-and-indexing.md)
+
+Required checks:
+
+- Docling-primary parses pass on representative born-digital papers
+- `pdfplumber` fallback only runs when the Docling structure gate classifies a parse as degraded
+- fallback results emit the required warnings
+- failed parses do not silently enter the retrieval index
+
+## Metadata enrichment validation
+
+Reference docs:
+
+- [Ingestion and Indexing](./ingestion-and-indexing.md)
+- [Data Model](./data-model.md)
+
+Required checks:
+
+- OpenAlex and Semantic Scholar matches do not overwrite higher-confidence parser metadata without recording source and confidence
+- DOI, venue, year, and author enrichment remain traceable to their source
+- enrichment failure produces warnings rather than corrupting canonical records
+
+## Versioning and regression tests
+
+Reference docs:
+
+- [Data Model](./data-model.md)
+- [Retrieval](./retrieval.md)
+- [APIs and Tools](./apis-and-tools.md)
+
+Required checks:
+
+- changing the embedding or reranker model creates a new index version
+- retrieval results remain stable for a fixed index version and corpus
+- active-version flips happen only after a successful build
+- passage, table, and context-pack contracts do not drift without an intentional versioned change
+
+## Deferred items
+
+These are not MVP requirements:
+
+- knowledge-graph-style retrieval
+- query expansion and multi-query retrieval
+- citation graph traversal
+- notes and memory
+- multimodal retrieval
+- OCR and scanned PDFs
+- LlamaIndex experiments
+- PydanticAI downstream agent layer
+
+## Future reference: query expansion and multi-query retrieval
+
+Query expansion and multi-query retrieval are intentionally deferred for the MVP.
+
+Rationale:
+
+- the current retrieval stack is optimized for a deterministic single-query pipeline that is easy to debug and evaluate
+- generated rewrites, expansions, or sub-queries add latency, model cost, and another failure surface before retrieval even begins
+- the most plausible value for this corpus is higher recall on terminology-mismatched, underspecified, or multi-hop questions, not routine single-passage lookup
+
+Expected value if revisited later:
+
+- better recall when user wording does not match the paper's terminology exactly
+- better coverage for short, ambiguous, or under-specified research questions
+- better support for multi-hop retrieval across sections or papers when one query is not enough
+- limited benefit for direct single-passage or single-table lookup when sparse+dense+rerank is already returning the right evidence
+
+If query augmentation is revisited, prefer this order:
+
+1. lightweight query rewriting or expansion as an optional pre-retrieval mode
+2. result fusion back into the same rerank stage and output contract
+3. only then consider more expensive multi-query generation for clearly complex or failing query classes
+
+## Future reference: graph-based retrieval options
+
+Knowledge-graph-style retrieval is intentionally deferred for the MVP.
+
+Rationale:
+
+- the current retrieval stack is optimized for deterministic passage and table retrieval, not graph construction
+- a full entity-relation graph adds extraction, linking, storage, and evaluation complexity that is not yet justified for the MVP
+- the most plausible graph-shaped extension for this corpus is citation-linked retrieval built from extracted references, not a broad ontology or general-purpose knowledge graph
+
+Relevant references for later evaluation:
+
+- **GraphRAG**: Microsoft Research, "From Local to Global: A GraphRAG Approach to Query-Focused Summarization"
+- **KG²RAG**: "Knowledge Graph-Guided Retrieval Augmented Generation"
+- **CG-RAG**: citation-graph retrieval for research-question answering
+
+Expected value if revisited later:
+
+- better multi-hop and cross-document retrieval when answers depend on connecting evidence across papers
+- stronger support for literature-mapping workflows such as tracing influence, support, contradiction, or follow-on methods
+- limited benefit for direct single-passage or single-table lookup, where the default sparse+dense+rerank pipeline should remain the primary path
+
+If graph-based retrieval is revisited, prefer this order:
+
+1. citation-linked retrieval using `document_references`
+2. section-and-passage graph expansion using existing document structure
+3. only then consider a broader entity-relation knowledge graph if there is a demonstrated gap that citation and structural links cannot cover
+
+## When to revisit deferred items
+
+Revisit a deferred item only when there is a concrete trigger:
+
+- **knowledge-graph-style retrieval**
+  - revisit when evaluation shows repeated multi-hop or cross-document retrieval failures that are not fixed by chunking, reranking, or metadata filters
+  - prefer citation-linked retrieval first, using `document_references`, before introducing a broader entity-relation graph
+- **query expansion and multi-query retrieval**
+  - revisit when evaluation shows repeated retrieval misses caused by terminology mismatch, ambiguous wording, or multi-hop query structure that are not fixed by chunking, reranking, or metadata filters
+  - keep the default single-query path intact unless an optional augmentation mode shows a clear gain on labeled retrieval queries
+- **citation graph traversal**
+  - revisit when `document_references` extraction is reliable enough to support citation-linked retrieval
+- **notes and memory**
+  - revisit when downstream workflows need persistent user or agent state beyond one retrieval call
+- **multimodal retrieval**
+  - revisit when figures or non-text tables become a frequent retrieval target
+- **OCR and scanned PDFs**
+  - revisit when scanned PDFs are a meaningful share of the input corpus
+- **LlamaIndex experiments**
+  - revisit when there is a demonstrated gap in the deterministic retrieval layer that a higher-level framework would solve
+- **PydanticAI downstream agent layer**
+  - revisit when downstream agent orchestration needs typed state on top of stable MCP contracts
+
+## Out of scope
+
+The MVP evaluation plan does not score answer-generation quality because answer generation is not part of the core system defined in this doc set.
