@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
@@ -40,8 +41,8 @@ class IngestionQueue:
         conn: Connection,
         ingest_job_id: UUID,
         document_id: UUID,
-        headers: dict[str, str] | None = None,
-        trace_metadata: dict[str, str] | None = None,
+        headers: Mapping[str, str] | None = None,
+        trace_metadata: Mapping[str, str] | None = None,
         delay_seconds: int = 0,
     ) -> int:
         payload: dict[str, str | dict[str, str]] = {
@@ -49,7 +50,7 @@ class IngestionQueue:
             "document_id": str(document_id),
         }
         if trace_metadata or headers:
-            payload["trace"] = {**(trace_metadata or {}), **(headers or {})}
+            payload["trace"] = {**dict(trace_metadata or {}), **dict(headers or {})}
         return self._queue.send(conn, payload, delay_seconds=delay_seconds)
 
     def claim_ingest(

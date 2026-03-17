@@ -112,6 +112,17 @@ Phase 0 exit checks:
 - MCP health: `GET /healthz`, readiness: `GET /readyz`, mounted MCP transport at `/mcp`
 - Synthetic job verification: `python -m paper_context.cli verify-synthetic-job`
 
+## Developer Quality Gate
+
+The repo targets Python 3.14 and includes a local and hosted quality gate:
+
+- Local hooks: `uv run pre-commit install --hook-type pre-commit --hook-type pre-push`
+- Manual full run: `uv run pre-commit run --all-files`
+- Type checking: `uv run mypy src`
+- Tests: `uv run pytest`
+
+GitHub Actions mirrors that baseline with a PR/push quality workflow and a separate security workflow for dependency review and CodeQL scanning.
+
 ## Contributing
 
 Issues and discussion are welcome, especially if you see weak assumptions, missing edge cases, or better ways to structure the retrieval core. That said, this is still a personal experimental project, so interfaces, scope, and implementation choices may change quickly.

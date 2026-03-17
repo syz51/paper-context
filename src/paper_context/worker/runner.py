@@ -56,16 +56,20 @@ def run_synthetic_job_verification() -> dict[str, Any]:
     worker = build_worker()
     handled = worker.run_once()
     with engine.begin() as connection:
-        ingest_job = connection.execute(
-            text(
-                """
+        ingest_job = (
+            connection.execute(
+                text(
+                    """
                 SELECT status, started_at, finished_at
                 FROM ingest_jobs
                 WHERE id = :ingest_job_id
                 """
-            ),
-            {"ingest_job_id": ingest_job_id},
-        ).mappings().one()
+                ),
+                {"ingest_job_id": ingest_job_id},
+            )
+            .mappings()
+            .one()
+        )
         metrics = queue.queue_metrics(connection)
     return {
         "document_id": str(document_id),

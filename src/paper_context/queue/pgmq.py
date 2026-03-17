@@ -80,7 +80,7 @@ class PgmqAdapter:
                 "poll_interval_ms": poll_interval_ms,
             },
         )
-        return [self._row_to_message(row) for row in result.mappings().all()]
+        return [self._row_to_message(dict(row)) for row in result.mappings().all()]
 
     def set_vt(self, connection: Connection, msg_id: int, vt_seconds: int) -> PgmqMessage | None:
         stmt = text(
@@ -100,7 +100,7 @@ class PgmqAdapter:
         row = result.mappings().one_or_none()
         if row is None:
             return None
-        return self._row_to_message(row)
+        return self._row_to_message(dict(row))
 
     def archive_message(self, connection: Connection, msg_id: int) -> bool:
         stmt = text("SELECT pgmq.archive(:queue_name, :msg_id)")
