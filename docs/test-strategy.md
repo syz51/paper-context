@@ -25,7 +25,7 @@
 
 ## CI lanes
 
-- `static-checks`: `pre-commit` and `pyright`
+- `static-checks`: `pre-commit` static checks, including `pyright`
 - `unit-slice`: PR-blocking fast tests with branch coverage, JUnit XML, and coverage XML artifacts
 - `contract`: schema and golden-response compatibility checks with JUnit XML
 - `integration-postgres`: PR-blocking real Postgres/PGMQ tests, including migration smoke, with retained pytest and Docker logs

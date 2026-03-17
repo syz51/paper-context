@@ -117,14 +117,17 @@ to reuse the same database image.
 
 ## Developer Quality Gate
 
-The repo targets Python 3.14 and includes a local and hosted quality gate:
+The repo targets Python 3.14 and separates static checks from test execution:
 
 - Local hooks: `uv run pre-commit install --hook-type pre-commit`
-- Manual full run: `uv run pre-commit run --all-files`
-- Type checking: `uv run pyright`
-- Tests with coverage gate: `uv run pytest`
+- Manual static run: `uv run pre-commit run --all-files`
+- Type checking only: `uv run pyright`
+- Fast test lane: `uv run pytest -m "unit or slice"`
+- Integration lane: `uv run pytest -m "integration or migration"`
+- Contract lane: `uv run pytest -m contract`
+- Regression lane: `uv run pytest -m "regression and not staging_only"`
 
-Pre-push hooks are intentionally not installed by default here because the full gate already runs in `pre-commit` and in GitHub Actions, so an extra local pre-push pass mostly adds latency without adding new signal.
+Pre-push hooks are intentionally not installed by default here because they would mostly duplicate the dedicated GitHub Actions test lanes and add local latency without new signal.
 
 GitHub Actions mirrors that baseline with a PR/push quality workflow and a separate security workflow for dependency review and CodeQL scanning.
 

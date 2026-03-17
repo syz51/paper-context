@@ -37,9 +37,6 @@ jobs:
       - name: Run pre-commit
         run: uv run pre-commit run --all-files --show-diff-on-failure
 
-      - name: Run pyright
-        run: uv run pyright
-
   unit-slice:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -137,6 +134,9 @@ jobs:
 
       - name: Sync dependencies
         run: uv sync --frozen --extra dev
+
+      - name: Materialize compose env file
+        run: cp .env.example .env
 
       - name: Start Postgres
         run: docker compose up -d db
