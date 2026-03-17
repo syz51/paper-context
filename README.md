@@ -1,23 +1,23 @@
-# Paper RAG
+# Paper Context
 
-Paper RAG is my personal, design-first experiment for building a retrieval system around born-digital research PDFs, especially quant and trading-relevant papers. The current direction is a deterministic ingestion and retrieval stack built around Docling-first parsing with `pdfplumber` fallback, Postgres + pgvector storage, FastAPI + FastMCP interfaces, Voyage `voyage-4-large` embeddings, Zero Entropy `zerank-2` reranking, and contextual retrieval with parent-child expansion.
+Paper Context is my personal, design-first experiment for building a retrieval system around born-digital research PDFs, especially quant and trading-relevant papers. The current direction is a deterministic ingestion and retrieval stack built around Docling-first parsing with `pdfplumber` fallback, Postgres + pgvector storage, FastAPI + FastMCP interfaces, Voyage `voyage-4-large` embeddings, Zero Entropy `zerank-2` reranking, and contextual retrieval with parent-child expansion.
 
 > **Status**
 >
-> This repository is open sourced for my own personal use, experimentation, and idea testing around RAG and AI workflows.
+> This repository is open sourced for my own personal use, experimentation, and idea testing around retrieval and agent-facing AI workflows.
 > The main artifact today is the documentation set in `docs/`, not a runnable implementation.
 > It is intentionally docs-first, still evolving, and not production-ready.
 
 ## Why This Exists
 
-Most RAG examples collapse important retrieval decisions into high-level frameworks, generic chat demos, or vague architecture diagrams. I want a tighter design for research-paper retrieval that stays explicit about parsing quality, provenance, indexing policy, and what agents should consume downstream.
+Most RAG examples collapse important retrieval decisions into high-level frameworks, generic chat demos, or vague architecture diagrams. I want a tighter design for research-paper retrieval that stays explicit about parsing quality, provenance, indexing policy, and what downstream agents should consume.
 
 This repo is where I am working through that design in public. It is useful both as a personal reference and as a way to pressure-test the system shape before committing to a full implementation.
 
 ## What The System Is
 
-- A personal experimental RAG system for ingesting and retrieving born-digital paper PDFs
-- A deterministic retrieval substrate for tools and agents
+- A personal experimental retrieval system for ingesting and retrieving born-digital paper PDFs
+- A deterministic retrieval substrate for downstream tools and agents
 - A normalized store for documents, sections, passages, tables, references, and artifacts
 - A provenance-aware retrieval design that favors debuggability over abstraction-heavy convenience
 - Currently centered on quant and trading-relevant research papers
@@ -25,7 +25,7 @@ This repo is where I am working through that design in public. It is useful both
 ## What The System Is Not
 
 - A production-ready OSS package
-- A general chat application or answer-generation product
+- A full end-to-end RAG application or answer-generation product
 - An OCR-first pipeline for scanned PDFs
 - A generic agent framework
 - A place to hide retrieval behavior behind LlamaIndex or PydanticAI abstractions
@@ -39,7 +39,7 @@ The current MVP design is organized around three planned runtime surfaces plus o
 - `mcp`: a FastMCP surface for search and context-pack retrieval tools
 - `skill` (optional): downstream agent guidance, not canonical retrieval logic
 
-The retrieval path is intentionally deterministic: metadata filtering, sparse retrieval, dense retrieval, fusion, reranking, and parent expansion. The goal is to return grounded context packs with stable provenance rather than hide the system behind answer synthesis.
+The retrieval path is intentionally deterministic: metadata filtering, sparse retrieval, dense retrieval, fusion, reranking, and parent expansion. The goal is to return grounded context packs with stable provenance for downstream agents rather than hide the system behind answer synthesis.
 
 ## Repo Layout
 
@@ -91,9 +91,9 @@ If you want the current source of truth, start here:
 
 Right now, this repository is most useful as:
 
-- A working design for a paper-RAG MVP
+- A working design for a paper-context MVP
 - A place to refine ingestion and retrieval decisions before full implementation
-- A public record of how my approach to RAG for papers is evolving
+- A public record of how my approach to retrieval for papers is evolving
 
 It is not yet a repo you can clone and run as an application. I have intentionally not added install or setup instructions because the implementation in this repository is still taking shape.
 

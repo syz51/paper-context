@@ -1,8 +1,8 @@
-# Paper RAG MVP Docs
+# Paper Context MVP Docs
 
-This `docs/` set is the implementation-facing design for the revised Paper RAG MVP. It defines a deterministic ingestion and retrieval system for born-digital research PDFs, optimized for quant and trading papers, with enough rationale to preserve decisions without turning the docs into long essays.
+This `docs/` set is the implementation-facing design for the revised Paper Context MVP. It defines a deterministic ingestion and retrieval system for born-digital research PDFs, optimized for quant and trading papers, with enough rationale to preserve decisions without turning the docs into long essays.
 
-The system is a retrieval substrate for tools and agents. It ingests PDFs, preserves sections, passages, tables, and provenance, and returns grounded context packs. It is not an answer-generation product, not a generic agent framework, and not a place to hide retrieval decisions behind LlamaIndex or PydanticAI abstractions.
+The system is a retrieval substrate for downstream tools and agents. It ingests PDFs, preserves sections, passages, tables, and provenance, and returns grounded context packs. It is not an answer-generation product, not a generic agent framework, and not a place to hide retrieval decisions behind LlamaIndex or PydanticAI abstractions.
 
 Status note: this documentation set supersedes `~/Downloads/rag-plan.md` and is the current source of truth for the MVP design.
 
@@ -23,9 +23,6 @@ Status note: this documentation set supersedes `~/Downloads/rag-plan.md` and is 
 - a single-tenant ingestion and retrieval service for born-digital paper PDFs
 - a normalized store for documents, sections, passages, tables, references, and artifacts
 - a deterministic retrieval layer that returns provenance-rich results and context packs
-
-**The system is not:**
-ieval layer that returns provenance-rich results and context packs
 
 **The system is not:**
 
