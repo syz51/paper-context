@@ -69,6 +69,7 @@ These are not MVP requirements:
 - knowledge-graph-style retrieval
 - query expansion and multi-query retrieval
 - self-reflective or corrective retrieval loops
+- Recursive Language Models (RLM)-style downstream orchestration
 - citation graph traversal
 - notes and memory
 - multimodal retrieval
@@ -122,6 +123,28 @@ If reflective retrieval is revisited, prefer this order:
 2. one optional in-corpus retry using query rewriting, alternate filters, or table-first versus passage-first routing
 3. only then consider broader self-critique loops in a downstream agent layer, not in the deterministic retrieval core
 
+## Future reference: Recursive Language Models (RLM)
+
+Recursive Language Models (RLM) are intentionally deferred for the MVP.
+
+Rationale:
+
+- the current system is a deterministic retrieval substrate, while most RLM value would land in a later downstream agent layer that consumes retrieval outputs rather than replacing retrieval logic
+- RLM adds latency, cost, operational complexity, and a more non-deterministic execution surface than the MVP currently targets
+- the most plausible value for this corpus is handling hard multi-hop, cross-paper, or terminology-mismatched research questions that are not solved by the default single-pass retrieval pipeline
+
+Expected value if revisited later:
+
+- better orchestration over multiple context packs when a downstream workflow needs iterative evidence gathering or synthesis across papers
+- better handling of difficult research questions that need more than one bounded retrieval pass or one context pack
+- limited benefit for direct passage or table lookup when the default sparse+dense+rerank pipeline is already returning the right evidence
+
+If RLM is revisited, prefer this order:
+
+1. use it as a downstream consumer of `build_context_pack` and the existing MCP retrieval tools
+2. keep canonical ingestion, indexing, and provenance-aware retrieval deterministic and service-owned
+3. only then consider deeper agentic orchestration if it shows a clear gain on hard-query evaluation without undermining debuggability or interface stability
+
 ## Future reference: graph-based retrieval options
 
 Knowledge-graph-style retrieval is intentionally deferred for the MVP.
@@ -163,6 +186,9 @@ Revisit a deferred item only when there is a concrete trigger:
 - **self-reflective or corrective retrieval loops**
   - revisit when evaluation shows repeated first-pass retrieval failures that are improved by one bounded retry, confidence gate, or route change rather than by better chunking, reranking, or metadata filters
   - keep reflective behavior optional and bounded unless it shows a clear gain on labeled retrieval queries without undermining provenance, latency, or debuggability
+- **Recursive Language Models (RLM)-style downstream orchestration**
+  - revisit when evaluation shows repeated hard-query failures on multi-hop, cross-paper, or terminology-mismatched questions that are not fixed by chunking, reranking, metadata filters, or one bounded retry
+  - keep RLM-style behavior downstream of the MCP retrieval contracts unless it shows a clear gain without undermining provenance, debuggability, or interface stability
 - **citation graph traversal**
   - revisit when `document_references` extraction is reliable enough to support citation-linked retrieval
 - **notes and memory**
