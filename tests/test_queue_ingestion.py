@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -16,13 +17,13 @@ from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
 
 
-def _make_message(payload: dict[str, str | dict[str, str]]) -> PgmqMessage:
+def _make_message(payload: Mapping[str, object]) -> PgmqMessage:
     return PgmqMessage(
         msg_id=1,
         read_ct=0,
         enqueued_at=datetime.now(UTC),
         vt=datetime.now(UTC),
-        message=payload,
+        message=dict(payload),
     )
 
 

@@ -9,26 +9,26 @@ description = "Phase 0 runtime skeleton for the Paper Context MVP."
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
-  "alembic>=1.16,<2.0",
-  "fastapi>=0.115,<1.0",
-  "fastmcp>=2.14.5,<3.0",
-  "orjson>=3.10,<4.0",
-  "psycopg[binary]>=3.2,<4.0",
-  "pydantic-settings>=2.7,<3.0",
-  "python-multipart>=0.0.20,<1.0",
-  "sqlalchemy>=2.0,<3.0",
-  "uvicorn[standard]>=0.35,<1.0",
+	"alembic>=1.16,<2.0",
+	"fastapi>=0.115,<1.0",
+	"fastmcp==3.1.1",
+	"orjson>=3.10,<4.0",
+	"psycopg[binary]>=3.2,<4.0",
+	"pydantic-settings>=2.7,<3.0",
+	"python-multipart>=0.0.20,<1.0",
+	"sqlalchemy>=2.0,<3.0",
+	"uvicorn[standard]>=0.35,<1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "bandit[toml]>=1.9.1,<2.0",
-  "httpx>=0.28,<1.0",
-  "mypy>=1.15,<2.0",
-  "pre-commit>=4.5.1,<5.0",
-  "pytest>=9.0.2,<10.0",
-  "pytest-cov>=7.0.0,<8.0.0",
-  "ruff>=0.11,<1.0",
+	"bandit[toml]>=1.9.4,<2.0",
+	"httpx>=0.28,<1.0",
+	"pre-commit>=4.5.1,<5.0",
+	"pyright>=1.1.403,<2.0",
+	"pytest>=9.0.2,<10.0",
+	"pytest-cov>=7.0.0,<8.0.0",
+	"ruff>=0.11,<1.0",
 ]
 
 [project.scripts]
@@ -40,11 +40,7 @@ packages = ["src/paper_context"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = [
-  "--cov=paper_context",
-  "--cov-branch",
-  "--cov-report=term-missing",
-]
+addopts = ["--cov=paper_context", "--cov-branch", "--cov-report=term-missing"]
 
 [tool.coverage.run]
 branch = true
@@ -62,13 +58,6 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
-
-[tool.mypy]
-python_version = "3.14"
-strict = false
-warn_unused_ignores = true
-warn_redundant_casts = true
-plugins = []
 
 [tool.bandit]
 exclude_dirs = ["tests"]

@@ -119,11 +119,13 @@ to reuse the same database image.
 
 The repo targets Python 3.14 and includes a local and hosted quality gate:
 
-- Local hooks: `uv run pre-commit install --hook-type pre-commit --hook-type pre-push`
+- Local hooks: `uv run pre-commit install --hook-type pre-commit`
 - Manual full run: `uv run pre-commit run --all-files`
-- Type checking: `uv run mypy src`
+- Type checking: `uv run pyright`
 - Tests with coverage gate: `uv run pytest`
-- Coverage threshold: `99%` total coverage enforced in `pytest`, local pre-commit/pre-push hooks, and GitHub Actions
+- Coverage threshold: `99%` total coverage enforced in `pytest`, local pre-commit hooks, and GitHub Actions
+
+Pre-push hooks are intentionally not installed by default here because the full gate already runs in `pre-commit` and in GitHub Actions, so an extra local pre-push pass mostly adds latency without adding new signal.
 
 GitHub Actions mirrors that baseline with a PR/push quality workflow and a separate security workflow for dependency review and CodeQL scanning.
 

@@ -1,0 +1,25 @@
+{
+  "include": ["src", "tests"],
+  "exclude": [
+    "**/__pycache__",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "**/.*",
+    "**/node_modules"
+  ],
+  "pythonVersion": "3.14",
+  "typeCheckingMode": "standard",
+  "useLibraryCodeForTypes": true,
+  "executionEnvironments": [
+    {
+      "root": "src"
+    },
+    {
+      "root": "tests",
+      "extraPaths": ["src"]
+    }
+  ]
+}

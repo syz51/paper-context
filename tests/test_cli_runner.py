@@ -181,15 +181,16 @@ def test_build_worker_connection_factory_opens_connection_scope(
     entered = object()
     connection_scope = MagicMock(return_value=contextlib.nullcontext(entered))
     worker = MagicMock()
+    worker_cls = MagicMock(return_value=worker)
     monkeypatch.setattr(runner_module, "get_settings", lambda: settings)
     monkeypatch.setattr(runner_module, "get_engine", lambda: engine)
     monkeypatch.setattr(runner_module, "connection_scope", connection_scope)
     monkeypatch.setattr(runner_module, "IngestionQueue", MagicMock())
     monkeypatch.setattr(runner_module, "SyntheticIngestProcessor", MagicMock())
-    monkeypatch.setattr(runner_module, "IngestWorker", MagicMock(return_value=worker))
+    monkeypatch.setattr(runner_module, "IngestWorker", worker_cls)
 
     runner_module.build_worker()
-    connection_factory = runner_module.IngestWorker.call_args.kwargs["connection_factory"]
+    connection_factory = worker_cls.call_args.kwargs["connection_factory"]
     with connection_factory() as connection:
         assert connection is entered
 
