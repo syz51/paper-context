@@ -140,7 +140,7 @@ Defaults:
 - stay within section boundaries
 - target 300-700 tokens
 - use 10-15% overlap
-- store both the raw passage text and the contextualized embedding text
+- store both the raw passage text and the contextualized retrieval text
 
 The contextualized text is deterministic. It prepends a short context string derived from:
 
@@ -148,7 +148,7 @@ The contextualized text is deterministic. It prepends a short context string der
 - section heading path
 - immediate local heading context when available
 
-The raw passage text remains the canonical record. The contextualized text is derived index input used for embeddings and retrieval.
+The raw passage text remains the canonical record. The contextualized text is derived index input used to materialize sparse passage search, produce embeddings, and drive retrieval.
 
 ## Index-version creation and activation rules
 

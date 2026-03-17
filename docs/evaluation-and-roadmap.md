@@ -15,6 +15,7 @@ Reference docs:
 Required checks:
 
 - labeled retrieval queries return the expected passages for methods, results, limitations, and implementation details
+- passage sparse and dense retrieval both use contextualized passage representations without regressing exact-match lookup or citation fidelity
 - table-oriented queries return the expected result or parameter tables
 - context packs contain the expected child results, parent context, provenance, and warnings
 - one response never mixes index versions
@@ -67,6 +68,7 @@ These are not MVP requirements:
 
 - knowledge-graph-style retrieval
 - query expansion and multi-query retrieval
+- self-reflective or corrective retrieval loops
 - citation graph traversal
 - notes and memory
 - multimodal retrieval
@@ -96,6 +98,29 @@ If query augmentation is revisited, prefer this order:
 1. lightweight query rewriting or expansion as an optional pre-retrieval mode
 2. result fusion back into the same rerank stage and output contract
 3. only then consider more expensive multi-query generation for clearly complex or failing query classes
+
+## Future reference: self-reflective and corrective retrieval loops
+
+Self-reflective and corrective retrieval loops are intentionally deferred for the MVP.
+
+Rationale:
+
+- the current system is a deterministic retrieval substrate, not an answer-generation product, so most of the value from reflective retrieval would land in a later downstream agent layer rather than the retrieval core
+- reflective retrieval adds latency, model cost, and another non-deterministic decision layer on top of a stack that is currently optimized for debuggability and stable retrieval contracts
+- the most plausible value for this corpus is recovering from hard retrieval misses, weak initial context packs, or ambiguous research questions, not replacing the default single-pass retrieval path
+
+Expected value if revisited later:
+
+- better recovery when the first retrieval pass returns weak or conflicting evidence
+- better handling of underspecified, terminology-mismatched, or multi-hop research questions that need one more bounded retrieval attempt
+- better routing between cheap single-pass retrieval and more expensive retry behavior for clearly difficult queries
+- limited benefit for direct passage or table lookup when the default sparse+dense+rerank pipeline is already returning the right evidence
+
+If reflective retrieval is revisited, prefer this order:
+
+1. a bounded retrieval-confidence or retrieval-quality check over the first-pass result set
+2. one optional in-corpus retry using query rewriting, alternate filters, or table-first versus passage-first routing
+3. only then consider broader self-critique loops in a downstream agent layer, not in the deterministic retrieval core
 
 ## Future reference: graph-based retrieval options
 
@@ -135,6 +160,9 @@ Revisit a deferred item only when there is a concrete trigger:
 - **query expansion and multi-query retrieval**
   - revisit when evaluation shows repeated retrieval misses caused by terminology mismatch, ambiguous wording, or multi-hop query structure that are not fixed by chunking, reranking, or metadata filters
   - keep the default single-query path intact unless an optional augmentation mode shows a clear gain on labeled retrieval queries
+- **self-reflective or corrective retrieval loops**
+  - revisit when evaluation shows repeated first-pass retrieval failures that are improved by one bounded retry, confidence gate, or route change rather than by better chunking, reranking, or metadata filters
+  - keep reflective behavior optional and bounded unless it shows a clear gain on labeled retrieval queries without undermining provenance, latency, or debuggability
 - **citation graph traversal**
   - revisit when `document_references` extraction is reliable enough to support citation-linked retrieval
 - **notes and memory**

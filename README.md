@@ -1,0 +1,104 @@
+# Paper RAG
+
+Paper RAG is my personal, design-first experiment for building a retrieval system around born-digital research PDFs, especially quant and trading-relevant papers. The current direction is a deterministic ingestion and retrieval stack built around Docling-first parsing with `pdfplumber` fallback, Postgres + pgvector storage, FastAPI + FastMCP interfaces, Voyage `voyage-4-large` embeddings, Zero Entropy `zerank-2` reranking, and contextual retrieval with parent-child expansion.
+
+> **Status**
+>
+> This repository is open sourced for my own personal use, experimentation, and idea testing around RAG and AI workflows.
+> The main artifact today is the documentation set in `docs/`, not a runnable implementation.
+> It is intentionally docs-first, still evolving, and not production-ready.
+
+## Why This Exists
+
+Most RAG examples collapse important retrieval decisions into high-level frameworks, generic chat demos, or vague architecture diagrams. I want a tighter design for research-paper retrieval that stays explicit about parsing quality, provenance, indexing policy, and what agents should consume downstream.
+
+This repo is where I am working through that design in public. It is useful both as a personal reference and as a way to pressure-test the system shape before committing to a full implementation.
+
+## What The System Is
+
+- A personal experimental RAG system for ingesting and retrieving born-digital paper PDFs
+- A deterministic retrieval substrate for tools and agents
+- A normalized store for documents, sections, passages, tables, references, and artifacts
+- A provenance-aware retrieval design that favors debuggability over abstraction-heavy convenience
+- Currently centered on quant and trading-relevant research papers
+
+## What The System Is Not
+
+- A production-ready OSS package
+- A general chat application or answer-generation product
+- An OCR-first pipeline for scanned PDFs
+- A generic agent framework
+- A place to hide retrieval behavior behind LlamaIndex or PydanticAI abstractions
+
+## Current Architecture Snapshot
+
+The current MVP design is organized around three planned runtime surfaces plus one optional downstream layer:
+
+- `api`: a FastAPI surface for uploads, ingest-job status, document inspection, and operational reads
+- `worker`: a background process for parsing, normalization, enrichment, chunking, embedding, and index-version writes
+- `mcp`: a FastMCP surface for search and context-pack retrieval tools
+- `skill` (optional): downstream agent guidance, not canonical retrieval logic
+
+The retrieval path is intentionally deterministic: metadata filtering, sparse retrieval, dense retrieval, fusion, reranking, and parent expansion. The goal is to return grounded context packs with stable provenance rather than hide the system behind answer synthesis.
+
+## Repo Layout
+
+```text
+.
+├── docs/
+│   ├── README.md
+│   ├── architecture.md
+│   ├── ingestion-and-indexing.md
+│   ├── retrieval.md
+│   ├── data-model.md
+│   ├── apis-and-tools.md
+│   └── evaluation-and-roadmap.md
+└── AGENTS.md
+```
+
+## Documentation Guide
+
+If you want the current source of truth, start here:
+
+- [`docs/README.md`](./docs/README.md): overview of the design set and current defaults
+- [`docs/architecture.md`](./docs/architecture.md): runtime surfaces, component boundaries, and system shape
+- [`docs/retrieval.md`](./docs/retrieval.md): query pipeline, context-pack behavior, and provenance rules
+- [`docs/ingestion-and-indexing.md`](./docs/ingestion-and-indexing.md): parsing, normalization, chunking, enrichment, and indexing flow
+- [`docs/data-model.md`](./docs/data-model.md): canonical entities, provenance links, and index-version rules
+- [`docs/apis-and-tools.md`](./docs/apis-and-tools.md): FastAPI and FastMCP contracts
+- [`docs/evaluation-and-roadmap.md`](./docs/evaluation-and-roadmap.md): validation criteria, deferred items, and near-term roadmap
+
+## Current Defaults / Tech Choices
+
+- Parser: Docling first, `pdfplumber` fallback when structure is degraded
+- Storage: Postgres + pgvector
+- API surface: FastAPI
+- Tool surface: FastMCP
+- Embeddings: Voyage `voyage-4-large`
+- Reranker: Zero Entropy `zerank-2`
+- Retrieval shape: contextualized passage retrieval plus parent-child expansion
+- Framework boundary: no LlamaIndex or PydanticAI in the MVP core
+
+## Near-Term Roadmap
+
+- Refine the ingestion pipeline for born-digital paper PDFs
+- Validate structure quality gates and fallback behavior
+- Lock down the normalized data model and provenance requirements
+- Test retrieval quality for passages, tables, and context packs
+- Keep the API and MCP contracts narrow, explicit, and version-aware
+
+## Usage Expectations
+
+Right now, this repository is most useful as:
+
+- A working design for a paper-RAG MVP
+- A place to refine ingestion and retrieval decisions before full implementation
+- A public record of how my approach to RAG for papers is evolving
+
+It is not yet a repo you can clone and run as an application. I have intentionally not added install or setup instructions because the implementation in this repository is still taking shape.
+
+## Contributing
+
+Issues and discussion are welcome, especially if you see weak assumptions, missing edge cases, or better ways to structure the retrieval core. That said, this is still a personal experimental project, so interfaces, scope, and implementation choices may change quickly.
+
+I have not added a final open source license yet. That will need to be clarified before any broader public release.

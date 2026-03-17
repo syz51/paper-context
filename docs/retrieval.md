@@ -1,6 +1,6 @@
 # Retrieval
 
-> **Default:** Retrieval uses metadata filter -> sparse -> dense -> fusion -> rerank -> parent expansion, with Voyage `voyage-4-large` for embeddings and Zero Entropy `zerank-2` for reranking. Results are provenance-rich and index-version aware.
+> **Default:** Retrieval uses metadata filter -> sparse -> dense -> fusion -> rerank -> parent expansion, with contextualized passage text feeding both sparse and dense passage retrieval, Voyage `voyage-4-large` for embeddings, and Zero Entropy `zerank-2` for reranking. Results are provenance-rich and index-version aware.
 
 This document defines the query pipeline, top-k defaults, table handling, parent-child retrieval behavior, context-pack assembly, and the retrieval output contract. For provenance and index fields, see [Data Model](./data-model.md).
 
@@ -12,7 +12,8 @@ Every retrieval request follows the same ordered stages:
    - apply document-level and passage-level filters first
    - common filters include year, tags, document IDs, and result type
 2. **Sparse retrieval**
-   - run Postgres full-text search over passage text, section headings, table captions, and selected metadata
+   - run Postgres full-text search over contextualized passage text, section headings, and selected metadata
+   - for tables, keep a separate lexical path over captions, headers, and serialized cell text
 3. **Dense retrieval**
    - embed the query once with Voyage `voyage-4-large`
    - search pgvector against the active index version
@@ -42,7 +43,8 @@ Default budgets:
 
 Passage behavior:
 
-- search over the contextualized embedding text for dense retrieval
+- search over the contextualized passage text for sparse retrieval
+- search over the same contextualized passage text for dense retrieval
 - return the raw passage text for display and citation
 - preserve section path, page range, chunk ordinal, and index-version provenance
 - allow pagination by cursor over the reranked result set
@@ -130,6 +132,7 @@ Warnings must be explicit. Common warnings include:
 
 - embedding model: Voyage `voyage-4-large`
 - reranker model: Zero Entropy `zerank-2`
+- sparse passage retrieval reads `contextualized_text` through the active sparse index materialization
 - dense retrieval always reads from the active `index version`
 - any model swap requires a new index version before activation
 

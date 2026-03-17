@@ -48,7 +48,7 @@ Use when the caller needs document-level narrowing before passage or table retri
 
 ### `search_passages(query, filters, cursor)`
 
-Use for direct passage retrieval through the standard pipeline.
+Use for direct passage retrieval through the standard contextual retrieval pipeline.
 
 ### `search_tables(query, filters, cursor)`
 

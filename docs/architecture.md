@@ -12,7 +12,7 @@ FastAPI service for uploads, document inspection, ingest job status, and operati
 
 ### `worker`
 
-Background ingestion and indexing process. It owns parsing, structure gating, metadata enrichment, normalization, contextualized chunk generation, embedding, and index-version writes.
+Background ingestion and indexing process. It owns parsing, structure gating, metadata enrichment, normalization, contextualized retrieval-text generation, sparse-index materialization, embedding, and index-version writes.
 
 ### `mcp`
 
@@ -31,8 +31,9 @@ A thin downstream companion layer that teaches agents how to use the MCP tools w
 - `worker`
   - parse with Docling, then `pdfplumber` only when needed
   - normalize document structure into canonical entities
-  - generate contextualized passage chunks
-  - write embeddings and retrieval index metadata
+  - generate contextualized passage retrieval text
+  - materialize sparse-search inputs and write embeddings
+  - write retrieval index metadata
 - `mcp`
   - expose search and context-pack tools
   - return provenance, warnings, and stable identifiers
@@ -47,7 +48,7 @@ A thin downstream companion layer that teaches agents how to use the MCP tools w
 2. The API creates a `document` shell and an `ingest_job`, then hands work to the worker.
 3. The worker stores the original file as an artifact, runs Docling, evaluates structure quality, and falls back to `pdfplumber` only if the Docling output is not usable.
 4. The worker recovers metadata, enriches it synchronously from OpenAlex and Semantic Scholar, and normalizes sections, passages, tables, references, and artifacts into Postgres.
-5. The worker creates contextualized chunks, embeds them with Voyage `voyage-4-large`, and records the run under an `index version`.
+5. The worker creates contextualized passage retrieval text, materializes sparse-search inputs, embeds them with Voyage `voyage-4-large`, and records the run under an `index version`.
 6. Retrieval queries run through metadata filtering, sparse search, dense search, fusion, reranking with `zerank-2`, parent expansion, and context-pack assembly.
 7. FastAPI and FastMCP return the same underlying document, passage, table, and context-pack semantics with provenance and warnings attached.
 
@@ -77,8 +78,9 @@ This boundary is deliberate. It keeps the MVP debuggable, testable, and implemen
   - FastAPI is the operational surface.
   - FastMCP is the tool surface.
   - Keeping them separate avoids turning the HTTP API into an accidental tool contract.
-- **Contextualized chunking + parent-child retrieval**
-  - The embedding unit is a section-bounded passage with deterministic context added.
+- **Contextual retrieval text + parent-child retrieval**
+  - The indexed passage representation is a section-bounded passage with deterministic context added.
+  - The same contextualized representation feeds sparse passage search and dense passage embeddings.
   - Retrieval returns the best child results plus the parent structure needed to interpret them.
 
 ## Out of scope

@@ -59,7 +59,7 @@ Key fields:
 - `quant_tags`
 - `artifact_id`
 
-`body_text` is canonical record data. `contextualized_text` is derived retrieval input.
+`body_text` is canonical record data. `contextualized_text` is derived retrieval and index input.
 
 ### `document_tables`
 
@@ -225,7 +225,7 @@ Derived or index data:
 
 - `document_passages.contextualized_text`
 - vector embeddings stored through pgvector
-- sparse-search tsvector materialization
+- sparse-search tsvector materialization from contextualized passage text and table lexical fields
 - rerank scores
 - `retrieval_index_runs`
 

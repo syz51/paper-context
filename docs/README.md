@@ -13,7 +13,7 @@ Status note: this documentation set supersedes `~/Downloads/rag-plan.md` and is 
 > - Reranker: Zero Entropy `zerank-2`.
 > - Storage: Postgres + pgvector.
 > - API stack: FastAPI for operational HTTP, FastMCP for MCP tools.
-> - Retrieval shape: contextualized chunking plus parent-child retrieval.
+> - Retrieval shape: contextual retrieval over contextualized passage text plus parent-child retrieval.
 > - Framework boundary: no LlamaIndex or PydanticAI in the MVP core.
 
 ## What the system is and is not
