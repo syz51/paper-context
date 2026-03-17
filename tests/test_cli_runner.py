@@ -105,10 +105,7 @@ def test_main_writes_verification_report(
 
     assert exit_code == 0
     assert capsys.readouterr().out == (
-        '{\n'
-        '  "handled_message": true,\n'
-        f'  "document_id": "{report["document_id"]}"\n'
-        '}\n'
+        f'{{\n  "handled_message": true,\n  "document_id": "{report["document_id"]}"\n}}\n'
     )
 
 
