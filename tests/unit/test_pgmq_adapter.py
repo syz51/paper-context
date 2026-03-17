@@ -4,7 +4,11 @@ import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
+import pytest
+
 from paper_context.queue.pgmq import PgmqAdapter, QueueMetrics
+
+pytestmark = pytest.mark.unit
 
 
 def _message_row(**overrides: object) -> dict[str, object]:

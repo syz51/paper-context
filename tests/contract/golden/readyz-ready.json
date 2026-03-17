@@ -1,0 +1,8 @@
+{
+  "service": "app",
+  "status": "ready",
+  "version": "0.1.0",
+  "database_ready": true,
+  "storage_root": "",
+  "queue_name": "document_ingest"
+}

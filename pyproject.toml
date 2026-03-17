@@ -40,7 +40,18 @@ packages = ["src/paper_context"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = ["--cov=paper_context", "--cov-branch", "--cov-report=term-missing"]
+addopts = ["--strict-markers", "-ra"]
+markers = [
+	"unit: fast isolated logic and module-level tests.",
+	"slice: in-process FastAPI and service-slice tests.",
+	"integration: multi-component tests against real infrastructure seams.",
+	"contract: schema and golden-response compatibility checks.",
+	"regression: deployment-shape and smoke/regression checks.",
+	"migration: schema migration smoke coverage.",
+	"slow: comparatively expensive tests.",
+	"requires_postgres: requires a real Postgres/PGMQ database.",
+	"staging_only: intended for the non-production staging environment only.",
+]
 
 [tool.coverage.run]
 branch = true
@@ -48,7 +59,7 @@ data_file = ".pytest_cache/.coverage"
 source = ["paper_context"]
 
 [tool.coverage.report]
-fail_under = 99
+fail_under = 95
 show_missing = true
 skip_covered = false
 

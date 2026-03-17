@@ -15,6 +15,8 @@ from paper_context.queue.contracts import ClaimedIngestMessage, IngestionQueue, 
 from paper_context.queue.pgmq import PgmqMessage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
 
+pytestmark = pytest.mark.unit
+
 
 def make_settings() -> SimpleNamespace:
     return SimpleNamespace(

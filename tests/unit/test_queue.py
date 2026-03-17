@@ -4,8 +4,12 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+import pytest
+
 from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqAdapter, PgmqMessage
+
+pytestmark = pytest.mark.unit
 
 
 def test_payload_parses_message() -> None:

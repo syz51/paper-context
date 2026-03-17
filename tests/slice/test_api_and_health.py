@@ -11,6 +11,8 @@ from paper_context.api import app as api_app_module
 from paper_context.api.app import create_app
 from paper_context.api.routes import health as health_module
 
+pytestmark = pytest.mark.slice
+
 
 def _patch_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
     storage = SimpleNamespace(root_path=tmp_path / "artifacts")

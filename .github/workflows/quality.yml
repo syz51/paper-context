@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint-type-test:
+  static-checks:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -40,5 +40,169 @@ jobs:
       - name: Run pyright
         run: uv run pyright
 
-      - name: Run pytest with coverage
-        run: uv run pytest
+  unit-slice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv==0.10.11
+
+      - name: Sync dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run unit and slice tests with coverage
+        run: |
+          mkdir -p .artifacts/unit-slice
+          uv run pytest -m "unit or slice" \
+            --junitxml=.artifacts/unit-slice/junit.xml \
+            --cov=paper_context \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml:.artifacts/unit-slice/coverage.xml
+
+      - name: Upload unit and slice artifacts
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: unit-slice-artifacts
+          path: .artifacts/unit-slice
+          if-no-files-found: error
+
+  contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv==0.10.11
+
+      - name: Sync dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run contract tests
+        run: |
+          mkdir -p .artifacts/contract
+          uv run pytest -m contract \
+            --junitxml=.artifacts/contract/junit.xml
+
+      - name: Upload contract artifacts
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: contract-artifacts
+          path: .artifacts/contract
+          if-no-files-found: error
+
+  integration-postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv==0.10.11
+
+      - name: Sync dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Start Postgres
+        run: docker compose up -d db
+
+      - name: Run integration and migration tests
+        env:
+          PAPER_CONTEXT_TEST_DATABASE_URL: postgresql+psycopg://paper_context:paper_context@localhost:5433/paper_context
+        run: |
+          mkdir -p .artifacts/integration
+          uv run pytest -m "integration or migration" \
+            --junitxml=.artifacts/integration/junit.xml \
+            --log-file=.artifacts/integration/pytest.log \
+            -o log_cli=true
+
+      - name: Capture integration logs
+        if: always()
+        run: |
+          mkdir -p .artifacts/integration
+          docker compose logs db > .artifacts/integration/docker-compose-db.log
+
+      - name: Stop Postgres
+        if: always()
+        run: docker compose down -v
+
+      - name: Upload integration artifacts
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: integration-artifacts
+          path: .artifacts/integration
+          if-no-files-found: error
+
+  regression-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version-file: .python-version
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv==0.10.11
+
+      - name: Sync dependencies
+        run: uv sync --frozen --extra dev
+
+      - name: Run non-staging regression tests
+        run: |
+          mkdir -p .artifacts/regression
+          uv run pytest -m "regression and not staging_only" \
+            --junitxml=.artifacts/regression/junit.xml \
+            --log-file=.artifacts/regression/pytest.log \
+            -o log_cli=true
+
+      - name: Upload regression artifacts
+        if: always()
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: regression-artifacts
+          path: .artifacts/regression
+          if-no-files-found: error

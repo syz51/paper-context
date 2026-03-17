@@ -21,6 +21,8 @@ from paper_context.db.session import connection_scope, get_session_factory, sess
 from paper_context.logging import configure_logging
 from paper_context.storage.local_fs import LocalFilesystemStorage
 
+pytestmark = pytest.mark.unit
+
 
 def test_get_settings_is_cached() -> None:
     get_settings.cache_clear()

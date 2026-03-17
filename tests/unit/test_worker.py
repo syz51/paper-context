@@ -5,9 +5,13 @@ from datetime import UTC, datetime
 from unittest.mock import MagicMock
 from uuid import uuid4
 
+import pytest
+
 from paper_context.queue.contracts import ClaimedIngestMessage, IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
+
+pytestmark = pytest.mark.unit
 
 
 def test_worker_returns_none_when_queue_empty() -> None:

@@ -16,6 +16,8 @@ from paper_context.ingestion.service import (
 from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
 
+pytestmark = pytest.mark.unit
+
 
 def _make_message(payload: Mapping[str, object]) -> PgmqMessage:
     return PgmqMessage(

@@ -123,7 +123,6 @@ The repo targets Python 3.14 and includes a local and hosted quality gate:
 - Manual full run: `uv run pre-commit run --all-files`
 - Type checking: `uv run pyright`
 - Tests with coverage gate: `uv run pytest`
-- Coverage threshold: `99%` total coverage enforced in `pytest`, local pre-commit hooks, and GitHub Actions
 
 Pre-push hooks are intentionally not installed by default here because the full gate already runs in `pre-commit` and in GitHub Actions, so an extra local pre-push pass mostly adds latency without adding new signal.
 

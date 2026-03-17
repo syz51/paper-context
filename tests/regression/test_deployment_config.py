@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.regression
+
 
 def _service_block(text: str, service: str) -> str:
     lines = text.splitlines()
