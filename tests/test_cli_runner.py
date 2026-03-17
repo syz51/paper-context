@@ -26,10 +26,8 @@ def make_settings() -> SimpleNamespace:
             poll_interval_ms=80,
         ),
         runtime=SimpleNamespace(
-            api_host="127.0.0.1",
-            api_port=9000,
-            mcp_host="127.0.0.1",
-            mcp_port=9001,
+            app_host="127.0.0.1",
+            app_port=9000,
             worker_idle_sleep_seconds=0.25,
         ),
     )
@@ -61,7 +59,7 @@ def test_build_parser_supports_worker_once_flag() -> None:
     assert args.once is True
 
 
-def test_main_runs_api_server(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_main_runs_serve_command(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = make_settings()
     configure_logging = MagicMock()
     uvicorn_run = MagicMock()
@@ -69,7 +67,7 @@ def test_main_runs_api_server(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli_module, "configure_logging", configure_logging)
     monkeypatch.setattr(cli_module.uvicorn, "run", uvicorn_run)
 
-    exit_code = cli_module.main(["api"])
+    exit_code = cli_module.main(["serve"])
 
     assert exit_code == 0
     configure_logging.assert_called_once_with("INFO")
@@ -77,24 +75,6 @@ def test_main_runs_api_server(monkeypatch: pytest.MonkeyPatch) -> None:
         "paper_context.api.app:create_app",
         host="127.0.0.1",
         port=9000,
-        factory=True,
-    )
-
-
-def test_main_runs_mcp_server(monkeypatch: pytest.MonkeyPatch) -> None:
-    settings = make_settings()
-    uvicorn_run = MagicMock()
-    monkeypatch.setattr(cli_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(cli_module, "configure_logging", MagicMock())
-    monkeypatch.setattr(cli_module.uvicorn, "run", uvicorn_run)
-
-    exit_code = cli_module.main(["mcp"])
-
-    assert exit_code == 0
-    uvicorn_run.assert_called_once_with(
-        "paper_context.mcp.server:create_app",
-        host="127.0.0.1",
-        port=9001,
         factory=True,
     )
 
@@ -124,8 +104,11 @@ def test_main_writes_verification_report(
     exit_code = cli_module.main(["verify-synthetic-job"])
 
     assert exit_code == 0
-    assert capsys.readouterr().out == '{\n  "handled_message": true,\n  "document_id": "%s"\n}\n' % (
-        report["document_id"],
+    assert capsys.readouterr().out == (
+        '{\n'
+        '  "handled_message": true,\n'
+        f'  "document_id": "{report["document_id"]}"\n'
+        '}\n'
     )
 
 

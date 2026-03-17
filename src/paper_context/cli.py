@@ -15,8 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="paper-context")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("api")
-    subparsers.add_parser("mcp")
+    subparsers.add_parser("serve")
 
     worker_parser = subparsers.add_parser("worker")
     worker_parser.add_argument("--once", action="store_true")
@@ -30,20 +29,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    if args.command == "api":
+    if args.command == "serve":
         uvicorn.run(
             "paper_context.api.app:create_app",
-            host=settings.runtime.api_host,
-            port=settings.runtime.api_port,
-            factory=True,
-        )
-        return 0
-
-    if args.command == "mcp":
-        uvicorn.run(
-            "paper_context.mcp.server:create_app",
-            host=settings.runtime.mcp_host,
-            port=settings.runtime.mcp_port,
+            host=settings.runtime.app_host,
+            port=settings.runtime.app_port,
             factory=True,
         )
         return 0

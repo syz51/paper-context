@@ -1,0 +1,59 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
+    networks:
+      - dokploy-network
+    command:
+      - python
+      - -m
+      - paper_context.cli
+      - serve
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
+    depends_on:
+      app:
+        condition: service_healthy
+    networks:
+      - dokploy-network
+    command:
+      - python
+      - -m
+      - paper_context.cli
+      - worker
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    networks:
+      - dokploy-network
+    command:
+      - alembic
+      - upgrade
+      - head
+
+networks:
+  dokploy-network:
+    external: true

@@ -7,7 +7,11 @@ from uuid import uuid4
 import pytest
 
 from paper_context.ingestion.queue import IngestionQueueService
-from paper_context.ingestion.service import IngestJobContext, LeaseExtender, SyntheticIngestProcessor
+from paper_context.ingestion.service import (
+    IngestJobContext,
+    LeaseExtender,
+    SyntheticIngestProcessor,
+)
 from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
 
@@ -112,7 +116,10 @@ def test_ingestion_queue_service_enqueues_document_with_trace_headers() -> None:
     document_id = uuid4()
     ingest_job_id = uuid4()
 
-    with patch("paper_context.ingestion.queue.uuid.uuid4", side_effect=[document_id, ingest_job_id]):
+    with patch(
+        "paper_context.ingestion.queue.uuid.uuid4",
+        side_effect=[document_id, ingest_job_id],
+    ):
         service = IngestionQueueService(engine, adapter)
         returned_document_id, returned_ingest_job_id = service.enqueue_document(
             {"title": "doc"}, trace_headers={"x": "y"}

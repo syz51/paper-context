@@ -19,4 +19,4 @@ COPY src ./src
 
 RUN uv pip install --system -e .
 
-EXPOSE 8000 8001
+EXPOSE 8000

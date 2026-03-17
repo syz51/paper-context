@@ -54,7 +54,12 @@ def test_read_with_poll_parses_json_string_messages() -> None:
     connection.execute.return_value = result
     adapter = PgmqAdapter("document_ingest")
 
-    messages = adapter.read_with_poll(connection, vt_seconds=5, max_poll_seconds=1, poll_interval_ms=10)
+    messages = adapter.read_with_poll(
+        connection,
+        vt_seconds=5,
+        max_poll_seconds=1,
+        poll_interval_ms=10,
+    )
 
     assert len(messages) == 1
     assert isinstance(messages[0].message, dict)

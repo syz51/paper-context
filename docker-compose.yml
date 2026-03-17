@@ -17,7 +17,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  api:
+  app:
     build:
       context: .
       dockerfile: Dockerfile
@@ -29,9 +29,11 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    command: >
-      sh -lc "alembic upgrade head &&
-      python -m paper_context.cli api"
+    command:
+      - python
+      - -m
+      - paper_context.cli
+      - serve
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2)\""]
       interval: 10s
@@ -39,30 +41,6 @@ services:
       retries: 10
     ports:
       - "8000:8000"
-    volumes:
-      - .:/app
-      - ./var/artifacts:/var/lib/paper-context/artifacts
-
-  mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    env_file:
-      - .env
-    environment:
-      PAPER_CONTEXT_DATABASE__URL: postgresql+psycopg://paper_context:paper_context@db:5432/paper_context
-      PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
-    depends_on:
-      api:
-        condition: service_healthy
-    command: python -m paper_context.cli mcp
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=2)\""]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    ports:
-      - "8001:8001"
     volumes:
       - .:/app
       - ./var/artifacts:/var/lib/paper-context/artifacts
@@ -77,12 +55,34 @@ services:
       PAPER_CONTEXT_DATABASE__URL: postgresql+psycopg://paper_context:paper_context@db:5432/paper_context
       PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
     depends_on:
-      api:
+      app:
         condition: service_healthy
-    command: python -m paper_context.cli worker
+      db:
+        condition: service_healthy
+    command:
+      - python
+      - -m
+      - paper_context.cli
+      - worker
     volumes:
       - .:/app
       - ./var/artifacts:/var/lib/paper-context/artifacts
+
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - alembic
+      - upgrade
+      - head
+    profiles:
+      - migrate
 
 volumes:
   postgres_data:

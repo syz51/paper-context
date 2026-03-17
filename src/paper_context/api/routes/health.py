@@ -12,7 +12,7 @@ router = APIRouter()
 
 @router.get("/healthz", response_model=HealthResponse)
 def healthcheck() -> HealthResponse:
-    return HealthResponse(service="api", status="ok", version=__version__)
+    return HealthResponse(service="app", status="ok", version=__version__)
 
 
 @router.get("/readyz", response_model=ReadinessResponse)
@@ -20,7 +20,7 @@ def readiness() -> ReadinessResponse:
     settings = get_settings()
     db_ready = database_is_ready()
     return ReadinessResponse(
-        service="api",
+        service="app",
         status="ready" if db_ready else "degraded",
         version=__version__,
         database_ready=db_ready,

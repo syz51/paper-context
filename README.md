@@ -5,7 +5,8 @@ Paper Context is my personal, design-first experiment for building a retrieval s
 > **Status**
 >
 > The repository now includes a phase-0 runtime skeleton alongside the design docs:
-> Docker Compose for Postgres + pgvector + PGMQ, a FastAPI health surface, a FastMCP health surface, Alembic migrations, a direct-SQL PGMQ adapter, and a synthetic worker smoke path.
+>
+> Docker Compose for Postgres + pgvector + PGMQ, a FastAPI health surface that mounts FastMCP at `/mcp`, Alembic migrations, a direct-SQL PGMQ adapter, and a synthetic worker smoke path.
 > The ingestion and retrieval logic beyond the queue/bootstrap flow are still intentionally incomplete.
 
 ## Why This Exists
@@ -34,9 +35,8 @@ This repo is where I am working through that design in public. It is useful both
 
 The current MVP design is organized around three planned runtime surfaces plus one optional downstream layer:
 
-- `api`: a FastAPI surface for uploads, ingest-job status, document inspection, and operational reads
+- `app`: a FastAPI surface that hosts `/healthz` and `/readyz` and mounts the FastMCP transport at `/mcp`
 - `worker`: a background process for parsing, normalization, enrichment, chunking, embedding, and index-version writes
-- `mcp`: a FastMCP surface for search and context-pack retrieval tools
 - `skill` (optional): downstream agent guidance, not canonical retrieval logic
 
 The retrieval path is intentionally deterministic: metadata filtering, sparse retrieval, dense retrieval, fusion, reranking, and parent expansion. The goal is to return grounded context packs with stable provenance for downstream agents rather than hide the system behind answer synthesis.
@@ -85,7 +85,7 @@ If you want the current source of truth, start here:
 - Validate structure quality gates and fallback behavior
 - Lock down the normalized data model and provenance requirements
 - Test retrieval quality for passages, tables, and context packs
-- Keep the API and MCP contracts narrow, explicit, and version-aware
+- Keep the hosted app and MCP contracts narrow, explicit, and version-aware
 
 ## Phase 0 Bring-Up
 
@@ -94,22 +94,21 @@ Copy `.env.example` to `.env`, then:
 ```bash
 uv sync --extra dev
 docker compose up --build -d db
-alembic upgrade head
-python -m paper_context.cli api
-python -m paper_context.cli mcp
+docker compose run --rm migrate
+python -m paper_context.cli serve
 python -m paper_context.cli verify-synthetic-job
 ```
 
 Or run the full stack in Compose:
 
 ```bash
-docker compose up --build
+docker compose --profile migrate up --build
 ```
 
 Phase 0 exit checks:
 
-- API health: `GET /healthz`, readiness: `GET /readyz`
-- MCP health: `GET /healthz`, readiness: `GET /readyz`, mounted MCP transport at `/mcp`
+- App health: `GET /healthz`, readiness: `GET /readyz`
+- Mounted MCP transport: `GET /mcp`
 - Synthetic job verification: `python -m paper_context.cli verify-synthetic-job`
 
 ## Developer Quality Gate

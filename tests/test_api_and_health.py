@@ -27,7 +27,9 @@ def _patch_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNa
     return settings
 
 
-def test_lifespan_invokes_storage_and_dispose(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_lifespan_invokes_storage_and_dispose(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     settings = _patch_settings(monkeypatch, tmp_path)
     calls: list[str | tuple[str, Path]] = []
 
@@ -40,7 +42,11 @@ def test_lifespan_invokes_storage_and_dispose(monkeypatch: pytest.MonkeyPatch, t
 
     monkeypatch.setattr(api_app_module, "LocalFilesystemStorage", StubStorage)
     monkeypatch.setattr(api_app_module, "dispose_engine", lambda: calls.append("dispose"))
-    monkeypatch.setattr(api_app_module, "configure_logging", lambda level: calls.append(("log", level)))
+    monkeypatch.setattr(
+        api_app_module,
+        "configure_logging",
+        lambda level: calls.append(("log", level)),
+    )
 
     with TestClient(create_app()) as client:
         client.get("/healthz")
@@ -64,7 +70,7 @@ def test_health_endpoint_reports_service(monkeypatch: pytest.MonkeyPatch, tmp_pa
         response = client.get("/healthz")
 
     payload = response.json()
-    assert payload["service"] == "api"
+    assert payload["service"] == "app"
     assert payload["status"] == "ok"
     assert payload["version"] == __version__
 
@@ -90,4 +96,4 @@ def test_readiness_reflects_database_state(
     assert payload["status"] == status
     assert payload["database_ready"] is db_ready
     assert payload["queue_name"] == "document_ingest"
-    assert payload["service"] == "api"
+    assert payload["service"] == "app"

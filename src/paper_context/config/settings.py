@@ -46,10 +46,8 @@ class ChunkingSettings(BaseModel):
 
 class RuntimeSettings(BaseModel):
     # These defaults are intentional so local/container deployments are reachable.
-    api_host: str = "0.0.0.0"  # nosec B104
-    api_port: int = 8000
-    mcp_host: str = "0.0.0.0"  # nosec B104
-    mcp_port: int = 8001
+    app_host: str = "0.0.0.0"  # nosec B104
+    app_port: int = 8000
     worker_idle_sleep_seconds: float = 1.0
 
 
