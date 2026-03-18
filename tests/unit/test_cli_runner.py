@@ -13,7 +13,6 @@ import paper_context.worker.loop as worker_loop_module
 import paper_context.worker.runner as runner_module
 from paper_context.queue.contracts import ClaimedIngestMessage, IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
-from paper_context.worker.loop import IngestWorker, WorkerConfig
 
 pytestmark = pytest.mark.unit
 
@@ -143,7 +142,7 @@ def test_worker_does_not_archive_when_processor_fails(monkeypatch: pytest.Monkey
     lease = MagicMock()
     connection = MagicMock()
     monkeypatch.setattr(worker_loop_module, "LeaseExtender", MagicMock(return_value=lease))
-    worker = IngestWorker(
+    worker = worker_loop_module.IngestWorker(
         connection_factory=lambda: contextlib.nullcontext(connection),
         queue_adapter=queue,
         processor=processor,
@@ -213,7 +212,7 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     kwargs = worker_cls.call_args.kwargs
     assert kwargs["queue_adapter"] is queue_instance
     assert kwargs["processor"] is processor_instance
-    assert kwargs["config"] == WorkerConfig(
+    assert kwargs["config"] == worker_loop_module.WorkerConfig(
         vt_seconds=120,
         max_poll_seconds=7,
         poll_interval_ms=80,

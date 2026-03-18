@@ -61,7 +61,7 @@ class IngestProcessor(Protocol):
         lease: LeaseExtender,
     ) -> None:
         """Process an ingest job context while the lease remains granted."""
-        ...
+        pass
 
 
 class DeterministicIngestProcessor:

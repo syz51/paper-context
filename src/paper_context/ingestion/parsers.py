@@ -25,7 +25,6 @@ from .types import (
 )
 
 _SUCCESSFUL_CONVERSION_STATUSES = {ConversionStatus.SUCCESS, ConversionStatus.PARTIAL_SUCCESS}
-_TEXTUAL_LABELS = {"paragraph", "text", "title"}
 _SKIPPED_TEXTUAL_LABELS = {"page_header", "page_footer", "footnote"}
 _NUMBERED_HEADING_PATTERN = re.compile(r"^\d+(?:\.\d+){0,3}\s+\S+")
 _YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
@@ -343,12 +342,6 @@ class PdfPlumberPdfParser:
     name = "pdfplumber"
 
     def parse(self, filename: str, content: bytes) -> ParserResult:
-        artifact = ParserArtifact(
-            artifact_type="pdfplumber_parse",
-            parser=self.name,
-            filename="pdfplumber-document.json",
-            content=b"{}",
-        )
         sections_by_key: OrderedDict[str, ParsedSection] = OrderedDict()
         tables: list[ParsedTable] = []
         references: list[ParsedReference] = []
@@ -450,7 +443,7 @@ class PdfPlumberPdfParser:
                             )
                         )
         except Exception as exc:
-            artifact = ParserArtifact(
+            error_artifact = ParserArtifact(
                 artifact_type="pdfplumber_parse",
                 parser=self.name,
                 filename="pdfplumber-error.json",
@@ -459,7 +452,7 @@ class PdfPlumberPdfParser:
             return ParserResult(
                 gate_status="fail",
                 parsed_document=None,
-                artifact=artifact,
+                artifact=error_artifact,
                 failure_code="pdfplumber_conversion_failed",
                 failure_message=str(exc),
             )
@@ -494,7 +487,7 @@ class PdfPlumberPdfParser:
         warnings = []
         if not any(section.heading for section in sections):
             warnings.append("reduced_structure_confidence")
-        artifact = ParserArtifact(
+        document_artifact = ParserArtifact(
             artifact_type="pdfplumber_parse",
             parser=self.name,
             filename="pdfplumber-document.json",
@@ -503,7 +496,7 @@ class PdfPlumberPdfParser:
         return ParserResult(
             gate_status=gate_status,
             parsed_document=parsed_document if gate_status == "pass" else None,
-            artifact=artifact,
+            artifact=document_artifact,
             warnings=warnings,
             failure_code="pdfplumber_structure_failed" if gate_status == "fail" else None,
             failure_message=(

@@ -51,7 +51,7 @@ def _patch_contract_app(
         storage=SimpleNamespace(root_path=tmp_path / "artifacts"),
         queue=SimpleNamespace(name="document_ingest"),
     )
-    monkeypatch.setattr(api_app_module, "create_http_app", lambda: _FakeMcpApp())
+    monkeypatch.setattr(api_app_module, "create_http_app", _FakeMcpApp)
     monkeypatch.setattr(api_app_module, "get_settings", lambda: settings)
     monkeypatch.setattr(health_module, "get_settings", lambda: settings)
     monkeypatch.setattr(health_module, "database_is_ready", lambda: database_ready)

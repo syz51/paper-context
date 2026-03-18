@@ -13,7 +13,8 @@ class StorageArtifact:
 
 
 class StorageInterface(Protocol):
-    def ensure_root(self) -> None: ...
+    def ensure_root(self) -> None:
+        pass
 
     def store_bytes(self, relative_path: str, content: bytes) -> StorageArtifact: ...
 

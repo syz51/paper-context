@@ -5,6 +5,7 @@
 .ruff_cache/
 .venv/
 .coverage
+.artifacts/
 coverage.xml
 htmlcov/
 __pycache__/
