@@ -15,6 +15,10 @@ class StorageSettings(BaseModel):
     root_path: Path = Path("./var/artifacts")
 
 
+class UploadSettings(BaseModel):
+    max_bytes: int = 25 * 1024 * 1024
+
+
 class QueueSettings(BaseModel):
     name: str = "document_ingest"
     visibility_timeout_seconds: int = 300
@@ -64,6 +68,7 @@ class AppSettings(BaseSettings):
     log_level: str = "INFO"
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
+    upload: UploadSettings = Field(default_factory=UploadSettings)
     queue: QueueSettings = Field(default_factory=QueueSettings)
     providers: ProviderSettings = Field(default_factory=ProviderSettings)
     parser: ParserSettings = Field(default_factory=ParserSettings)

@@ -3,8 +3,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -141,13 +143,27 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         self.replaced_index = False
 
     def _lock_ingest_job(self, connection, ingest_job_id) -> IngestJobRow | None:
-        return {"status": "queued", "warnings": []}
+        return {
+            "document_id": uuid4(),
+            "created_at": datetime.now(UTC),
+            "status": "queued",
+            "warnings": [],
+            "source_artifact_id": uuid4(),
+        }
 
-    def _load_source_artifact(self, connection, document_id) -> SourceArtifactRow | None:
-        return {"storage_ref": "documents/test/source.pdf"}
+    def _load_source_artifact(
+        self, connection, *, ingest_job_id, source_artifact_id
+    ) -> SourceArtifactRow | None:
+        return cast(
+            SourceArtifactRow,
+            {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
+        )
 
-    def _reset_document_state(self, connection, document_id) -> None:
+    def _reset_document_state(self, connection, *, document_id, ingest_job_id) -> None:
         return None
+
+    def _is_superseded(self, connection, *, ingest_job_id, document_id, created_at) -> bool:
+        return False
 
     def _persist_parser_artifact(self, connection, **kwargs):
         return uuid4()
@@ -192,7 +208,7 @@ def test_documents_api_service_stores_source_artifact_and_enqueues_job(tmp_path:
     engine.begin.return_value = nullcontext(connection)
     queue = MagicMock()
     storage = MagicMock()
-    storage.store_bytes.return_value = SimpleNamespace(
+    storage.store_file.return_value = SimpleNamespace(
         storage_ref="documents/source.pdf",
         checksum="abc123",
     )
@@ -201,13 +217,13 @@ def test_documents_api_service_stores_source_artifact_and_enqueues_job(tmp_path:
     response = service.create_document(
         filename="paper.pdf",
         content_type="application/pdf",
-        body=b"%PDF-1.4\nphase-1",
+        upload=BytesIO(b"%PDF-1.4\nphase-1"),
         title="Phase 1 paper",
     )
 
     assert response.status == "queued"
-    storage.store_bytes.assert_called_once()
-    assert connection.execute.call_count == 3
+    storage.store_file.assert_called_once()
+    assert connection.execute.call_count == 4
     queue.enqueue_ingest.assert_called_once()
 
 

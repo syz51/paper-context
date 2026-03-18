@@ -35,27 +35,29 @@ class IngestWorker:
         self._config = config or WorkerConfig()
 
     def run_once(self) -> ClaimedIngestMessage | None:
-        with self._connection_factory() as connection:
+        with self._connection_factory() as claim_connection:
             task = self._queue_adapter.claim_ingest(
-                connection,
+                claim_connection,
                 vt_seconds=self._config.vt_seconds,
                 max_poll_seconds=self._config.max_poll_seconds,
                 poll_interval_ms=self._config.poll_interval_ms,
             )
-            if task is None:
-                return None
+        if task is None:
+            return None
 
-            lease = LeaseExtender(
-                connection,
-                self._queue_adapter,
-                task.message,
-                self._config.vt_seconds,
-            )
-            lease.extend()
+        lease = LeaseExtender(
+            self._connection_factory,
+            self._queue_adapter,
+            task.message,
+            self._config.vt_seconds,
+        )
+        lease.extend()
+        with self._connection_factory() as processing_connection:
             self._processor.process(
-                connection,
+                processing_connection,
                 IngestJobContext(message=task.message, payload=task.payload),
                 lease,
             )
-            self._queue_adapter.archive_message(connection, task.message.msg_id)
-            return task
+        with self._connection_factory() as archive_connection:
+            self._queue_adapter.archive_message(archive_connection, task.message.msg_id)
+        return task

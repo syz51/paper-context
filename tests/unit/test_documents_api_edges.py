@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException, UploadFile
+from starlette.requests import Request
 
 from paper_context.api.routes import documents as documents_route_module
 from paper_context.ingestion.api import DocumentsApiService
@@ -21,6 +22,7 @@ def test_get_documents_service_builds_service_from_settings(
     settings = SimpleNamespace(
         storage=SimpleNamespace(root_path="/tmp/storage"),
         queue=SimpleNamespace(name="document_ingest"),
+        upload=SimpleNamespace(max_bytes=1024),
     )
     engine = object()
     storage = object()
@@ -40,7 +42,12 @@ def test_get_documents_service_builds_service_from_settings(
     assert resolved is service
     storage_cls.assert_called_once_with("/tmp/storage")
     queue_cls.assert_called_once_with("document_ingest")
-    service_cls.assert_called_once_with(engine=engine, queue=queue, storage=storage)
+    service_cls.assert_called_once_with(
+        engine=engine,
+        queue=queue,
+        storage=storage,
+        max_upload_bytes=1024,
+    )
 
 
 def test_upload_document_translates_value_error_to_http_400() -> None:
@@ -48,9 +55,10 @@ def test_upload_document_translates_value_error_to_http_400() -> None:
     service.create_document.side_effect = ValueError("uploaded file is empty")
     upload = UploadFile(filename="paper.pdf", file=BytesIO(b""))
     upload_document = documents_route_module.upload_document
+    request = Request({"type": "http", "headers": []})
 
     with pytest.raises(HTTPException, match="uploaded file is empty") as exc_info:
-        asyncio.run(upload_document(file=upload, title=None, service=service))
+        asyncio.run(upload_document(request=request, file=upload, title=None, service=service))
 
     assert exc_info.value.status_code == 400
 
@@ -62,7 +70,7 @@ def test_create_document_rejects_empty_body_before_storage_work() -> None:
         service.create_document(
             filename="paper.pdf",
             content_type="application/pdf",
-            body=b"",
+            upload=BytesIO(b""),
         )
 
 
@@ -73,7 +81,7 @@ def test_create_document_rejects_non_pdf_uploads() -> None:
         service.create_document(
             filename="paper.txt",
             content_type="text/plain",
-            body=b"plain text",
+            upload=BytesIO(b"plain text"),
         )
 
 
@@ -84,7 +92,7 @@ def test_create_document_forwards_trace_headers_to_queue() -> None:
     engine.begin.return_value.__exit__.return_value = None
     queue = MagicMock()
     storage = MagicMock()
-    storage.store_bytes.return_value = SimpleNamespace(
+    storage.store_file.return_value = SimpleNamespace(
         storage_ref="documents/source.pdf",
         checksum="abc123",
     )
@@ -93,7 +101,7 @@ def test_create_document_forwards_trace_headers_to_queue() -> None:
     response = service.create_document(
         filename="paper.pdf",
         content_type="application/pdf",
-        body=b"%PDF-1.4",
+        upload=BytesIO(b"%PDF-1.4"),
         trace_headers={"x-trace-id": "trace-123"},
     )
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, TypedDict, cast
@@ -16,16 +18,21 @@ from paper_context.queue.pgmq import PgmqMessage
 from paper_context.storage.base import StorageInterface
 
 from .enrichment import MetadataEnricher
+from .identifiers import artifact_id, retrieval_index_run_id
 from .parsers import PdfParser
 from .types import EnrichmentResult, ParsedDocument, ParsedParagraph, ParsedSection, ParserResult
 
 
 class IngestJobRow(TypedDict):
+    document_id: uuid.UUID
+    created_at: datetime
     status: str
     warnings: list[str]
+    source_artifact_id: uuid.UUID | None
 
 
 class SourceArtifactRow(TypedDict):
+    id: uuid.UUID
     storage_ref: str
 
 
@@ -35,22 +42,26 @@ class IngestJobContext:
     payload: IngestQueuePayload
 
 
+ConnectionFactory = Callable[[], AbstractContextManager[Connection]]
+
+
 class LeaseExtender:
     def __init__(
         self,
-        connection: Connection,
+        connection_factory: ConnectionFactory,
         queue_adapter: IngestionQueue,
         message: PgmqMessage,
         default_vt_seconds: int,
     ) -> None:
-        self._connection = connection
+        self._connection_factory = connection_factory
         self._queue_adapter = queue_adapter
         self._message = message
         self._default_vt_seconds = default_vt_seconds
 
     def extend(self, vt_seconds: int | None = None) -> None:
         vt_seconds = vt_seconds or self._default_vt_seconds
-        self._queue_adapter.extend_lease(self._connection, self._message.msg_id, vt_seconds)
+        with self._connection_factory() as connection:
+            self._queue_adapter.extend_lease(connection, self._message.msg_id, vt_seconds)
 
 
 class IngestProcessor(Protocol):
@@ -100,183 +111,221 @@ class DeterministicIngestProcessor:
         context: IngestJobContext,
         lease: LeaseExtender,
     ) -> None:
-        job = self._lock_ingest_job(connection, context.payload.ingest_job_id)
-        if job is None:
-            raise LookupError(f"missing ingest job {context.payload.ingest_job_id}")
-        if job["status"] in self.TERMINAL_STATUSES:
-            return
+        created_storage_refs: list[str] = []
+        try:
+            job = self._lock_ingest_job(connection, context.payload.ingest_job_id)
+            if job is None:
+                raise LookupError(f"missing ingest job {context.payload.ingest_job_id}")
+            if job["status"] in self.TERMINAL_STATUSES:
+                return
 
-        source_artifact = self._load_source_artifact(connection, context.payload.document_id)
-        if source_artifact is None:
-            self._mark_failed(
+            document_id = job["document_id"]
+            self._lock_document(connection, document_id)
+            warnings = list(job["warnings"])
+            if self._is_superseded(
                 connection,
                 ingest_job_id=context.payload.ingest_job_id,
-                document_id=context.payload.document_id,
-                failure_code="missing_source_artifact",
-                failure_message="No source PDF artifact exists for this ingest job.",
-                warnings=[],
-            )
-            return
-
-        self._reset_document_state(connection, context.payload.document_id)
-        storage_ref = source_artifact["storage_ref"]
-        pdf_bytes = self._storage.resolve(storage_ref).read_bytes()
-        warnings = list(job["warnings"])
-
-        self._mark_stage(
-            connection,
-            ingest_job_id=context.payload.ingest_job_id,
-            document_id=context.payload.document_id,
-            status="parsing",
-            warnings=warnings,
-        )
-
-        primary_result = self._primary_parser.parse(
-            filename=storage_ref,
-            content=pdf_bytes,
-        )
-        primary_artifact_id = self._persist_parser_artifact(
-            connection,
-            document_id=context.payload.document_id,
-            ingest_job_id=context.payload.ingest_job_id,
-            artifact=primary_result,
-            is_primary=primary_result.gate_status == "pass",
-        )
-        lease.extend()
-
-        active_result = primary_result
-        active_artifact_id = primary_artifact_id
-        parser_source = primary_result.artifact.parser
-        warnings = _dedupe_warnings([*warnings, *primary_result.warnings])
-        if primary_result.gate_status == "degraded":
-            warnings = _dedupe_warnings([*warnings, "parser_fallback_used"])
-            fallback_result = self._fallback_parser.parse(
-                filename=storage_ref,
-                content=pdf_bytes,
-            )
-            fallback_artifact_id = self._persist_parser_artifact(
-                connection,
-                document_id=context.payload.document_id,
-                ingest_job_id=context.payload.ingest_job_id,
-                artifact=fallback_result,
-                is_primary=fallback_result.gate_status == "pass",
-            )
-            lease.extend()
-            warnings = _dedupe_warnings([*warnings, *fallback_result.warnings])
-            if fallback_result.gate_status != "pass" or fallback_result.parsed_document is None:
+                document_id=document_id,
+                created_at=job["created_at"],
+            ):
                 self._mark_failed(
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
-                    document_id=context.payload.document_id,
-                    failure_code=fallback_result.failure_code or "pdfplumber_structure_failed",
+                    document_id=document_id,
+                    failure_code="superseded_by_newer_ingest_job",
                     failure_message=(
-                        fallback_result.failure_message
-                        or "Fallback parsing could not recover stable passages with provenance."
+                        "A newer ingest job superseded this run before processing began."
                     ),
                     warnings=warnings,
                 )
                 return
-            active_result = fallback_result
-            active_artifact_id = fallback_artifact_id
-            parser_source = fallback_result.artifact.parser
-        elif primary_result.gate_status == "fail" or primary_result.parsed_document is None:
-            self._mark_failed(
+
+            source_artifact = self._load_source_artifact(
                 connection,
                 ingest_job_id=context.payload.ingest_job_id,
-                document_id=context.payload.document_id,
-                failure_code=primary_result.failure_code or "docling_structure_failed",
-                failure_message=(
-                    primary_result.failure_message
-                    or "Docling could not recover stable passages with provenance."
-                ),
+                source_artifact_id=job["source_artifact_id"],
+            )
+            if source_artifact is None:
+                self._mark_failed(
+                    connection,
+                    ingest_job_id=context.payload.ingest_job_id,
+                    document_id=document_id,
+                    failure_code="missing_source_artifact",
+                    failure_message="No source PDF artifact exists for this ingest job.",
+                    warnings=warnings,
+                )
+                return
+
+            self._reset_document_state(
+                connection,
+                document_id=document_id,
+                ingest_job_id=context.payload.ingest_job_id,
+            )
+            storage_ref = source_artifact["storage_ref"]
+            pdf_bytes = self._storage.resolve(storage_ref).read_bytes()
+
+            self._mark_stage(
+                connection,
+                ingest_job_id=context.payload.ingest_job_id,
+                document_id=document_id,
+                status="parsing",
                 warnings=warnings,
             )
-            return
 
-        parsed_document = active_result.parsed_document
-        if parsed_document is None:
-            raise RuntimeError("parsed_document is unexpectedly missing after parser validation")
+            primary_result = self._primary_parser.parse(
+                filename=storage_ref,
+                content=pdf_bytes,
+            )
+            primary_artifact_id = self._persist_parser_artifact(
+                connection,
+                document_id=document_id,
+                ingest_job_id=context.payload.ingest_job_id,
+                artifact=primary_result,
+                is_primary=primary_result.gate_status == "pass",
+                created_storage_refs=created_storage_refs,
+            )
+            lease.extend()
 
-        if (parsed_document.metadata_confidence or 0.0) < 0.5:
-            warnings = _dedupe_warnings([*warnings, "metadata_low_confidence"])
+            active_result = primary_result
+            active_artifact_id = primary_artifact_id
+            parser_source = primary_result.artifact.parser
+            warnings = _dedupe_warnings([*warnings, *primary_result.warnings])
+            if primary_result.gate_status == "degraded":
+                warnings = _dedupe_warnings([*warnings, "parser_fallback_used"])
+                fallback_result = self._fallback_parser.parse(
+                    filename=storage_ref,
+                    content=pdf_bytes,
+                )
+                fallback_artifact_id = self._persist_parser_artifact(
+                    connection,
+                    document_id=document_id,
+                    ingest_job_id=context.payload.ingest_job_id,
+                    artifact=fallback_result,
+                    is_primary=fallback_result.gate_status == "pass",
+                    created_storage_refs=created_storage_refs,
+                )
+                lease.extend()
+                warnings = _dedupe_warnings([*warnings, *fallback_result.warnings])
+                if fallback_result.gate_status != "pass" or fallback_result.parsed_document is None:
+                    self._mark_failed(
+                        connection,
+                        ingest_job_id=context.payload.ingest_job_id,
+                        document_id=document_id,
+                        failure_code=fallback_result.failure_code or "pdfplumber_structure_failed",
+                        failure_message=(
+                            fallback_result.failure_message
+                            or "Fallback parsing could not recover stable passages with provenance."
+                        ),
+                        warnings=warnings,
+                    )
+                    return
+                active_result = fallback_result
+                active_artifact_id = fallback_artifact_id
+                parser_source = fallback_result.artifact.parser
+            elif primary_result.gate_status == "fail" or primary_result.parsed_document is None:
+                self._mark_failed(
+                    connection,
+                    ingest_job_id=context.payload.ingest_job_id,
+                    document_id=document_id,
+                    failure_code=primary_result.failure_code or "docling_structure_failed",
+                    failure_message=(
+                        primary_result.failure_message
+                        or "Docling could not recover stable passages with provenance."
+                    ),
+                    warnings=warnings,
+                )
+                return
 
-        self._mark_stage(
-            connection,
-            ingest_job_id=context.payload.ingest_job_id,
-            document_id=context.payload.document_id,
-            status="normalizing",
-            warnings=warnings,
-        )
-        section_ids = self._normalize_document(
-            connection,
-            document_id=context.payload.document_id,
-            parsed_document=parsed_document,
-            artifact_id=active_artifact_id,
-        )
-        self._apply_document_metadata(
-            connection,
-            document_id=context.payload.document_id,
-            title=parsed_document.title,
-            authors=parsed_document.authors,
-            abstract=parsed_document.abstract,
-            publication_year=parsed_document.publication_year,
-            metadata_confidence=parsed_document.metadata_confidence,
-        )
-        lease.extend()
+            parsed_document = active_result.parsed_document
+            if parsed_document is None:
+                raise RuntimeError(
+                    "parsed_document is unexpectedly missing after parser validation"
+                )
 
-        self._mark_stage(
-            connection,
-            ingest_job_id=context.payload.ingest_job_id,
-            document_id=context.payload.document_id,
-            status="enriching_metadata",
-            warnings=warnings,
-        )
-        enrichment = self._metadata_enricher.enrich(parsed_document)
-        warnings = _dedupe_warnings([*warnings, *enrichment.warnings])
-        self._apply_enriched_document_metadata(
-            connection,
-            document_id=context.payload.document_id,
-            parsed_document=parsed_document,
-            enrichment=enrichment,
-            warnings=warnings,
-        )
-        lease.extend()
+            if (parsed_document.metadata_confidence or 0.0) < 0.5:
+                warnings = _dedupe_warnings([*warnings, "metadata_low_confidence"])
 
-        self._mark_stage(
-            connection,
-            ingest_job_id=context.payload.ingest_job_id,
-            document_id=context.payload.document_id,
-            status="chunking",
-            warnings=warnings,
-        )
-        self._insert_passages(
-            connection,
-            document_id=context.payload.document_id,
-            parsed_document=parsed_document,
-            section_ids=section_ids,
-            artifact_id=active_artifact_id,
-        )
-        lease.extend()
+            self._mark_stage(
+                connection,
+                ingest_job_id=context.payload.ingest_job_id,
+                document_id=document_id,
+                status="normalizing",
+                warnings=warnings,
+            )
+            section_ids = self._normalize_document(
+                connection,
+                document_id=document_id,
+                parsed_document=parsed_document,
+                artifact_id=active_artifact_id,
+            )
+            self._apply_document_metadata(
+                connection,
+                document_id=document_id,
+                title=parsed_document.title,
+                authors=parsed_document.authors,
+                abstract=parsed_document.abstract,
+                publication_year=parsed_document.publication_year,
+                metadata_confidence=parsed_document.metadata_confidence,
+            )
+            lease.extend()
 
-        self._mark_stage(
-            connection,
-            ingest_job_id=context.payload.ingest_job_id,
-            document_id=context.payload.document_id,
-            status="indexing",
-            warnings=warnings,
-        )
-        self._replace_index_run(
-            connection,
-            document_id=context.payload.document_id,
-            ingest_job_id=context.payload.ingest_job_id,
-            parser_source=parser_source,
-        )
-        self._mark_ready(
-            connection,
-            ingest_job_id=context.payload.ingest_job_id,
-            document_id=context.payload.document_id,
-            warnings=warnings,
-        )
+            self._mark_stage(
+                connection,
+                ingest_job_id=context.payload.ingest_job_id,
+                document_id=document_id,
+                status="enriching_metadata",
+                warnings=warnings,
+            )
+            enrichment = self._metadata_enricher.enrich(parsed_document)
+            warnings = _dedupe_warnings([*warnings, *enrichment.warnings])
+            self._apply_enriched_document_metadata(
+                connection,
+                document_id=document_id,
+                parsed_document=parsed_document,
+                enrichment=enrichment,
+                warnings=warnings,
+            )
+            lease.extend()
+
+            self._mark_stage(
+                connection,
+                ingest_job_id=context.payload.ingest_job_id,
+                document_id=document_id,
+                status="chunking",
+                warnings=warnings,
+            )
+            self._insert_passages(
+                connection,
+                document_id=document_id,
+                parsed_document=parsed_document,
+                section_ids=section_ids,
+                artifact_id=active_artifact_id,
+            )
+            lease.extend()
+
+            self._mark_stage(
+                connection,
+                ingest_job_id=context.payload.ingest_job_id,
+                document_id=document_id,
+                status="indexing",
+                warnings=warnings,
+            )
+            self._replace_index_run(
+                connection,
+                document_id=document_id,
+                ingest_job_id=context.payload.ingest_job_id,
+                parser_source=parser_source,
+            )
+            self._mark_ready(
+                connection,
+                ingest_job_id=context.payload.ingest_job_id,
+                document_id=document_id,
+                warnings=warnings,
+            )
+        except Exception:
+            for storage_ref in reversed(created_storage_refs):
+                self._storage.delete(storage_ref)
+            raise
 
     def _lock_ingest_job(
         self,
@@ -287,7 +336,13 @@ class DeterministicIngestProcessor:
             connection.execute(
                 text(
                     """
-                    SELECT id, document_id, status, COALESCE(warnings, '[]'::jsonb) AS warnings
+                    SELECT
+                        id,
+                        document_id,
+                        source_artifact_id,
+                        created_at,
+                        status,
+                        COALESCE(warnings, '[]'::jsonb) AS warnings
                     FROM ingest_jobs
                     WHERE id = :ingest_job_id
                     FOR UPDATE
@@ -302,24 +357,43 @@ class DeterministicIngestProcessor:
             return None
         return cast(IngestJobRow, dict(row))
 
+    def _lock_document(self, connection: Connection, document_id: uuid.UUID) -> None:
+        connection.execute(
+            text(
+                """
+                SELECT id
+                FROM documents
+                WHERE id = :document_id
+                FOR UPDATE
+                """
+            ),
+            {"document_id": document_id},
+        ).scalar_one()
+
     def _load_source_artifact(
         self,
         connection: Connection,
-        document_id: uuid.UUID,
+        *,
+        ingest_job_id: uuid.UUID,
+        source_artifact_id: uuid.UUID | None,
     ) -> SourceArtifactRow | None:
+        if source_artifact_id is None:
+            return None
         row = (
             connection.execute(
                 text(
                     """
                     SELECT id, storage_ref, checksum
                     FROM document_artifacts
-                    WHERE document_id = :document_id
+                    WHERE id = :source_artifact_id
+                      AND ingest_job_id = :ingest_job_id
                       AND artifact_type = 'source_pdf'
-                    ORDER BY created_at DESC
-                    LIMIT 1
                     """
                 ),
-                {"document_id": document_id},
+                {
+                    "source_artifact_id": source_artifact_id,
+                    "ingest_job_id": ingest_job_id,
+                },
             )
             .mappings()
             .one_or_none()
@@ -328,12 +402,30 @@ class DeterministicIngestProcessor:
             return None
         return cast(SourceArtifactRow, dict(row))
 
-    def _reset_document_state(self, connection: Connection, document_id: uuid.UUID) -> None:
+    def _reset_document_state(
+        self,
+        connection: Connection,
+        *,
+        document_id: uuid.UUID,
+        ingest_job_id: uuid.UUID,
+    ) -> None:
         for statement in [
-            "DELETE FROM document_passages WHERE document_id = :document_id",
-            "DELETE FROM document_tables WHERE document_id = :document_id",
-            "DELETE FROM document_references WHERE document_id = :document_id",
-            "DELETE FROM document_sections WHERE document_id = :document_id",
+            """
+            DELETE FROM document_passages
+            WHERE document_id = :document_id
+            """,
+            """
+            DELETE FROM document_tables
+            WHERE document_id = :document_id
+            """,
+            """
+            DELETE FROM document_references
+            WHERE document_id = :document_id
+            """,
+            """
+            DELETE FROM document_sections
+            WHERE document_id = :document_id
+            """,
             "DELETE FROM retrieval_index_runs WHERE document_id = :document_id",
             """
             DELETE FROM document_artifacts
@@ -346,7 +438,10 @@ class DeterministicIngestProcessor:
             WHERE document_id = :document_id
             """,
         ]:
-            connection.execute(text(statement), {"document_id": document_id})
+            connection.execute(
+                text(statement),
+                {"document_id": document_id, "ingest_job_id": ingest_job_id},
+            )
 
     def _persist_parser_artifact(
         self,
@@ -356,18 +451,26 @@ class DeterministicIngestProcessor:
         ingest_job_id: uuid.UUID,
         artifact: ParserResult,
         is_primary: bool,
+        created_storage_refs: list[str] | None = None,
     ) -> uuid.UUID:
         stored_artifact = self._storage.store_bytes(
             f"documents/{document_id}/{ingest_job_id}/{artifact.artifact.filename}",
             artifact.artifact.content,
         )
-        artifact_id = uuid.uuid4()
+        if created_storage_refs is not None:
+            created_storage_refs.append(stored_artifact.storage_ref)
+        parser_artifact_id = artifact_id(
+            ingest_job_id=ingest_job_id,
+            artifact_type=artifact.artifact.artifact_type,
+            parser=artifact.artifact.parser,
+        )
         connection.execute(
             text(
                 """
                 INSERT INTO document_artifacts (
                     id,
                     document_id,
+                    ingest_job_id,
                     artifact_type,
                     parser,
                     storage_ref,
@@ -377,17 +480,23 @@ class DeterministicIngestProcessor:
                 VALUES (
                     :id,
                     :document_id,
+                    :ingest_job_id,
                     :artifact_type,
                     :parser,
                     :storage_ref,
                     :checksum,
                     :is_primary
                 )
+                ON CONFLICT (id) DO UPDATE
+                SET storage_ref = EXCLUDED.storage_ref,
+                    checksum = EXCLUDED.checksum,
+                    is_primary = EXCLUDED.is_primary
                 """
             ),
             {
-                "id": artifact_id,
+                "id": parser_artifact_id,
                 "document_id": document_id,
+                "ingest_job_id": ingest_job_id,
                 "artifact_type": artifact.artifact.artifact_type,
                 "parser": artifact.artifact.parser,
                 "storage_ref": stored_artifact.storage_ref,
@@ -395,7 +504,7 @@ class DeterministicIngestProcessor:
                 "is_primary": is_primary,
             },
         )
-        return artifact_id
+        return parser_artifact_id
 
     def _normalize_document(
         self,
@@ -739,14 +848,14 @@ class DeterministicIngestProcessor:
             text(
                 """
                 DELETE FROM retrieval_index_runs
-                WHERE document_id = :document_id
+                WHERE ingest_job_id = :ingest_job_id
                 """
             ),
-            {"document_id": document_id},
+            {"ingest_job_id": ingest_job_id},
         )
         connection.execute(
             insert(RetrievalIndexRun).values(
-                id=uuid.uuid4(),
+                id=retrieval_index_run_id(ingest_job_id=ingest_job_id),
                 document_id=document_id,
                 ingest_job_id=ingest_job_id,
                 index_version=self._index_version,
@@ -758,6 +867,76 @@ class DeterministicIngestProcessor:
                 parser_source=parser_source,
                 status="ready",
             )
+        )
+
+    def _is_superseded(
+        self,
+        connection: Connection,
+        *,
+        ingest_job_id: uuid.UUID,
+        document_id: uuid.UUID,
+        created_at: datetime,
+    ) -> bool:
+        result = connection.execute(
+            text(
+                """
+                SELECT EXISTS(
+                    SELECT 1
+                    FROM ingest_jobs newer
+                    WHERE newer.document_id = :document_id
+                      AND newer.id <> :ingest_job_id
+                      AND (
+                          newer.created_at > :created_at
+                          OR (
+                              newer.created_at = :created_at
+                              AND newer.id::text > :ingest_job_id_text
+                          )
+                      )
+                )
+                """
+            ),
+            {
+                "document_id": document_id,
+                "ingest_job_id": ingest_job_id,
+                "created_at": created_at,
+                "ingest_job_id_text": str(ingest_job_id),
+            },
+        )
+        return bool(result.scalar_one())
+
+    def _update_document_status_if_current(
+        self,
+        connection: Connection,
+        *,
+        document_id: uuid.UUID,
+        ingest_job_id: uuid.UUID,
+        status: str,
+        now: datetime,
+    ) -> None:
+        connection.execute(
+            text(
+                """
+                UPDATE documents
+                SET current_status = :status,
+                    updated_at = :now
+                WHERE id = :document_id
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM ingest_jobs current_job
+                      JOIN ingest_jobs newer
+                        ON newer.document_id = current_job.document_id
+                       AND newer.id <> current_job.id
+                       AND newer.created_at > current_job.created_at
+                      WHERE current_job.id = :ingest_job_id
+                  )
+                """
+            ),
+            {
+                "document_id": document_id,
+                "ingest_job_id": ingest_job_id,
+                "status": status,
+                "now": now,
+            },
         )
 
     def _mark_stage(
@@ -790,16 +969,12 @@ class DeterministicIngestProcessor:
                 "now": now,
             },
         )
-        connection.execute(
-            text(
-                """
-                UPDATE documents
-                SET current_status = :status,
-                    updated_at = :now
-                WHERE id = :document_id
-                """
-            ),
-            {"document_id": document_id, "status": status, "now": now},
+        self._update_document_status_if_current(
+            connection,
+            document_id=document_id,
+            ingest_job_id=ingest_job_id,
+            status=status,
+            now=now,
         )
 
     def _mark_failed(
@@ -834,16 +1009,12 @@ class DeterministicIngestProcessor:
                 "now": now,
             },
         )
-        connection.execute(
-            text(
-                """
-                UPDATE documents
-                SET current_status = 'failed',
-                    updated_at = :now
-                WHERE id = :document_id
-                """
-            ),
-            {"document_id": document_id, "now": now},
+        self._update_document_status_if_current(
+            connection,
+            document_id=document_id,
+            ingest_job_id=ingest_job_id,
+            status="failed",
+            now=now,
         )
 
     def _mark_ready(
@@ -871,16 +1042,12 @@ class DeterministicIngestProcessor:
                 "now": now,
             },
         )
-        connection.execute(
-            text(
-                """
-                UPDATE documents
-                SET current_status = 'ready',
-                    updated_at = :now
-                WHERE id = :document_id
-                """
-            ),
-            {"document_id": document_id, "now": now},
+        self._update_document_status_if_current(
+            connection,
+            document_id=document_id,
+            ingest_job_id=ingest_job_id,
+            status="ready",
+            now=now,
         )
 
 

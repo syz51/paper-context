@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -142,7 +143,7 @@ def test_lease_extender_uses_default_and_overridden_vt() -> None:
     adapter = MagicMock()
     connection = MagicMock()
     message = MagicMock(msg_id=7)
-    lease = LeaseExtender(connection, adapter, message, default_vt_seconds=60)
+    lease = LeaseExtender(lambda: nullcontext(connection), adapter, message, default_vt_seconds=60)
 
     lease.extend()
     lease.extend(vt_seconds=5)

@@ -46,6 +46,11 @@ class DocumentArtifact(Base):
         ForeignKey("documents.id", ondelete="CASCADE"),
         nullable=False,
     )
+    ingest_job_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ingest_jobs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     artifact_type: Mapped[str] = mapped_column(String(64), nullable=False)
     parser: Mapped[str] = mapped_column(String(64), nullable=False)
     storage_ref: Mapped[str] = mapped_column(String(2048), nullable=False)

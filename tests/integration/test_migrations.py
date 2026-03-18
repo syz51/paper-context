@@ -27,6 +27,7 @@ EXPECTED_PHASE0_TABLE_COLUMNS = {
     "document_artifacts": {
         "id",
         "document_id",
+        "ingest_job_id",
         "artifact_type",
         "parser",
         "storage_ref",
@@ -86,6 +87,7 @@ EXPECTED_PHASE0_TABLE_COLUMNS = {
     "ingest_jobs": {
         "id",
         "document_id",
+        "source_artifact_id",
         "status",
         "failure_code",
         "failure_message",
@@ -115,6 +117,7 @@ EXPECTED_PHASE0_TABLE_COLUMNS = {
 EXPECTED_PHASE0_INDEX_COLUMNS = {
     "ix_documents_current_status": ["current_status"],
     "ix_document_artifacts_document_id": ["document_id"],
+    "ix_document_artifacts_ingest_job_id": ["ingest_job_id"],
     "ix_document_sections_document_id": ["document_id"],
     "ix_document_passages_document_id": ["document_id"],
     "ix_document_passages_section_id": ["section_id"],

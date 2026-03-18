@@ -32,7 +32,7 @@ class _DocumentsApiService:
         *,
         filename: str,
         content_type: str | None,
-        body: bytes,
+        upload,
         title: str | None,
         trace_headers=None,
     ) -> DocumentUploadResponse:

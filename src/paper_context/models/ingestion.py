@@ -20,6 +20,11 @@ class IngestJob(Base):
         ForeignKey("documents.id", ondelete="CASCADE"),
         nullable=False,
     )
+    source_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_artifacts.id"),
+        nullable=True,
+    )
     status: Mapped[str] = mapped_column(
         String(32),
         nullable=False,

@@ -44,12 +44,49 @@ def upgrade() -> None:
     op.create_index("ix_documents_current_status", "documents", ["current_status"])
 
     op.create_table(
+        "ingest_jobs",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
+        sa.Column(
+            "document_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("documents.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "source_artifact_id",
+            postgresql.UUID(as_uuid=True),
+            nullable=True,
+        ),
+        sa.Column("status", sa.String(32), nullable=False, server_default=sa.text("'queued'")),
+        sa.Column("failure_code", sa.String(128), nullable=True),
+        sa.Column("failure_message", sa.Text, nullable=True),
+        sa.Column("warnings", postgresql.JSONB, nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("trigger", sa.String(64), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+    )
+    op.create_index("ix_ingest_jobs_document_id", "ingest_jobs", ["document_id"])
+    op.create_index("ix_ingest_jobs_status", "ingest_jobs", ["status"])
+
+    op.create_table(
         "document_artifacts",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
         sa.Column(
             "document_id",
             postgresql.UUID(as_uuid=True),
             sa.ForeignKey("documents.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "ingest_job_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("ingest_jobs.id", ondelete="CASCADE"),
             nullable=False,
         ),
         sa.Column("artifact_type", sa.String(64), nullable=False),
@@ -65,6 +102,14 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_document_artifacts_document_id", "document_artifacts", ["document_id"])
+    op.create_index("ix_document_artifacts_ingest_job_id", "document_artifacts", ["ingest_job_id"])
+    op.create_foreign_key(
+        "fk_ingest_jobs_source_artifact_id_document_artifacts",
+        "ingest_jobs",
+        "document_artifacts",
+        ["source_artifact_id"],
+        ["id"],
+    )
 
     op.create_table(
         "document_sections",
@@ -185,32 +230,6 @@ def upgrade() -> None:
     op.create_index("ix_document_references_document_id", "document_references", ["document_id"])
 
     op.create_table(
-        "ingest_jobs",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column(
-            "document_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("documents.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column("status", sa.String(32), nullable=False, server_default=sa.text("'queued'")),
-        sa.Column("failure_code", sa.String(128), nullable=True),
-        sa.Column("failure_message", sa.Text, nullable=True),
-        sa.Column("warnings", postgresql.JSONB, nullable=True),
-        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("trigger", sa.String(64), nullable=True),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-    )
-    op.create_index("ix_ingest_jobs_document_id", "ingest_jobs", ["document_id"])
-    op.create_index("ix_ingest_jobs_status", "ingest_jobs", ["status"])
-
-    op.create_table(
         "retrieval_index_runs",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
         sa.Column(
@@ -256,6 +275,14 @@ def downgrade() -> None:
     op.drop_index("ix_retrieval_index_runs_document_version", table_name="retrieval_index_runs")
     op.drop_index("ix_retrieval_index_runs_document_id", table_name="retrieval_index_runs")
     op.drop_table("retrieval_index_runs")
+    op.drop_index("ix_document_artifacts_ingest_job_id", table_name="document_artifacts")
+    op.drop_index("ix_document_artifacts_document_id", table_name="document_artifacts")
+    op.drop_constraint(
+        "fk_ingest_jobs_source_artifact_id_document_artifacts",
+        "ingest_jobs",
+        type_="foreignkey",
+    )
+    op.drop_table("document_artifacts")
     op.drop_index("ix_ingest_jobs_status", table_name="ingest_jobs")
     op.drop_index("ix_ingest_jobs_document_id", table_name="ingest_jobs")
     op.drop_table("ingest_jobs")
@@ -269,8 +296,6 @@ def downgrade() -> None:
     op.drop_table("document_passages")
     op.drop_index("ix_document_sections_document_id", table_name="document_sections")
     op.drop_table("document_sections")
-    op.drop_index("ix_document_artifacts_document_id", table_name="document_artifacts")
-    op.drop_table("document_artifacts")
     op.drop_index("ix_documents_current_status", table_name="documents")
     op.drop_table("documents")
     op.execute("DROP EXTENSION IF EXISTS pgmq CASCADE")

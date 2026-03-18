@@ -12,5 +12,7 @@ class MetadataEnricher(Protocol):
 
 
 class NullMetadataEnricher:
+    """Phase-1 default enricher: explicitly no-op until enrichment ships beyond sign-off."""
+
     def enrich(self, parsed_document: ParsedDocument) -> EnrichmentResult:
         return EnrichmentResult()

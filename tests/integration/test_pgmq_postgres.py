@@ -78,7 +78,7 @@ def test_pgmq_adapter_redelivers_message_after_visibility_timeout_expires(
             poll_interval_ms=10,
         )
 
-    time.sleep(1.2)
+    time.sleep(2.2)
 
     with migrated_postgres_engine.begin() as connection:
         redelivered_claim = adapter.read_with_poll(
@@ -95,4 +95,105 @@ def test_pgmq_adapter_redelivers_message_after_visibility_timeout_expires(
     assert [message.msg_id for message in redelivered_claim] == [message_id]
     assert redelivered_claim[0].message == {"kind": "redeliver-me"}
     assert redelivered_claim[0].read_ct > first_claim[0].read_ct
+    assert archived is True
+
+
+def test_pgmq_claim_stays_hidden_until_open_claim_transaction_ends(
+    migrated_postgres_engine,
+    unique_queue_name: str,
+) -> None:
+    adapter = PgmqAdapter(unique_queue_name)
+
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            text("SELECT pgmq.create(:queue_name)"),
+            {"queue_name": unique_queue_name},
+        )
+        message_id = adapter.send(connection, {"kind": "held-open"})
+
+    claim_connection = migrated_postgres_engine.connect()
+    claim_transaction = claim_connection.begin()
+    try:
+        first_claim = adapter.read_with_poll(
+            claim_connection,
+            vt_seconds=1,
+            max_poll_seconds=1,
+            poll_interval_ms=10,
+        )
+
+        time.sleep(1.2)
+
+        with migrated_postgres_engine.begin() as connection:
+            hidden_claim = adapter.read_with_poll(
+                connection,
+                vt_seconds=1,
+                max_poll_seconds=1,
+                poll_interval_ms=10,
+            )
+
+        assert [message.msg_id for message in first_claim] == [message_id]
+        assert hidden_claim == []
+    finally:
+        claim_transaction.rollback()
+        claim_connection.close()
+
+    with migrated_postgres_engine.begin() as connection:
+        redelivered_claim = adapter.read_with_poll(
+            connection,
+            vt_seconds=1,
+            max_poll_seconds=1,
+            poll_interval_ms=10,
+        )
+        archived = adapter.archive_message(connection, message_id)
+
+    assert [message.msg_id for message in redelivered_claim] == [message_id]
+    assert archived is True
+
+
+def test_pgmq_claim_stays_hidden_until_claim_transaction_exits(
+    migrated_postgres_engine,
+    unique_queue_name: str,
+) -> None:
+    adapter = PgmqAdapter(unique_queue_name)
+
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            text("SELECT pgmq.create(:queue_name)"),
+            {"queue_name": unique_queue_name},
+        )
+        message_id = adapter.send(connection, {"kind": "tx-bound-claim"})
+
+    claim_connection = migrated_postgres_engine.connect()
+    claim_transaction = claim_connection.begin()
+    try:
+        claimed = adapter.read_with_poll(
+            claim_connection,
+            vt_seconds=2,
+            max_poll_seconds=1,
+            poll_interval_ms=10,
+        )
+        time.sleep(2.2)
+        with migrated_postgres_engine.begin() as connection:
+            hidden_claim = adapter.read_with_poll(
+                connection,
+                vt_seconds=2,
+                max_poll_seconds=1,
+                poll_interval_ms=10,
+            )
+        assert [message.msg_id for message in claimed] == [message_id]
+        assert hidden_claim == []
+    finally:
+        claim_transaction.rollback()
+        claim_connection.close()
+
+    with migrated_postgres_engine.begin() as connection:
+        redelivered = adapter.read_with_poll(
+            connection,
+            vt_seconds=2,
+            max_poll_seconds=1,
+            poll_interval_ms=10,
+        )
+        archived = adapter.archive_message(connection, message_id)
+
+    assert [message.msg_id for message in redelivered] == [message_id]
     assert archived is True

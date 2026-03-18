@@ -32,7 +32,7 @@ class _DocumentsApiService:
         *,
         filename: str,
         content_type: str | None,
-        body: bytes,
+        upload,
         title: str | None,
         trace_headers=None,
     ) -> DocumentUploadResponse:
@@ -40,8 +40,9 @@ class _DocumentsApiService:
             {
                 "filename": filename,
                 "content_type": content_type,
-                "body": body,
+                "body": upload.read(),
                 "title": title,
+                "trace_headers": trace_headers,
             }
         )
         return self.upload_response
@@ -102,6 +103,7 @@ def test_post_documents_creates_document_and_returns_initial_job_state(
             "content_type": "application/pdf",
             "body": b"%PDF-1.4\nphase-1",
             "title": "Phase 1 paper",
+            "trace_headers": {},
         }
     ]
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -45,9 +45,20 @@ def test_worker_processes_and_archives_message() -> None:
     queue = MagicMock(spec=IngestionQueue)
     queue.claim_ingest.return_value = ClaimedIngestMessage(message=message, payload=payload)
     processor = MagicMock()
-    connection = MagicMock()
+    claim_connection = MagicMock()
+    lease_connection = MagicMock()
+    processing_connection = MagicMock()
+    archive_connection = MagicMock()
+    contexts = iter(
+        [
+            contextlib.nullcontext(claim_connection),
+            contextlib.nullcontext(lease_connection),
+            contextlib.nullcontext(processing_connection),
+            contextlib.nullcontext(archive_connection),
+        ]
+    )
     worker = IngestWorker(
-        connection_factory=lambda: contextlib.nullcontext(connection),
+        connection_factory=lambda: next(contexts),
         queue_adapter=queue,
         processor=processor,
         config=WorkerConfig(vt_seconds=60, max_poll_seconds=2, poll_interval_ms=25),
@@ -56,5 +67,16 @@ def test_worker_processes_and_archives_message() -> None:
     handled = worker.run_once()
 
     assert handled is not None
-    processor.process.assert_called_once()
-    queue.archive_message.assert_called_once_with(connection, 7)
+    queue.claim_ingest.assert_called_once_with(
+        claim_connection,
+        vt_seconds=60,
+        max_poll_seconds=2,
+        poll_interval_ms=25,
+    )
+    queue.extend_lease.assert_called_once_with(lease_connection, 7, 60)
+    processor.process.assert_called_once_with(
+        processing_connection,
+        ANY,
+        ANY,
+    )
+    queue.archive_message.assert_called_once_with(archive_connection, 7)

@@ -168,6 +168,8 @@ def _make_processor() -> tuple[
         max_tokens=6,
         overlap_fraction=0.5,
     )
+    processor._lock_document = MagicMock()  # type: ignore[method-assign]
+    processor._is_superseded = MagicMock(return_value=False)  # type: ignore[method-assign]
     return processor, storage, primary_parser, fallback_parser, metadata_enricher
 
 
@@ -188,6 +190,22 @@ def _row_sequence(rows: list[dict[str, object] | None]) -> Callable[..., MagicMo
         return _result_with_row(row)
 
     return _execute
+
+
+def _job_row(
+    *,
+    document_id: UUID | None = None,
+    source_artifact_id: UUID | None = None,
+    status: str = "queued",
+    warnings: list[str] | None = None,
+) -> dict[str, object]:
+    return {
+        "document_id": document_id or uuid4(),
+        "created_at": datetime.now(UTC),
+        "status": status,
+        "warnings": warnings or [],
+        "source_artifact_id": source_artifact_id or uuid4(),
+    }
 
 
 def test_small_helpers_cover_json_array_token_count_dedupe_and_context() -> None:
@@ -239,39 +257,57 @@ def test_chunk_paragraphs_handles_empty_input_and_overlap() -> None:
 def test_lock_and_load_helpers_return_rows_and_none() -> None:
     processor, _, _, _, _ = _make_processor()
     connection = MagicMock()
+    source_artifact_id = uuid4()
+    artifact_row_id = uuid4()
     connection.execute.side_effect = _row_sequence(
         [
-            {"status": "queued", "warnings": ["parser_fallback_used"]},
-            {"storage_ref": "documents/source.pdf"},
+            _job_row(warnings=["parser_fallback_used"]),
+            {"id": artifact_row_id, "storage_ref": "documents/source.pdf"},
             None,
             None,
         ]
     )
 
     ingest_job_id = uuid4()
-    document_id = uuid4()
 
-    assert processor._lock_ingest_job(connection, ingest_job_id) == {
-        "status": "queued",
-        "warnings": ["parser_fallback_used"],
-    }
-    assert processor._load_source_artifact(connection, document_id) == {
+    locked_job = processor._lock_ingest_job(connection, ingest_job_id)
+    assert locked_job is not None
+    assert locked_job["status"] == "queued"
+    assert locked_job["warnings"] == ["parser_fallback_used"]
+    assert processor._load_source_artifact(
+        connection,
+        ingest_job_id=ingest_job_id,
+        source_artifact_id=source_artifact_id,
+    ) == {
+        "id": artifact_row_id,
         "storage_ref": "documents/source.pdf",
     }
     assert processor._lock_ingest_job(connection, ingest_job_id) is None
-    assert processor._load_source_artifact(connection, document_id) is None
+    assert (
+        processor._load_source_artifact(
+            connection,
+            ingest_job_id=ingest_job_id,
+            source_artifact_id=source_artifact_id,
+        )
+        is None
+    )
 
 
 def test_reset_document_state_executes_all_cleanup_statements() -> None:
     processor, _, _, _, _ = _make_processor()
     connection = MagicMock()
     document_id = uuid4()
+    ingest_job_id = uuid4()
 
-    processor._reset_document_state(connection, document_id)
+    processor._reset_document_state(
+        connection,
+        document_id=document_id,
+        ingest_job_id=ingest_job_id,
+    )
 
     assert connection.execute.call_count == 7
     for call in connection.execute.call_args_list:
-        assert call.args[1] == {"document_id": document_id}
+        assert call.args[1] == {"document_id": document_id, "ingest_job_id": ingest_job_id}
 
 
 def test_persist_parser_artifact_stores_bytes_and_records_row() -> None:
@@ -525,11 +561,16 @@ def test_process_success_path_uses_real_helpers_and_marks_low_confidence_warning
         ],
     )
     primary_parser.parse.return_value = _make_parser_result(parsed_document=parsed_document)
+    source_artifact_id = uuid4()
 
     connection.execute.side_effect = _row_sequence(
         [
-            {"status": "queued", "warnings": ["parser_fallback_used"]},
-            {"storage_ref": "documents/test/source.pdf"},
+            _job_row(
+                document_id=context.payload.document_id,
+                source_artifact_id=source_artifact_id,
+                warnings=["parser_fallback_used"],
+            ),
+            {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
         ]
     )
 
@@ -560,16 +601,16 @@ def test_process_missing_job_raises_lookup_error() -> None:
 def test_process_missing_source_artifact_marks_failure() -> None:
     processor, _, primary_parser, fallback_parser, _ = _make_processor()
     connection = MagicMock()
+    context = _make_context()
     connection.execute.side_effect = _row_sequence(
         [
-            {"status": "queued", "warnings": []},
+            _job_row(document_id=context.payload.document_id, warnings=[]),
             None,
         ]
     )
     lease = MagicMock()
     processor._mark_failed = MagicMock()  # type: ignore[method-assign]
 
-    context = _make_context()
     processor.process(connection, context, lease)
 
     processor._mark_failed.assert_called_once_with(
@@ -587,10 +628,16 @@ def test_process_missing_source_artifact_marks_failure() -> None:
 def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
     processor, _, primary_parser, fallback_parser, _ = _make_processor()
     connection = MagicMock()
+    context = _make_context()
+    source_artifact_id = uuid4()
     connection.execute.side_effect = _row_sequence(
         [
-            {"status": "queued", "warnings": []},
-            {"storage_ref": "documents/test/source.pdf"},
+            _job_row(
+                document_id=context.payload.document_id,
+                source_artifact_id=source_artifact_id,
+                warnings=[],
+            ),
+            {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
         ]
     )
     lease = MagicMock()
@@ -601,7 +648,6 @@ def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
     primary_parser.parse.return_value = primary_result
     fallback_parser.parse.return_value = fallback_result
 
-    context = _make_context()
     processor.process(connection, context, lease)
 
     processor._mark_failed.assert_called_once_with(
