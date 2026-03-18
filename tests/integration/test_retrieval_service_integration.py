@@ -16,9 +16,10 @@ from paper_context.models import (
     IngestJob,
     RetrievalIndexRun,
 )
-from paper_context.retrieval import RetrievalService
+from paper_context.retrieval import DocumentRetrievalIndexer, RetrievalService
+from paper_context.retrieval import service as retrieval_service_module
 from paper_context.retrieval.clients import EmbeddingBatch
-from paper_context.retrieval.types import RerankItem, RetrievalFilters
+from paper_context.retrieval.types import MixedIndexVersionError, RerankItem, RetrievalFilters
 
 pytestmark = [
     pytest.mark.integration,
@@ -64,6 +65,21 @@ class FixedEmbeddingClient:
             dimensions=VECTOR_DIMENSIONS,
             embeddings=embeddings,
         )
+
+
+class CountingEmbeddingClient(FixedEmbeddingClient):
+    def __init__(self, mapping: dict[str, list[float]]) -> None:
+        super().__init__(mapping)
+        self.batch_sizes: list[int] = []
+
+    def embed(
+        self,
+        texts: list[str],
+        *,
+        input_type: str,
+    ) -> EmbeddingBatch:
+        self.batch_sizes.append(len(texts))
+        return super().embed(texts, input_type=input_type)
 
 
 class IdentityReranker:
@@ -400,6 +416,160 @@ def test_search_passages_and_tables_return_only_active_index_version_rows(
     assert tables[0].retrieval_modes == ("sparse",)
 
 
+def test_search_passages_and_tables_include_all_active_versions_during_rollout(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    newer_document_id = uuid4()
+    older_document_id = uuid4()
+    newer_section_id = uuid4()
+    older_section_id = uuid4()
+    newer_passage_id = uuid4()
+    older_passage_id = uuid4()
+    newer_table_id = uuid4()
+    older_table_id = uuid4()
+    newer_ingest_job_id = uuid4()
+    older_ingest_job_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        for (
+            document_id,
+            section_id,
+            ingest_job_id,
+            title,
+            index_version,
+            activation_offset_minutes,
+        ) in [
+            (
+                newer_document_id,
+                newer_section_id,
+                newer_ingest_job_id,
+                "New rollout paper",
+                "mvp-v2",
+                0,
+            ),
+            (
+                older_document_id,
+                older_section_id,
+                older_ingest_job_id,
+                "Older rollout paper",
+                "mvp-v1",
+                1,
+            ),
+        ]:
+            created_at = now - timedelta(minutes=activation_offset_minutes)
+            connection.execute(
+                insert(Document).values(
+                    id=document_id,
+                    title=title,
+                    source_type="upload",
+                    current_status="ready",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+            connection.execute(
+                insert(IngestJob).values(
+                    id=ingest_job_id,
+                    document_id=document_id,
+                    status="ready",
+                    trigger="upload",
+                    warnings=[],
+                    created_at=created_at,
+                    started_at=created_at,
+                    finished_at=created_at,
+                )
+            )
+            connection.execute(
+                insert(DocumentSection).values(
+                    id=section_id,
+                    document_id=document_id,
+                    heading="Methods",
+                    heading_path=["Methods"],
+                    ordinal=1,
+                    page_start=1,
+                    page_end=1,
+                )
+            )
+            run_id = _insert_run(
+                connection,
+                document_id=document_id,
+                ingest_job_id=ingest_job_id,
+                index_version=index_version,
+                parser_source="docling",
+                is_active=True,
+                activated_at=created_at,
+                created_at=created_at,
+            )
+            passage_id = newer_passage_id if document_id == newer_document_id else older_passage_id
+            table_id = newer_table_id if document_id == newer_document_id else older_table_id
+            connection.execute(
+                insert(DocumentPassage).values(
+                    id=passage_id,
+                    document_id=document_id,
+                    section_id=section_id,
+                    chunk_ordinal=1,
+                    body_text=f"Rollout keyword stays searchable for {title}.",
+                    contextualized_text=f"Rollout keyword stays searchable for {title}.",
+                    token_count=6,
+                    page_start=1,
+                    page_end=1,
+                    provenance_offsets={"pages": [1], "charspans": [[0, 20]]},
+                    artifact_id=None,
+                )
+            )
+            connection.execute(
+                insert(DocumentTable).values(
+                    id=table_id,
+                    document_id=document_id,
+                    section_id=section_id,
+                    caption=f"{title} table",
+                    table_type="lexical",
+                    headers_json=["A"],
+                    rows_json=[["1"]],
+                    page_start=1,
+                    page_end=1,
+                    artifact_id=None,
+                )
+            )
+            _insert_passage_asset(
+                connection,
+                run_id=run_id,
+                passage_id=passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text=f"Rollout keyword stays searchable for {title}.",
+                embedding=_vector_string(20 if document_id == newer_document_id else 21),
+            )
+            _insert_table_asset(
+                connection,
+                run_id=run_id,
+                table_id=table_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text=f"Rollout keyword {title} table",
+            )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        embedding_client=FixedEmbeddingClient({"rollout keyword": _vector_values(20)}),
+        reranker_client=IdentityReranker(),
+    )
+
+    passages = service.search_passages(query="rollout keyword")
+    tables = service.search_tables(query="rollout keyword")
+
+    assert {result.document_id for result in passages} == {newer_document_id, older_document_id}
+    assert {result.index_version for result in passages} == {"mvp-v1", "mvp-v2"}
+    assert {result.document_id for result in tables} == {newer_document_id, older_document_id}
+    assert {result.index_version for result in tables} == {"mvp-v1", "mvp-v2"}
+
+    with pytest.raises(MixedIndexVersionError, match="mixed index versions"):
+        service.build_context_pack(query="rollout keyword")
+
+
 def test_search_passages_dense_path_uses_embeddings(
     migrated_postgres_engine,
 ) -> None:
@@ -616,6 +786,127 @@ def test_build_context_pack_propagates_parent_warning_and_provenance(
     assert pack.warnings == ("parser_fallback_used", "parent_context_truncated")
     assert len(pack.parent_sections) == 1
     assert len(pack.parent_sections[0].supporting_passages) == 2
+
+
+def test_document_retrieval_indexer_batches_passage_embeddings(
+    migrated_postgres_engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(retrieval_service_module, "INDEX_BUILD_BATCH_SIZE", 2)
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    ingest_job_id = uuid4()
+    section_id = uuid4()
+
+    contextualized_texts = [
+        (
+            "Document title: Retrieval paper\n"
+            "Section path: Methods\n"
+            "Local heading context: Methods\n\n"
+            f"passage {index}"
+        )
+        for index in range(5)
+    ]
+    embedding_client = CountingEmbeddingClient(
+        {text: _vector_values(index) for index, text in enumerate(contextualized_texts)}
+    )
+    indexer = DocumentRetrievalIndexer(
+        index_version="mvp-v2",
+        chunking_version="phase2",
+        embedding_model="fixed-embedding",
+        reranker_model="identity",
+        embedding_client=embedding_client,
+        reranker_client=IdentityReranker(),
+    )
+
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            insert(Document).values(
+                id=document_id,
+                title="Retrieval paper",
+                source_type="upload",
+                current_status="ready",
+                created_at=now - timedelta(minutes=2),
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now - timedelta(minutes=1),
+                started_at=now - timedelta(minutes=1),
+                finished_at=now - timedelta(minutes=1),
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                heading="Methods",
+                heading_path=["Methods"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        for index, contextualized_text in enumerate(contextualized_texts, start=1):
+            connection.execute(
+                insert(DocumentPassage).values(
+                    id=uuid4(),
+                    document_id=document_id,
+                    section_id=section_id,
+                    chunk_ordinal=index,
+                    body_text=f"passage {index}",
+                    contextualized_text=contextualized_text,
+                    token_count=3,
+                    page_start=1,
+                    page_end=1,
+                    provenance_offsets={"pages": [1], "charspans": [[0, 9]]},
+                    artifact_id=None,
+                )
+            )
+
+        run_id = indexer.rebuild(
+            connection,
+            document_id=document_id,
+            ingest_job_id=ingest_job_id,
+            parser_source="docling",
+        )
+
+        passage_asset_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE retrieval_index_run_id = :run_id
+                """
+            ),
+            {"run_id": run_id},
+        ).scalar_one()
+        retrieval_run = (
+            connection.execute(
+                text(
+                    """
+                SELECT status, is_active, embedding_dimensions
+                FROM retrieval_index_runs
+                WHERE id = :run_id
+                """
+                ),
+                {"run_id": run_id},
+            )
+            .mappings()
+            .one()
+        )
+
+    assert embedding_client.batch_sizes == [2, 2, 1]
+    assert passage_asset_count == 5
+    assert retrieval_run["status"] == "ready"
+    assert retrieval_run["is_active"] is True
+    assert retrieval_run["embedding_dimensions"] == VECTOR_DIMENSIONS
 
 
 def test_search_retrieval_filters_apply_via_document_scope(

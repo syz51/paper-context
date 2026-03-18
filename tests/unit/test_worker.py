@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import pytest
 
+from paper_context.ingestion.service import IngestExecutionDeferred
 from paper_context.queue.contracts import (
     ClaimedIngestMessage,
     IngestionQueue,
@@ -121,4 +122,41 @@ def test_worker_stops_when_initial_lease_extension_is_lost() -> None:
         worker.run_once()
 
     processor.process.assert_not_called()
+    queue.archive_message.assert_not_called()
+
+
+def test_worker_does_not_archive_when_processing_is_deferred() -> None:
+    payload = IngestQueuePayload(ingest_job_id=uuid4(), document_id=uuid4())
+    message = PgmqMessage(
+        msg_id=8,
+        read_ct=1,
+        enqueued_at=datetime.now(UTC),
+        vt=datetime.now(UTC),
+        message={
+            "ingest_job_id": str(payload.ingest_job_id),
+            "document_id": str(payload.document_id),
+        },
+    )
+    queue = MagicMock(spec=IngestionQueue)
+    queue.claim_ingest.return_value = ClaimedIngestMessage(message=message, payload=payload)
+    processor = MagicMock()
+    processor.process.side_effect = IngestExecutionDeferred("in progress")
+    claim_connection = MagicMock()
+    lease_connection = MagicMock()
+    processing_connection = MagicMock()
+    contexts = iter(
+        [
+            contextlib.nullcontext(claim_connection),
+            contextlib.nullcontext(lease_connection),
+            contextlib.nullcontext(processing_connection),
+        ]
+    )
+    worker = IngestWorker(
+        connection_factory=lambda: next(contexts),
+        queue_adapter=queue,
+        processor=processor,
+    )
+
+    assert worker.run_once() is None
+
     queue.archive_message.assert_not_called()

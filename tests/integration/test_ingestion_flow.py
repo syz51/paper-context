@@ -89,7 +89,10 @@ class _StaticParser:
         self.calls: list[str] = []
         self.name = result.artifact.parser
 
-    def parse(self, filename: str, content: bytes) -> ParserResult:
+    def parse(
+        self, filename: str, content: bytes | None = None, *, source_path=None
+    ) -> ParserResult:
+        del content, source_path
         self.calls.append(filename)
         return self.result
 

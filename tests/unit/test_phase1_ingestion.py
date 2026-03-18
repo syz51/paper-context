@@ -114,8 +114,7 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         fallback_result: ParserResult | None = None,
     ) -> None:
         storage = MagicMock()
-        resolved_path = MagicMock(spec=Path)
-        resolved_path.read_bytes.return_value = b"%PDF-1.4"
+        resolved_path = Path("/tmp/source.pdf")
         storage.resolve.return_value = resolved_path
         primary_parser = MagicMock()
         primary_parser.parse.return_value = primary_result
@@ -141,10 +140,11 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         self.failed_calls: list[tuple[str, str, list[str]]] = []
         self.ready_warnings: list[str] | None = None
         self.replaced_index = False
-        self._retrieval_indexer.prepare_rebuild = MagicMock(return_value=object())  # type: ignore[method-assign]
-        self._retrieval_indexer.publish_prepared = MagicMock(  # type: ignore[method-assign]
-            side_effect=lambda connection, prepared: setattr(self, "replaced_index", True)
+        self._retrieval_indexer.rebuild = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda *args, **kwargs: setattr(self, "replaced_index", True)
         )
+        self._try_claim_processing_lock = MagicMock(return_value=True)  # type: ignore[method-assign]
+        self._release_processing_lock = MagicMock()  # type: ignore[method-assign]
 
     def _lock_ingest_job(self, connection, ingest_job_id) -> IngestJobRow | None:
         return {
@@ -284,6 +284,14 @@ def test_deterministic_processor_uses_fallback_on_degraded_primary() -> None:
     ]
     processor.primary_parser.parse.assert_called_once()
     processor.fallback_parser.parse.assert_called_once()
+    processor.primary_parser.parse.assert_called_once_with(
+        filename="documents/test/source.pdf",
+        source_path=Path("/tmp/source.pdf"),
+    )
+    processor.fallback_parser.parse.assert_called_once_with(
+        filename="documents/test/source.pdf",
+        source_path=Path("/tmp/source.pdf"),
+    )
     assert processor.replaced_index is True
     assert processor.ready_warnings is not None
     assert "parser_fallback_used" in processor.ready_warnings

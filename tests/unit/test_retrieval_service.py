@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -120,8 +121,9 @@ def _table_candidate(
 def test_search_passages_fuses_sparse_and_dense_candidates() -> None:
     service = _service()
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
-    service._resolve_active_index_version = MagicMock(return_value="mvp-v1")  # type: ignore[method-assign]
-    service._resolve_active_run_ids = MagicMock(return_value=(uuid4(),))  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
 
     run_id = uuid4()
     passage_a = _passage_candidate(
@@ -173,8 +175,9 @@ def test_search_passages_fuses_sparse_and_dense_candidates() -> None:
 def test_search_passages_dense_only_hit_survives_rerank() -> None:
     service = _service()
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
-    service._resolve_active_index_version = MagicMock(return_value="mvp-v1")  # type: ignore[method-assign]
-    service._resolve_active_run_ids = MagicMock(return_value=(uuid4(),))  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
 
     run_id = uuid4()
     dense_candidate = _passage_candidate(
@@ -198,9 +201,10 @@ def test_search_passages_dense_only_hit_survives_rerank() -> None:
 
 def test_search_tables_returns_structured_preview() -> None:
     service = _service()
-    service._resolve_active_index_version = MagicMock(return_value="mvp-v1")  # type: ignore[method-assign]
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
-    service._resolve_active_run_ids = MagicMock(return_value=(uuid4(),))  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
 
     run_id = uuid4()
     table_candidate = _table_candidate(
@@ -226,8 +230,9 @@ def test_search_tables_returns_structured_preview() -> None:
 def test_search_tables_skips_dense_candidate_loader() -> None:
     service = _service()
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
-    service._resolve_active_index_version = MagicMock(return_value="mvp-v1")  # type: ignore[method-assign]
-    service._resolve_active_run_ids = MagicMock(return_value=(uuid4(),))  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
     service._load_sparse_table_candidates = MagicMock(return_value=[])  # type: ignore[method-assign]
 
     assert service.search_tables(query="table query") == []
@@ -282,8 +287,15 @@ def test_build_context_pack_propagates_warnings_and_provenance() -> None:
         active_index_version="mvp-v1",
     )
 
-    service.search_passages = MagicMock(return_value=(passage,))  # type: ignore[method-assign]
-    service.search_tables = MagicMock(return_value=())  # type: ignore[method-assign]
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            run_ids=(passage.retrieval_index_run_id,),
+            index_versions=("mvp-v1",),
+        )
+    )
+    service._search_passages_with_connection = MagicMock(return_value=[passage])  # type: ignore[method-assign]
+    service._search_tables_with_connection = MagicMock(return_value=[])  # type: ignore[method-assign]
     service._load_parent_sections = MagicMock(return_value=(parent_section,))  # type: ignore[method-assign]
     service._load_document_summaries = MagicMock(return_value=(document,))  # type: ignore[method-assign]
 
@@ -336,8 +348,47 @@ def test_build_context_pack_rejects_mixed_index_versions() -> None:
         retrieval_index_run_id=uuid4(),
     )
 
-    service.search_passages = MagicMock(return_value=(passage,))  # type: ignore[method-assign]
-    service.search_tables = MagicMock(return_value=(table,))  # type: ignore[method-assign]
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            run_ids=(passage.retrieval_index_run_id, table.retrieval_index_run_id),
+            index_versions=("mvp-v1", "mvp-v2"),
+        )
+    )
+    service._search_passages_with_connection = MagicMock(return_value=[passage])  # type: ignore[method-assign]
+    service._search_tables_with_connection = MagicMock(return_value=[table])  # type: ignore[method-assign]
 
     with pytest.raises(MixedIndexVersionError):
         service.build_context_pack(query="mixed")
+
+
+def test_search_passages_allows_mixed_index_versions_when_searching_active_runs() -> None:
+    service = _service()
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            run_ids=(uuid4(), uuid4()),
+            index_versions=("mvp-v2", "mvp-v1"),
+        )
+    )
+
+    first = _passage_candidate(
+        entity_id=uuid4(),
+        retrieval_index_run_id=uuid4(),
+        index_version="mvp-v2",
+        text="Newer active result",
+        modes={"sparse"},
+    )
+    second = _passage_candidate(
+        entity_id=uuid4(),
+        retrieval_index_run_id=uuid4(),
+        index_version="mvp-v1",
+        text="Older active result",
+        modes={"sparse"},
+    )
+    service._load_sparse_passage_candidates = MagicMock(return_value=[first, second])  # type: ignore[method-assign]
+    service._load_dense_passage_candidates = MagicMock(return_value=[])  # type: ignore[method-assign]
+
+    results = service.search_passages(query="rollout")
+
+    assert [result.index_version for result in results] == ["mvp-v2", "mvp-v1"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -9,7 +10,7 @@ from paper_context.config import get_settings
 from paper_context.db.engine import get_engine
 from paper_context.db.session import connection_scope
 from paper_context.ingestion.enrichment import NullMetadataEnricher
-from paper_context.ingestion.parsers import DoclingPdfParser, PdfPlumberPdfParser
+from paper_context.ingestion.parser_isolation import ParserIsolationConfig, build_pdf_parser
 from paper_context.ingestion.queue import IngestionQueueService
 from paper_context.ingestion.service import DeterministicIngestProcessor, SyntheticIngestProcessor
 from paper_context.queue.contracts import IngestionQueue
@@ -24,14 +25,29 @@ from paper_context.storage.local_fs import LocalFilesystemStorage
 
 from .loop import IngestWorker, WorkerConfig
 
+logger = logging.getLogger(__name__)
+
 
 def build_worker() -> IngestWorker:
     settings = get_settings()
     queue = IngestionQueue(settings.queue.name)
     storage = LocalFilesystemStorage(settings.storage.root_path)
     storage.ensure_root()
+    parser_settings = getattr(settings, "parser", None)
+    parser_isolated = getattr(parser_settings, "execution_mode", "subprocess") == "subprocess"
+    parser_config = ParserIsolationConfig(
+        timeout_seconds=getattr(parser_settings, "timeout_seconds", 120),
+        memory_limit_mb=getattr(parser_settings, "memory_limit_mb", 2_048),
+        output_limit_mb=getattr(parser_settings, "output_limit_mb", 32),
+    )
+    primary_parser_name = getattr(parser_settings, "primary", "docling")
+    fallback_parser_name = getattr(parser_settings, "fallback", "pdfplumber")
     voyage_api_key = getattr(settings.providers, "voyage_api_key", None)
     zero_entropy_api_key = getattr(settings.providers, "zero_entropy_api_key", None)
+    if not voyage_api_key:
+        logger.warning("voyage_api_key not configured; using deterministic embedding client")
+    if not zero_entropy_api_key:
+        logger.warning("zero_entropy_api_key not configured; using heuristic reranker")
     embedding_client = (
         VoyageEmbeddingClient(
             api_key=voyage_api_key,
@@ -53,8 +69,16 @@ def build_worker() -> IngestWorker:
         queue_adapter=queue,
         processor=DeterministicIngestProcessor(
             storage=storage,
-            primary_parser=DoclingPdfParser(),
-            fallback_parser=PdfPlumberPdfParser(),
+            primary_parser=build_pdf_parser(
+                primary_parser_name,
+                isolated=parser_isolated,
+                config=parser_config,
+            ),
+            fallback_parser=build_pdf_parser(
+                fallback_parser_name,
+                isolated=parser_isolated,
+                config=parser_config,
+            ),
             metadata_enricher=NullMetadataEnricher(),
             index_version=settings.providers.index_version,
             chunking_version=settings.chunking.version,
@@ -84,7 +108,14 @@ def run_worker(*, once: bool = False) -> None:
     settings = get_settings()
     worker = build_worker()
     while True:
-        handled = worker.run_once()
+        try:
+            handled = worker.run_once()
+        except Exception:
+            if once:
+                raise
+            logger.exception("worker poll failed; continuing after backoff")
+            time.sleep(settings.runtime.worker_idle_sleep_seconds)
+            continue
         if once:
             return
         if handled is None:

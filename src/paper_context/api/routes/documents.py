@@ -3,6 +3,7 @@ from __future__ import annotations
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 
 from paper_context.config import get_settings
 from paper_context.db.engine import get_engine
@@ -44,7 +45,8 @@ async def upload_document(
     service: DocumentsApiService = Depends(get_documents_service),  # noqa: B008
 ) -> DocumentUploadResponse:
     try:
-        return service.create_document(
+        return await run_in_threadpool(
+            service.create_document,
             filename=file.filename or "document.pdf",
             content_type=file.content_type,
             upload=file.file,

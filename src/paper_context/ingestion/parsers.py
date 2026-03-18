@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from collections import OrderedDict
+from collections.abc import Callable
 from io import BytesIO
+from pathlib import Path
 from typing import Protocol
 
 import orjson
@@ -33,7 +36,13 @@ _YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
 class PdfParser(Protocol):
     name: str
 
-    def parse(self, filename: str, content: bytes) -> ParserResult:
+    def parse(
+        self,
+        filename: str,
+        content: bytes | None = None,
+        *,
+        source_path: Path | None = None,
+    ) -> ParserResult:
         """Parse a PDF document into a normalized intermediate representation."""
         ...
 
@@ -127,6 +136,44 @@ def _build_heading_path(stack: list[tuple[int, str, str]]) -> list[str]:
     return [heading for _, _, heading in stack]
 
 
+def _build_parser_artifact(
+    *,
+    artifact_type: str,
+    parser: str,
+    filename: str,
+    content: bytes,
+) -> ParserArtifact:
+    cleanup_root = Path(tempfile.mkdtemp(prefix=f"{parser}-artifact-"))
+    artifact_path = cleanup_root / filename
+    artifact_path.write_bytes(content)
+    return ParserArtifact(
+        artifact_type=artifact_type,
+        parser=parser,
+        filename=filename,
+        content_path=artifact_path,
+        cleanup_root=cleanup_root,
+    )
+
+
+def _build_file_backed_parser_artifact(
+    *,
+    artifact_type: str,
+    parser: str,
+    filename: str,
+    writer: Callable[[Path], None],
+) -> ParserArtifact:
+    cleanup_root = Path(tempfile.mkdtemp(prefix=f"{parser}-artifact-"))
+    artifact_path = cleanup_root / filename
+    writer(artifact_path)
+    return ParserArtifact(
+        artifact_type=artifact_type,
+        parser=parser,
+        filename=filename,
+        content_path=artifact_path,
+        cleanup_root=cleanup_root,
+    )
+
+
 class DoclingPdfParser:
     name = "docling"
 
@@ -144,20 +191,32 @@ class DoclingPdfParser:
             }
         )
 
-    def parse(self, filename: str, content: bytes) -> ParserResult:
+    def parse(
+        self,
+        filename: str,
+        content: bytes | None = None,
+        *,
+        source_path: Path | None = None,
+    ) -> ParserResult:
         try:
+            if source_path is not None:
+                source: Path | DocumentStream = source_path
+            elif content is not None:
+                source = DocumentStream(name=filename, stream=BytesIO(content))
+            else:
+                raise ValueError("docling parser requires content bytes or a source path")
             conversion = self._converter.convert(
-                DocumentStream(name=filename, stream=BytesIO(content)),
+                source,
                 raises_on_error=False,
             )
-            artifact = ParserArtifact(
+            artifact = _build_file_backed_parser_artifact(
                 artifact_type="docling_parse",
                 parser=self.name,
                 filename="docling-document.json",
-                content=orjson.dumps(conversion.document.export_to_dict()),
+                writer=conversion.document.save_as_json,
             )
         except Exception as exc:
-            artifact = ParserArtifact(
+            artifact = _build_parser_artifact(
                 artifact_type="docling_parse",
                 parser=self.name,
                 filename="docling-error.json",
@@ -341,7 +400,13 @@ class DoclingPdfParser:
 class PdfPlumberPdfParser:
     name = "pdfplumber"
 
-    def parse(self, filename: str, content: bytes) -> ParserResult:
+    def parse(
+        self,
+        filename: str,
+        content: bytes | None = None,
+        *,
+        source_path: Path | None = None,
+    ) -> ParserResult:
         sections_by_key: OrderedDict[str, ParsedSection] = OrderedDict()
         tables: list[ParsedTable] = []
         references: list[ParsedReference] = []
@@ -381,69 +446,82 @@ class PdfPlumberPdfParser:
             section_stack.append((level, key, line))
 
         try:
-            with pdfplumber.open(BytesIO(content)) as pdf:
+            if source_path is not None:
+                pdf_source: Path | BytesIO = source_path
+            elif content is not None:
+                pdf_source = BytesIO(content)
+            else:
+                raise ValueError("pdfplumber parser requires content bytes or a source path")
+            with pdfplumber.open(pdf_source) as pdf:
                 for page_no, page in enumerate(pdf.pages, start=1):
-                    page_text = page.extract_text() or ""
-                    lines = [line.strip() for line in page_text.splitlines() if line.strip()]
-                    if page_no == 1 and lines:
-                        title = lines[0]
-                    for line in lines:
-                        if _looks_like_heading(line):
-                            ensure_section(line, page_no)
-                            continue
-                        if sections_by_key[current_section_key()].heading_path and (
-                            sections_by_key[current_section_key()].heading_path[-1].lower()
-                            == "references"
-                        ):
-                            references.append(
-                                ParsedReference(
-                                    raw_citation=line,
-                                    publication_year=_infer_publication_year(line),
+                    try:
+                        page_text = page.extract_text() or ""
+                        lines = [line.strip() for line in page_text.splitlines() if line.strip()]
+                        if page_no == 1 and lines:
+                            title = lines[0]
+                        for line in lines:
+                            if _looks_like_heading(line):
+                                ensure_section(line, page_no)
+                                continue
+                            if sections_by_key[current_section_key()].heading_path and (
+                                sections_by_key[current_section_key()].heading_path[-1].lower()
+                                == "references"
+                            ):
+                                references.append(
+                                    ParsedReference(
+                                        raw_citation=line,
+                                        publication_year=_infer_publication_year(line),
+                                    )
                                 )
-                            )
-                            continue
-                        section = sections_by_key[current_section_key()]
-                        paragraph = ParsedParagraph(
-                            text=line,
-                            page_start=page_no,
-                            page_end=page_no,
-                            provenance_offsets={"pages": [page_no]},
-                        )
-                        sections_by_key[section.key] = ParsedSection(
-                            key=section.key,
-                            heading=section.heading,
-                            heading_path=section.heading_path,
-                            level=section.level,
-                            page_start=(
-                                section.page_start if section.page_start is not None else page_no
-                            ),
-                            page_end=page_no,
-                            parent_key=section.parent_key,
-                            paragraphs=[*section.paragraphs, paragraph],
-                        )
-                        if not abstract and page_no == 1 and len(line.split()) > 40:
-                            abstract = line
-
-                    for table_index, table in enumerate(page.extract_tables() or [], start=1):
-                        cleaned_rows = [
-                            [_coerce_text(value) for value in row] for row in table if row
-                        ]
-                        if not cleaned_rows:
-                            continue
-                        headers = cleaned_rows[0]
-                        body_rows = cleaned_rows[1:] if len(cleaned_rows) > 1 else []
-                        tables.append(
-                            ParsedTable(
-                                section_key=current_section_key(),
-                                caption=f"Table {table_index}",
-                                headers=headers,
-                                rows=body_rows,
+                                continue
+                            section = sections_by_key[current_section_key()]
+                            paragraph = ParsedParagraph(
+                                text=line,
                                 page_start=page_no,
                                 page_end=page_no,
+                                provenance_offsets={"pages": [page_no]},
                             )
-                        )
+                            sections_by_key[section.key] = ParsedSection(
+                                key=section.key,
+                                heading=section.heading,
+                                heading_path=section.heading_path,
+                                level=section.level,
+                                page_start=(
+                                    section.page_start
+                                    if section.page_start is not None
+                                    else page_no
+                                ),
+                                page_end=page_no,
+                                parent_key=section.parent_key,
+                                paragraphs=[*section.paragraphs, paragraph],
+                            )
+                            if not abstract and page_no == 1 and len(line.split()) > 40:
+                                abstract = line
+
+                        for table_index, table in enumerate(page.extract_tables() or [], start=1):
+                            cleaned_rows = [
+                                [_coerce_text(value) for value in row] for row in table if row
+                            ]
+                            if not cleaned_rows:
+                                continue
+                            headers = cleaned_rows[0]
+                            body_rows = cleaned_rows[1:] if len(cleaned_rows) > 1 else []
+                            tables.append(
+                                ParsedTable(
+                                    section_key=current_section_key(),
+                                    caption=f"Table {table_index}",
+                                    headers=headers,
+                                    rows=body_rows,
+                                    page_start=page_no,
+                                    page_end=page_no,
+                                )
+                            )
+                    finally:
+                        close_page = getattr(page, "close", None)
+                        if callable(close_page):
+                            close_page()
         except Exception as exc:
-            error_artifact = ParserArtifact(
+            error_artifact = _build_parser_artifact(
                 artifact_type="pdfplumber_parse",
                 parser=self.name,
                 filename="pdfplumber-error.json",
@@ -487,11 +565,11 @@ class PdfPlumberPdfParser:
         warnings = []
         if not any(section.heading for section in sections):
             warnings.append("reduced_structure_confidence")
-        document_artifact = ParserArtifact(
+        document_artifact = _build_parser_artifact(
             artifact_type="pdfplumber_parse",
             parser=self.name,
             filename="pdfplumber-document.json",
-            content=orjson.dumps(parsed_document.to_dict()),
+            content=orjson.dumps(parsed_document),
         )
         return ParserResult(
             gate_status=gate_status,

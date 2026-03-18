@@ -63,6 +63,41 @@ def test_upload_document_translates_value_error_to_http_400() -> None:
     assert exc_info.value.status_code == 400
 
 
+def test_upload_document_offloads_blocking_work_to_threadpool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = MagicMock()
+    request = Request({"type": "http", "headers": []})
+    upload = UploadFile(filename="paper.pdf", file=BytesIO(b"%PDF-1.4"))
+    threadpool_call: dict[str, object] = {}
+
+    async def _fake_run_in_threadpool(func, /, *args, **kwargs):
+        threadpool_call["func"] = func
+        threadpool_call["kwargs"] = kwargs
+        return "ok"
+
+    monkeypatch.setattr(documents_route_module, "run_in_threadpool", _fake_run_in_threadpool)
+
+    result = asyncio.run(
+        documents_route_module.upload_document(
+            request=request,
+            file=upload,
+            title="Threadpooled",
+            service=service,
+        )
+    )
+
+    assert result == "ok"
+    assert threadpool_call["func"] is service.create_document
+    assert threadpool_call["kwargs"] == {
+        "filename": "paper.pdf",
+        "content_type": None,
+        "upload": upload.file,
+        "title": "Threadpooled",
+        "trace_headers": {},
+    }
+
+
 def test_create_document_rejects_empty_body_before_storage_work() -> None:
     service = DocumentsApiService(engine=MagicMock(), queue=MagicMock(), storage=MagicMock())
 

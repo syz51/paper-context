@@ -86,6 +86,10 @@ class ProviderSettings(BaseModel):
 class ParserSettings(BaseModel):
     primary: str = "docling"
     fallback: str = "pdfplumber"
+    execution_mode: str = "subprocess"
+    timeout_seconds: int = 120
+    memory_limit_mb: int = 2_048
+    output_limit_mb: int = 32
 
 
 class ChunkingSettings(BaseModel):

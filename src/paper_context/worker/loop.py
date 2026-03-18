@@ -8,7 +8,12 @@ from dataclasses import dataclass
 
 from sqlalchemy.engine import Connection
 
-from paper_context.ingestion.service import IngestJobContext, IngestProcessor, LeaseExtender
+from paper_context.ingestion.service import (
+    IngestExecutionDeferred,
+    IngestJobContext,
+    IngestProcessor,
+    LeaseExtender,
+)
 from paper_context.queue.contracts import ClaimedIngestMessage, IngestionQueue
 
 ConnectionFactory = Callable[..., AbstractContextManager[Connection]]
@@ -59,11 +64,14 @@ class IngestWorker:
         )
         lease.extend()
         with self._open_connection(transactional=False) as processing_connection:
-            self._processor.process(
-                processing_connection,
-                IngestJobContext(message=task.message, payload=task.payload),
-                lease,
-            )
+            try:
+                self._processor.process(
+                    processing_connection,
+                    IngestJobContext(message=task.message, payload=task.payload),
+                    lease,
+                )
+            except IngestExecutionDeferred:
+                return None
         with self._open_connection(transactional=True) as archive_connection:
             self._queue_adapter.archive_message(archive_connection, task.message.msg_id)
         return task

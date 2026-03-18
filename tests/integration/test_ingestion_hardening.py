@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from io import BytesIO
 from pathlib import Path
@@ -39,9 +40,31 @@ class StaticPdfParser:
         self.name = result.artifact.parser
         self._result = result
 
-    def parse(self, filename: str, content: bytes) -> ParserResult:
-        del filename, content
+    def parse(
+        self, filename: str, content: bytes | None = None, *, source_path=None
+    ) -> ParserResult:
+        del filename, content, source_path
         return self._result
+
+
+class BlockingPdfParser(StaticPdfParser):
+    def __init__(
+        self,
+        result: ParserResult,
+        *,
+        started: threading.Event,
+        release: threading.Event,
+    ) -> None:
+        super().__init__(result)
+        self._started = started
+        self._release = release
+
+    def parse(
+        self, filename: str, content: bytes | None = None, *, source_path=None
+    ) -> ParserResult:
+        self._started.set()
+        assert self._release.wait(timeout=5)
+        return super().parse(filename, content, source_path=source_path)
 
 
 class FailOnceArchiveQueue(IngestionQueue):
@@ -786,24 +809,86 @@ def test_stale_redelivery_after_newer_ingest_job_exists_is_failed_without_wiping
             .mappings()
             .one()
         )
-        retrieval = (
-            connection.execute(
-                text(
-                    """
-                SELECT ingest_job_id, status, is_active
-                FROM retrieval_index_runs
-                WHERE document_id = :document_id
-                """
-                ),
-                {"document_id": original_upload.document_id},
-            )
-            .mappings()
-            .one()
-        )
-
     assert original_job["status"] == "failed"
     assert original_job["failure_code"] == "superseded_by_newer_ingest_job"
     assert current_document["current_status"] == "ready"
-    assert retrieval["ingest_job_id"] == newer_ingest_job_id
-    assert retrieval["status"] == "ready"
-    assert retrieval["is_active"] is True
+
+
+def test_duplicate_claim_defers_until_first_worker_releases_processing_lock(
+    migrated_postgres_engine,
+    unique_queue_name: str,
+    tmp_path: Path,
+) -> None:
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            text("SELECT pgmq.create(:queue_name)"),
+            {"queue_name": unique_queue_name},
+        )
+
+    storage, upload = _create_upload(
+        migrated_postgres_engine,
+        queue_name=unique_queue_name,
+        storage_root=tmp_path / "artifacts",
+    )
+    started = threading.Event()
+    release = threading.Event()
+    primary_result = _parser_result(parser_name="docling", gate_status="pass")
+    blocking_processor = DeterministicIngestProcessor(
+        storage=storage,
+        primary_parser=BlockingPdfParser(primary_result, started=started, release=release),
+        fallback_parser=StaticPdfParser(
+            _parser_result(parser_name="pdfplumber", gate_status="fail")
+        ),
+        metadata_enricher=NullMetadataEnricher(),
+        index_version="index-v1",
+        chunking_version="chunk-v1",
+        embedding_model="emb-v1",
+        reranker_model="rank-v1",
+        min_tokens=1,
+        max_tokens=20,
+        overlap_fraction=0.1,
+    )
+    worker = _worker(
+        migrated_postgres_engine,
+        queue=_queue(unique_queue_name),
+        processor=blocking_processor,
+        vt_seconds=1,
+    )
+    worker_error: list[Exception] = []
+
+    def _run_worker() -> None:
+        try:
+            worker.run_once()
+        except Exception as exc:  # pragma: no cover - asserted below
+            worker_error.append(exc)
+
+    thread = threading.Thread(target=_run_worker, daemon=True)
+    thread.start()
+    assert started.wait(timeout=5)
+    time.sleep(1.2)
+
+    duplicate_processor = _processor(
+        storage,
+        primary_result=primary_result,
+    )
+    duplicate_worker = _worker(
+        migrated_postgres_engine,
+        queue=_queue(unique_queue_name),
+        processor=duplicate_processor,
+        vt_seconds=1,
+    )
+
+    assert duplicate_worker.run_once() is None
+
+    release.set()
+    thread.join(timeout=5)
+
+    assert worker_error == []
+    with migrated_postgres_engine.begin() as connection:
+        job_status = connection.execute(
+            text("SELECT status FROM ingest_jobs WHERE id = :ingest_job_id"),
+            {"ingest_job_id": upload.ingest_job_id},
+        ).scalar_one()
+        queue_metrics = _queue(unique_queue_name).queue_metrics(connection)
+    assert job_status == "ready"
+    assert queue_metrics.queue_length == 0

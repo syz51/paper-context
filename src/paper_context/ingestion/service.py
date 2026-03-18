@@ -83,6 +83,10 @@ class LeaseExtender:
             self._queue_adapter.extend_lease(connection, self._message.msg_id, vt_seconds)
 
 
+class IngestExecutionDeferred(RuntimeError):
+    """Raised when a claimed job should be retried later without archiving the queue message."""
+
+
 class IngestProcessor(Protocol):
     def process(
         self,
@@ -137,6 +141,14 @@ class DeterministicIngestProcessor:
         context: IngestJobContext,
         lease: LeaseExtender,
     ) -> None:
+        if not self._try_claim_processing_lock(
+            connection,
+            ingest_job_id=context.payload.ingest_job_id,
+        ):
+            raise IngestExecutionDeferred(
+                f"ingest job {context.payload.ingest_job_id} is already being processed"
+            )
+        self._clear_implicit_transaction(connection)
         created_storage_refs: list[str] = []
         try:
             with connection.begin():
@@ -149,10 +161,10 @@ class DeterministicIngestProcessor:
 
             document_id = prepared.document_id
             warnings = list(prepared.warnings)
-            pdf_bytes = self._storage.resolve(prepared.storage_ref).read_bytes()
+            source_path = self._storage.resolve(prepared.storage_ref)
             primary_result = self._primary_parser.parse(
                 filename=prepared.storage_ref,
-                content=pdf_bytes,
+                source_path=source_path,
             )
             primary_artifact = self._store_parser_artifact(
                 document_id=document_id,
@@ -171,7 +183,7 @@ class DeterministicIngestProcessor:
                 warnings = _dedupe_warnings([*warnings, "parser_fallback_used"])
                 fallback_result = self._fallback_parser.parse(
                     filename=prepared.storage_ref,
-                    content=pdf_bytes,
+                    source_path=source_path,
                 )
                 fallback_artifact = self._store_parser_artifact(
                     document_id=document_id,
@@ -225,7 +237,7 @@ class DeterministicIngestProcessor:
                 active_result = fallback_result
                 active_artifact = fallback_artifact
                 parser_source = fallback_result.artifact.parser
-            elif primary_result.gate_status == "fail" or primary_result.parsed_document is None:
+            elif primary_result.gate_status == "fail":
                 with connection.begin():
                     warnings = self._sync_processing_warnings(
                         connection,
@@ -256,6 +268,8 @@ class DeterministicIngestProcessor:
                 return
 
             parsed_document = active_result.parsed_document
+            if parsed_document is None:
+                parsed_document = active_result.load_parsed_document()
             if parsed_document is None:
                 raise RuntimeError(
                     "parsed_document is unexpectedly missing after parser validation"
@@ -363,14 +377,6 @@ class DeterministicIngestProcessor:
                     warnings=warnings,
                 )
             lease.extend()
-            prepared_index = self._retrieval_indexer.prepare_rebuild(
-                connection,
-                document_id=document_id,
-                ingest_job_id=context.payload.ingest_job_id,
-                parser_source=parser_source,
-            )
-            if connection.in_transaction():
-                connection.commit()
             with connection.begin():
                 warnings = self._sync_processing_warnings(
                     connection,
@@ -381,7 +387,12 @@ class DeterministicIngestProcessor:
                 )
                 if warnings is None:
                     return
-                self._retrieval_indexer.publish_prepared(connection, prepared_index)
+                self._retrieval_indexer.rebuild(
+                    connection,
+                    document_id=document_id,
+                    ingest_job_id=context.payload.ingest_job_id,
+                    parser_source=parser_source,
+                )
                 self._mark_ready(
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
@@ -392,6 +403,11 @@ class DeterministicIngestProcessor:
             for storage_ref in reversed(created_storage_refs):
                 self._storage.delete(storage_ref)
             raise
+        finally:
+            self._release_processing_lock(
+                connection,
+                ingest_job_id=context.payload.ingest_job_id,
+            )
 
     def _prepare_for_processing(
         self,
@@ -458,6 +474,37 @@ class DeterministicIngestProcessor:
             storage_ref=source_artifact["storage_ref"],
             warnings=warnings,
         )
+
+    def _try_claim_processing_lock(
+        self,
+        connection: Connection,
+        *,
+        ingest_job_id: uuid.UUID,
+    ) -> bool:
+        key_hi, key_lo = _advisory_lock_keys(ingest_job_id)
+        return bool(
+            connection.execute(
+                text("SELECT pg_try_advisory_lock(:key_hi, :key_lo)"),
+                {"key_hi": key_hi, "key_lo": key_lo},
+            ).scalar_one()
+        )
+
+    def _release_processing_lock(
+        self,
+        connection: Connection,
+        *,
+        ingest_job_id: uuid.UUID,
+    ) -> None:
+        key_hi, key_lo = _advisory_lock_keys(ingest_job_id)
+        connection.execute(
+            text("SELECT pg_advisory_unlock(:key_hi, :key_lo)"),
+            {"key_hi": key_hi, "key_lo": key_lo},
+        )
+
+    def _clear_implicit_transaction(self, connection: Connection) -> None:
+        in_transaction = connection.in_transaction()
+        if in_transaction is True:
+            connection.commit()
 
     def _sync_processing_warnings(
         self,
@@ -646,10 +693,21 @@ class DeterministicIngestProcessor:
         is_primary: bool,
         created_storage_refs: list[str] | None = None,
     ) -> _StagedParserArtifact:
-        stored_artifact = self._storage.store_bytes(
-            f"documents/{document_id}/{ingest_job_id}/{artifact.artifact.filename}",
-            artifact.artifact.content,
-        )
+        artifact_path = f"documents/{document_id}/{ingest_job_id}/{artifact.artifact.filename}"
+        try:
+            if artifact.parsed_document is None and artifact.parsed_document_loader is not None:
+                artifact.load_parsed_document()
+            if artifact.artifact.content_path is not None:
+                with artifact.artifact.content_path.open("rb") as handle:
+                    stored_artifact = self._storage.store_file(artifact_path, handle)
+            elif artifact.artifact.content is not None:
+                stored_artifact = self._storage.store_bytes(
+                    artifact_path, artifact.artifact.content
+                )
+            else:
+                raise ValueError("parser artifact is missing both content and content_path")
+        finally:
+            artifact.artifact.cleanup_local_copy()
         if created_storage_refs is not None:
             created_storage_refs.append(stored_artifact.storage_ref)
         return _StagedParserArtifact(
@@ -1353,6 +1411,15 @@ def _dedupe_warnings(warnings: list[str]) -> list[str]:
             seen.add(warning)
             deduped.append(warning)
     return deduped
+
+
+def _advisory_lock_keys(value: uuid.UUID) -> tuple[int, int]:
+    uuid_int = value.int
+    return _to_signed_int32((uuid_int >> 96) & 0xFFFFFFFF), _to_signed_int32(uuid_int & 0xFFFFFFFF)
+
+
+def _to_signed_int32(value: int) -> int:
+    return value - 0x100000000 if value >= 0x80000000 else value
 
 
 def _token_count(text: str) -> int:

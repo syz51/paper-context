@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from paper_context.ingestion import parsers
-from paper_context.ingestion.types import ParsedParagraph
+from paper_context.ingestion import parser_isolation, parsers
+from paper_context.ingestion.types import (
+    ParsedDocument,
+    ParsedParagraph,
+    ParsedSection,
+    ParserArtifact,
+    ParserResult,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -86,6 +95,9 @@ class _FakeDocument:
     def export_to_dict(self) -> dict[str, object]:
         return {"items": len(self._items)}
 
+    def save_as_json(self, filename: str | Path, *args, **kwargs) -> None:
+        Path(filename).write_text(f'{{"items": {len(self._items)}}}', encoding="utf-8")
+
 
 @dataclass(frozen=True)
 class _FakeConversion:
@@ -134,12 +146,16 @@ class _FakePdfPage:
     def __init__(self, text: str | None, tables: list[list[list[object]]] | None = None) -> None:
         self._text = text
         self._tables = tables or []
+        self.close_calls = 0
 
     def extract_text(self) -> str | None:
         return self._text
 
     def extract_tables(self) -> list[list[list[object]]]:
         return self._tables
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class _FakePdfContext:
@@ -318,9 +334,156 @@ def test_docling_parser_initializes_pipeline_options(monkeypatch: pytest.MonkeyP
     option = converter.format_options[_FakeInputFormat.PDF]
     assert isinstance(option, _FakePdfFormatOption)
     assert option.pipeline_options.do_ocr is False
-    assert option.pipeline_options.do_table_structure is True
-    assert option.pipeline_options.force_backend_text is True
-    assert option.pipeline_options.generate_page_images is True
+
+
+def test_parser_worker_round_trips_parser_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    expected = ParserResult(
+        gate_status="pass",
+        parsed_document=ParsedDocument(
+            title="Isolated parser paper",
+            authors=["Ada Lovelace"],
+            abstract="A parser isolation fixture.",
+            publication_year=2024,
+            metadata_confidence=0.9,
+            sections=[
+                ParsedSection(
+                    key="intro",
+                    heading="Introduction",
+                    heading_path=["Introduction"],
+                    level=1,
+                    page_start=1,
+                    page_end=1,
+                    paragraphs=[ParsedParagraph(text="hello", page_start=1, page_end=1)],
+                )
+            ],
+            tables=[],
+            references=[],
+        ),
+        artifact=ParserArtifact(
+            artifact_type="docling_parse",
+            parser="docling",
+            filename="docling.json",
+            content=b"{}",
+        ),
+    )
+    fake_parser = SimpleNamespace(parse=lambda filename, content=None, source_path=None: expected)
+    monkeypatch.setattr(
+        parser_isolation,
+        "_create_inprocess_parser",
+        lambda parser_name: fake_parser,
+    )
+
+    output_root = tmp_path / "parser-output"
+    payload = parser_isolation.run_parser_worker(
+        "docling",
+        "paper.pdf",
+        output_root,
+        b"%PDF-1.4",
+    )
+    restored = parser_isolation._payload_to_parser_result(
+        parser_name="docling",
+        payload=payload,
+        output_root=output_root,
+    )
+
+    assert restored.gate_status == expected.gate_status
+    assert restored.parsed_document is None
+    assert restored.load_parsed_document() == expected.parsed_document
+    assert restored.parsed_document == expected.parsed_document
+    assert restored.artifact.artifact_type == expected.artifact.artifact_type
+    assert restored.artifact.parser == expected.artifact.parser
+    assert restored.artifact.filename == expected.artifact.filename
+    assert restored.artifact.content is None
+    assert restored.artifact.content_path is not None
+    assert restored.artifact.content_path.read_bytes() == b"{}"
+    assert restored.artifact.cleanup_root == output_root
+    parser_isolation._cleanup_output_root(restored.artifact.cleanup_root)
+
+
+def test_subprocess_parser_returns_machine_readable_timeout_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=5, stderr=b"timeout")
+
+    monkeypatch.setattr(parser_isolation.subprocess, "run", _timeout)
+
+    result = parser_isolation.SubprocessPdfParser("docling").parse("paper.pdf", b"%PDF-1.4")
+
+    assert result.gate_status == "fail"
+    assert result.failure_code == "docling_timeout"
+    assert "timeout" in (result.failure_message or "")
+
+
+def test_subprocess_parser_returns_machine_readable_launch_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _launch_failure(*args, **kwargs):
+        raise subprocess.SubprocessError("resource limits unavailable")
+
+    monkeypatch.setattr(parser_isolation.subprocess, "run", _launch_failure)
+
+    result = parser_isolation.SubprocessPdfParser("docling").parse("paper.pdf", b"%PDF-1.4")
+
+    assert result.gate_status == "fail"
+    assert result.failure_code == "docling_subprocess_launch_failed"
+    assert result.failure_message == "resource limits unavailable"
+
+
+def test_parser_resource_limits_lower_soft_limit_before_hard_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rlim_infinity = 2**63 - 1
+    state = {
+        1: (rlim_infinity, rlim_infinity),
+        2: (rlim_infinity, rlim_infinity),
+        3: (rlim_infinity, rlim_infinity),
+    }
+    calls: list[tuple[int, tuple[int, int]]] = []
+
+    class _FakeResource:
+        RLIMIT_AS = 1
+        RLIMIT_CPU = 2
+        RLIMIT_FSIZE = 3
+        RLIM_INFINITY = rlim_infinity
+
+        @staticmethod
+        def getrlimit(limit_kind: int) -> tuple[int, int]:
+            return state[limit_kind]
+
+        @staticmethod
+        def setrlimit(limit_kind: int, limits: tuple[int, int]) -> None:
+            calls.append((limit_kind, limits))
+            _, current_hard = state[limit_kind]
+            next_soft, next_hard = limits
+            if next_hard != rlim_infinity and state[limit_kind][0] > next_hard:
+                raise ValueError("current limit exceeds maximum limit")
+            if current_hard != rlim_infinity and next_hard > current_hard:
+                raise ValueError("cannot raise hard limit")
+            state[limit_kind] = limits
+
+    monkeypatch.setitem(sys.modules, "resource", _FakeResource)
+
+    apply_limits = parser_isolation._parser_resource_limits(
+        parser_isolation.ParserIsolationConfig(
+            timeout_seconds=120,
+            memory_limit_mb=2_048,
+            output_limit_mb=32,
+        )
+    )
+
+    assert apply_limits is not None
+    apply_limits()
+
+    assert calls[:2] == [
+        (_FakeResource.RLIMIT_AS, (2_048 * 1024 * 1024, rlim_infinity)),
+        (_FakeResource.RLIMIT_AS, (2_048 * 1024 * 1024, 2_048 * 1024 * 1024)),
+    ]
+    assert state[_FakeResource.RLIMIT_CPU] == (120, 120)
+    assert state[_FakeResource.RLIMIT_FSIZE] == (32 * 1024 * 1024, 32 * 1024 * 1024)
 
 
 def test_docling_parser_handles_success_and_structure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -384,6 +547,26 @@ def test_docling_parser_handles_success_and_structure(monkeypatch: pytest.Monkey
     assert result.failure_message is None
 
 
+def test_docling_parser_accepts_source_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    conversion = _FakeConversion(
+        status=parsers.ConversionStatus.SUCCESS,
+        document=_FakeDocument(
+            [
+                _FakeTitleItem("paper title"),
+                _FakeSectionHeaderItem("Introduction", level=1, prov=[_FakeProv(1, (0, 11))]),
+                _FakeTextItem("body text", "body", prov=[_FakeProv(1, (0, 9))]),
+            ]
+        ),
+    )
+    converter = _install_docling_fakes(monkeypatch, conversion=conversion)
+
+    result = parsers.DoclingPdfParser().parse("paper.pdf", source_path=Path("/tmp/paper.pdf"))
+
+    assert converter.calls == [("paper.pdf", False)]
+    assert result.gate_status == "pass"
+    assert result.parsed_document is not None
+
+
 def test_docling_parser_marks_degraded_documents_without_headings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -409,6 +592,67 @@ def test_docling_parser_marks_degraded_documents_without_headings(
     assert result.parsed_document.sections[0].paragraphs[0].text == "short intro"
     assert result.warnings == ["reduced_structure_confidence"]
     assert result.failure_code is None
+
+
+def test_parser_worker_skips_parsed_document_handoff_for_degraded_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    degraded = ParserResult(
+        gate_status="degraded",
+        parsed_document=ParsedDocument(
+            title="Degraded parser paper",
+            authors=[],
+            abstract=None,
+            publication_year=2024,
+            metadata_confidence=0.4,
+            sections=[
+                ParsedSection(
+                    key="root",
+                    heading=None,
+                    heading_path=[],
+                    level=0,
+                    page_start=1,
+                    page_end=1,
+                    paragraphs=[ParsedParagraph(text="body", page_start=1, page_end=1)],
+                )
+            ],
+            tables=[],
+            references=[],
+        ),
+        artifact=ParserArtifact(
+            artifact_type="docling_parse",
+            parser="docling",
+            filename="docling.json",
+            content=b"{}",
+        ),
+        warnings=["reduced_structure_confidence"],
+    )
+    fake_parser = SimpleNamespace(parse=lambda filename, content=None, source_path=None: degraded)
+    monkeypatch.setattr(
+        parser_isolation,
+        "_create_inprocess_parser",
+        lambda parser_name: fake_parser,
+    )
+
+    output_root = tmp_path / "parser-output"
+    payload = parser_isolation.run_parser_worker(
+        "docling",
+        "paper.pdf",
+        output_root,
+        b"%PDF-1.4",
+    )
+    restored = parser_isolation._payload_to_parser_result(
+        parser_name="docling",
+        payload=payload,
+        output_root=output_root,
+    )
+
+    assert restored.gate_status == "degraded"
+    assert restored.parsed_document is None
+    assert restored.load_parsed_document() is None
+    assert not (output_root / "parsed_document.json").exists()
+    parser_isolation._cleanup_output_root(restored.artifact.cleanup_root)
 
 
 def test_docling_parser_returns_fail_for_bad_conversion_status(
@@ -495,6 +739,21 @@ def test_pdfplumber_parser_handles_structured_documents(monkeypatch: pytest.Monk
     assert parsed.references[0].publication_year == 2024
     assert result.warnings == []
     assert result.failure_code is None
+    assert [page.close_calls for page in pages] == [1, 1]
+
+
+def test_pdfplumber_parser_accepts_source_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    pages = [_FakePdfPage("paper title\nIntroduction\nbody text")]
+    monkeypatch.setattr(parsers.pdfplumber, "open", lambda content: _FakePdfContext(pages))
+
+    result = parsers.PdfPlumberPdfParser().parse(
+        "paper.pdf",
+        source_path=Path("/tmp/paper.pdf"),
+    )
+
+    assert result.gate_status == "pass"
+    assert result.parsed_document is not None
+    assert pages[0].close_calls == 1
 
 
 def test_pdfplumber_parser_marks_degraded_documents_without_headings(

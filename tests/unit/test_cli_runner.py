@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 from uuid import uuid4
 
 import pytest
@@ -26,6 +26,14 @@ def make_settings() -> SimpleNamespace:
             visibility_timeout_seconds=120,
             max_poll_seconds=7,
             poll_interval_ms=80,
+        ),
+        parser=SimpleNamespace(
+            primary="docling",
+            fallback="pdfplumber",
+            execution_mode="subprocess",
+            timeout_seconds=120,
+            memory_limit_mb=2048,
+            output_limit_mb=32,
         ),
         providers=SimpleNamespace(
             index_version="mvp-v1",
@@ -163,12 +171,9 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     storage_cls = MagicMock()
     storage_instance = MagicMock()
     storage_cls.return_value = storage_instance
-    primary_parser_cls = MagicMock()
     primary_parser = MagicMock()
-    primary_parser_cls.return_value = primary_parser
-    fallback_parser_cls = MagicMock()
     fallback_parser = MagicMock()
-    fallback_parser_cls.return_value = fallback_parser
+    build_pdf_parser = MagicMock(side_effect=[primary_parser, fallback_parser])
     enricher_cls = MagicMock()
     enricher = MagicMock()
     enricher_cls.return_value = enricher
@@ -190,8 +195,7 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_module, "get_engine", lambda: engine)
     monkeypatch.setattr(runner_module, "IngestionQueue", queue_cls)
     monkeypatch.setattr(runner_module, "LocalFilesystemStorage", storage_cls)
-    monkeypatch.setattr(runner_module, "DoclingPdfParser", primary_parser_cls)
-    monkeypatch.setattr(runner_module, "PdfPlumberPdfParser", fallback_parser_cls)
+    monkeypatch.setattr(runner_module, "build_pdf_parser", build_pdf_parser)
     monkeypatch.setattr(runner_module, "NullMetadataEnricher", enricher_cls)
     monkeypatch.setattr(runner_module, "DocumentRetrievalIndexer", retrieval_indexer_cls)
     monkeypatch.setattr(runner_module, "DeterministicEmbeddingClient", deterministic_embedding_cls)
@@ -206,8 +210,24 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     queue_cls.assert_called_once_with("document_ingest")
     storage_cls.assert_called_once_with("/tmp/paper-context-tests")
     storage_instance.ensure_root.assert_called_once_with()
-    primary_parser_cls.assert_called_once_with()
-    fallback_parser_cls.assert_called_once_with()
+    assert build_pdf_parser.call_args_list[0].kwargs == {
+        "isolated": True,
+        "config": runner_module.ParserIsolationConfig(
+            timeout_seconds=120,
+            memory_limit_mb=2048,
+            output_limit_mb=32,
+        ),
+    }
+    assert build_pdf_parser.call_args_list[0].args == ("docling",)
+    assert build_pdf_parser.call_args_list[1].kwargs == {
+        "isolated": True,
+        "config": runner_module.ParserIsolationConfig(
+            timeout_seconds=120,
+            memory_limit_mb=2048,
+            output_limit_mb=32,
+        ),
+    }
+    assert build_pdf_parser.call_args_list[1].args == ("pdfplumber",)
     enricher_cls.assert_called_once_with()
     processor_cls.assert_called_once_with(
         storage=storage_instance,
@@ -252,8 +272,11 @@ def test_build_worker_connection_factory_opens_connection_scope(
         "LocalFilesystemStorage",
         MagicMock(return_value=MagicMock(ensure_root=MagicMock())),
     )
-    monkeypatch.setattr(runner_module, "DoclingPdfParser", MagicMock())
-    monkeypatch.setattr(runner_module, "PdfPlumberPdfParser", MagicMock())
+    monkeypatch.setattr(
+        runner_module,
+        "build_pdf_parser",
+        MagicMock(side_effect=[MagicMock(), MagicMock()]),
+    )
     monkeypatch.setattr(runner_module, "NullMetadataEnricher", MagicMock())
     monkeypatch.setattr(runner_module, "DocumentRetrievalIndexer", MagicMock())
     monkeypatch.setattr(runner_module, "DeterministicEmbeddingClient", MagicMock())
@@ -269,6 +292,44 @@ def test_build_worker_connection_factory_opens_connection_scope(
         assert connection is entered
 
     connection_scope.assert_called_once_with(engine)
+
+
+def test_build_worker_warns_when_provider_keys_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings()
+    logger = MagicMock()
+    monkeypatch.setattr(runner_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_module, "get_engine", MagicMock())
+    monkeypatch.setattr(runner_module, "IngestionQueue", MagicMock())
+    monkeypatch.setattr(
+        runner_module,
+        "LocalFilesystemStorage",
+        MagicMock(return_value=MagicMock(ensure_root=MagicMock())),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "build_pdf_parser",
+        MagicMock(side_effect=[MagicMock(), MagicMock()]),
+    )
+    monkeypatch.setattr(runner_module, "NullMetadataEnricher", MagicMock())
+    monkeypatch.setattr(runner_module, "DocumentRetrievalIndexer", MagicMock())
+    monkeypatch.setattr(runner_module, "DeterministicEmbeddingClient", MagicMock())
+    monkeypatch.setattr(runner_module, "HeuristicRerankerClient", MagicMock())
+    monkeypatch.setattr(runner_module, "VoyageEmbeddingClient", MagicMock())
+    monkeypatch.setattr(runner_module, "ZeroEntropyRerankerClient", MagicMock())
+    monkeypatch.setattr(runner_module, "DeterministicIngestProcessor", MagicMock())
+    monkeypatch.setattr(runner_module, "IngestWorker", MagicMock())
+    monkeypatch.setattr(runner_module, "logger", logger)
+
+    runner_module.build_worker()
+
+    logger.warning.assert_has_calls(
+        [
+            call("voyage_api_key not configured; using deterministic embedding client"),
+            call("zero_entropy_api_key not configured; using heuristic reranker"),
+        ]
+    )
 
 
 def test_run_worker_returns_immediately_in_once_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -298,6 +359,26 @@ def test_run_worker_sleeps_when_idle(monkeypatch: pytest.MonkeyPatch) -> None:
         runner_module.run_worker()
 
     sleep.assert_called_once_with(0.25)
+
+
+def test_run_worker_logs_and_continues_after_non_once_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings()
+    worker = MagicMock()
+    worker.run_once.side_effect = [RuntimeError("boom"), RuntimeError("stop")]
+    sleep = MagicMock(side_effect=[None, RuntimeError("stop")])
+    logger = MagicMock()
+    monkeypatch.setattr(runner_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_module, "build_worker", lambda: worker)
+    monkeypatch.setattr(runner_module.time, "sleep", sleep)
+    monkeypatch.setattr(runner_module, "logger", logger)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        runner_module.run_worker()
+
+    assert logger.exception.call_count == 2
+    assert sleep.call_args_list[0].args == (0.25,)
 
 
 def test_run_synthetic_job_verification_returns_summary(

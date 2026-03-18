@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -47,6 +47,7 @@ PARENT_SIBLINGS_BEFORE = 1
 PARENT_SIBLINGS_AFTER = 1
 TABLE_PREVIEW_ROWS = 3
 EMBEDDING_DIMENSIONS = 1024
+INDEX_BUILD_BATCH_SIZE = 128
 _RETRIEVAL_NAMESPACE = uuid.UUID("68b1ce8d-1a1e-49f5-b1db-47052d7ece6c")
 
 
@@ -113,43 +114,6 @@ class _TableIndexRow:
     section_path: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class _PreparedPassageAsset:
-    id: uuid.UUID
-    retrieval_index_run_id: uuid.UUID
-    passage_id: uuid.UUID
-    document_id: uuid.UUID
-    section_id: uuid.UUID
-    publication_year: int | None
-    search_text: str
-    embedding: str
-    created_at: datetime
-
-
-@dataclass(frozen=True)
-class _PreparedTableAsset:
-    id: uuid.UUID
-    retrieval_index_run_id: uuid.UUID
-    table_id: uuid.UUID
-    document_id: uuid.UUID
-    section_id: uuid.UUID
-    publication_year: int | None
-    search_text: str
-    created_at: datetime
-
-
-@dataclass(frozen=True)
-class _PreparedRetrievalBuild:
-    run_id: uuid.UUID
-    document_id: uuid.UUID
-    ingest_job_id: uuid.UUID
-    parser_source: str
-    created_at: datetime
-    embedding_dimensions: int | None
-    passage_assets: tuple[_PreparedPassageAsset, ...]
-    table_assets: tuple[_PreparedTableAsset, ...]
-
-
 @dataclass
 class _Candidate:
     entity_kind: Literal["passage", "table"]
@@ -174,6 +138,12 @@ class _Candidate:
     caption: str | None = None
     table_type: str | None = None
     preview: TablePreview | None = None
+
+
+@dataclass(frozen=True)
+class _ActiveRunSelection:
+    run_ids: tuple[uuid.UUID, ...]
+    index_versions: tuple[str, ...]
 
 
 class DocumentRetrievalIndexer:
@@ -202,87 +172,76 @@ class DocumentRetrievalIndexer:
         ingest_job_id: uuid.UUID,
         parser_source: str,
     ) -> uuid.UUID:
-        prepared = self.prepare_rebuild(
-            connection,
-            document_id=document_id,
-            ingest_job_id=ingest_job_id,
-            parser_source=parser_source,
-        )
-        self.publish_prepared(connection, prepared)
-        return prepared.run_id
-
-    def prepare_rebuild(
-        self,
-        connection: Connection,
-        *,
-        document_id: uuid.UUID,
-        ingest_job_id: uuid.UUID,
-        parser_source: str,
-    ) -> _PreparedRetrievalBuild:
         run_id = _retrieval_index_run_id(ingest_job_id=ingest_job_id)
         now = datetime.now(UTC)
-        passages = self._load_passage_rows(connection, document_id=document_id)
-        embedding_dimensions: int | None = None
-        passage_assets: list[_PreparedPassageAsset] = []
-        if passages:
-            passage_embeddings = self.embedding_client.embed(
-                [row.contextualized_text for row in passages],
-                input_type="document",
-            )
-            embedding_dimensions = passage_embeddings.dimensions
-            if embedding_dimensions != EMBEDDING_DIMENSIONS:
-                raise RetrievalError(
-                    "embedding dimension mismatch for retrieval assets: "
-                    f"expected {EMBEDDING_DIMENSIONS}, got {embedding_dimensions}"
-                )
-            passage_assets = [
-                _PreparedPassageAsset(
-                    id=uuid.uuid4(),
-                    retrieval_index_run_id=run_id,
-                    passage_id=row.passage_id,
-                    document_id=row.document_id,
-                    section_id=row.section_id,
-                    publication_year=row.publication_year,
-                    search_text=self._build_passage_search_text(row),
-                    embedding=_vector_literal(embedding),
-                    created_at=now,
-                )
-                for row, embedding in zip(
-                    passages,
-                    passage_embeddings.embeddings,
-                    strict=True,
-                )
-            ]
-
-        tables = self._load_table_rows(connection, document_id=document_id)
-        table_assets = [
-            _PreparedTableAsset(
-                id=uuid.uuid4(),
-                retrieval_index_run_id=run_id,
-                table_id=row.table_id,
-                document_id=row.document_id,
-                section_id=row.section_id,
-                publication_year=row.publication_year,
-                search_text=self._build_table_search_text(row),
-                created_at=now,
-            )
-            for row in tables
-        ]
-        return _PreparedRetrievalBuild(
+        self._upsert_build_run(
+            connection,
             run_id=run_id,
             document_id=document_id,
             ingest_job_id=ingest_job_id,
             parser_source=parser_source,
             created_at=now,
-            embedding_dimensions=embedding_dimensions,
-            passage_assets=tuple(passage_assets),
-            table_assets=tuple(table_assets),
         )
+        embedding_dimensions: int | None = None
+        self._clear_existing_assets(connection, run_id=run_id)
+        for passages in self._iter_passage_row_batches(
+            connection,
+            document_id=document_id,
+            batch_size=INDEX_BUILD_BATCH_SIZE,
+        ):
+            passage_embeddings = self.embedding_client.embed(
+                [row.contextualized_text for row in passages],
+                input_type="document",
+            )
+            batch_dimensions = passage_embeddings.dimensions
+            if batch_dimensions != EMBEDDING_DIMENSIONS:
+                raise RetrievalError(
+                    "embedding dimension mismatch for retrieval assets: "
+                    f"expected {EMBEDDING_DIMENSIONS}, got {batch_dimensions}"
+                )
+            if embedding_dimensions is None:
+                embedding_dimensions = batch_dimensions
+            elif embedding_dimensions != batch_dimensions:
+                raise RetrievalError(
+                    "embedding dimension mismatch across retrieval asset batches: "
+                    f"expected {embedding_dimensions}, got {batch_dimensions}"
+                )
+            self._insert_passage_asset_batch(
+                connection,
+                run_id=run_id,
+                rows=passages,
+                embeddings=passage_embeddings.embeddings,
+                created_at=now,
+            )
+        for tables in self._iter_table_row_batches(
+            connection,
+            document_id=document_id,
+            batch_size=INDEX_BUILD_BATCH_SIZE,
+        ):
+            self._insert_table_asset_batch(
+                connection,
+                run_id=run_id,
+                rows=tables,
+                created_at=now,
+            )
+        self._activate_build_run(
+            connection,
+            run_id=run_id,
+            document_id=document_id,
+            embedding_dimensions=embedding_dimensions,
+            activated_at=now,
+        )
+        return run_id
 
-    def publish_prepared(
+    def _upsert_build_run(
         self,
         connection: Connection,
-        prepared: _PreparedRetrievalBuild,
+        *,
+        run_id: uuid.UUID,
+        document_id: uuid.UUID,
+        ingest_job_id: uuid.UUID,
+        parser_source: str,
+        created_at: datetime,
     ) -> None:
         connection.execute(
             text(
@@ -335,19 +294,26 @@ class DocumentRetrievalIndexer:
                 """
             ),
             {
-                "id": prepared.run_id,
-                "document_id": prepared.document_id,
-                "ingest_job_id": prepared.ingest_job_id,
+                "id": run_id,
+                "document_id": document_id,
+                "ingest_job_id": ingest_job_id,
                 "index_version": self.index_version,
                 "embedding_provider": self.embedding_client.provider,
                 "embedding_model": self.embedding_client.model,
                 "reranker_provider": self.reranker_client.provider,
                 "reranker_model": self.reranker_client.model,
                 "chunking_version": self.chunking_version,
-                "parser_source": prepared.parser_source,
-                "created_at": prepared.created_at,
+                "parser_source": parser_source,
+                "created_at": created_at,
             },
         )
+
+    def _clear_existing_assets(
+        self,
+        connection: Connection,
+        *,
+        run_id: uuid.UUID,
+    ) -> None:
         connection.execute(
             text(
                 """
@@ -355,7 +321,7 @@ class DocumentRetrievalIndexer:
                 WHERE retrieval_index_run_id = :retrieval_index_run_id
                 """
             ),
-            {"retrieval_index_run_id": prepared.run_id},
+            {"retrieval_index_run_id": run_id},
         )
         connection.execute(
             text(
@@ -364,95 +330,18 @@ class DocumentRetrievalIndexer:
                 WHERE retrieval_index_run_id = :retrieval_index_run_id
                 """
             ),
-            {"retrieval_index_run_id": prepared.run_id},
+            {"retrieval_index_run_id": run_id},
         )
-        if prepared.passage_assets:
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO retrieval_passage_assets (
-                        id,
-                        retrieval_index_run_id,
-                        passage_id,
-                        document_id,
-                        section_id,
-                        publication_year,
-                        search_text,
-                        search_tsvector,
-                        embedding,
-                        created_at
-                    )
-                    VALUES (
-                        :id,
-                        :retrieval_index_run_id,
-                        :passage_id,
-                        :document_id,
-                        :section_id,
-                        :publication_year,
-                        :search_text,
-                        to_tsvector('english', :search_text),
-                        CAST(:embedding AS vector),
-                        :created_at
-                    )
-                    """
-                ),
-                [
-                    {
-                        "id": asset.id,
-                        "retrieval_index_run_id": asset.retrieval_index_run_id,
-                        "passage_id": asset.passage_id,
-                        "document_id": asset.document_id,
-                        "section_id": asset.section_id,
-                        "publication_year": asset.publication_year,
-                        "search_text": asset.search_text,
-                        "embedding": asset.embedding,
-                        "created_at": asset.created_at,
-                    }
-                    for asset in prepared.passage_assets
-                ],
-            )
-        if prepared.table_assets:
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO retrieval_table_assets (
-                        id,
-                        retrieval_index_run_id,
-                        table_id,
-                        document_id,
-                        section_id,
-                        publication_year,
-                        search_text,
-                        search_tsvector,
-                        created_at
-                    )
-                    VALUES (
-                        :id,
-                        :retrieval_index_run_id,
-                        :table_id,
-                        :document_id,
-                        :section_id,
-                        :publication_year,
-                        :search_text,
-                        to_tsvector('english', :search_text),
-                        :created_at
-                    )
-                    """
-                ),
-                [
-                    {
-                        "id": asset.id,
-                        "retrieval_index_run_id": asset.retrieval_index_run_id,
-                        "table_id": asset.table_id,
-                        "document_id": asset.document_id,
-                        "section_id": asset.section_id,
-                        "publication_year": asset.publication_year,
-                        "search_text": asset.search_text,
-                        "created_at": asset.created_at,
-                    }
-                    for asset in prepared.table_assets
-                ],
-            )
+
+    def _activate_build_run(
+        self,
+        connection: Connection,
+        *,
+        run_id: uuid.UUID,
+        document_id: uuid.UUID,
+        embedding_dimensions: int | None,
+        activated_at: datetime,
+    ) -> None:
         connection.execute(
             text(
                 """
@@ -463,8 +352,8 @@ class DocumentRetrievalIndexer:
                 """
             ),
             {
-                "document_id": prepared.document_id,
-                "deactivated_at": prepared.created_at,
+                "document_id": document_id,
+                "deactivated_at": activated_at,
             },
         )
         connection.execute(
@@ -480,22 +369,25 @@ class DocumentRetrievalIndexer:
                 """
             ),
             {
-                "retrieval_index_run_id": prepared.run_id,
-                "embedding_dimensions": prepared.embedding_dimensions,
-                "activated_at": prepared.created_at,
+                "retrieval_index_run_id": run_id,
+                "embedding_dimensions": embedding_dimensions,
+                "activated_at": activated_at,
             },
         )
 
-    def _load_passage_rows(
+    def _iter_passage_row_batches(
         self,
         connection: Connection,
         *,
         document_id: uuid.UUID,
-    ) -> list[_PassageIndexRow]:
-        rows = (
-            connection.execute(
-                text(
-                    """
+        batch_size: int,
+    ) -> Iterator[list[_PassageIndexRow]]:
+        offset = 0
+        while True:
+            rows = (
+                connection.execute(
+                    text(
+                        """
                     SELECT
                         passages.id AS passage_id,
                         passages.document_id,
@@ -515,42 +407,37 @@ class DocumentRetrievalIndexer:
                     JOIN document_sections sections ON sections.id = passages.section_id
                     WHERE passages.document_id = :document_id
                     ORDER BY sections.ordinal, passages.chunk_ordinal, passages.id
+                    LIMIT :batch_size
+                    OFFSET :offset
                     """
-                ),
-                {"document_id": document_id},
+                    ),
+                    {
+                        "document_id": document_id,
+                        "batch_size": batch_size,
+                        "offset": offset,
+                    },
+                )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
-        )
-        return [
-            _PassageIndexRow(
-                passage_id=row["passage_id"],
-                document_id=row["document_id"],
-                section_id=row["section_id"],
-                chunk_ordinal=row["chunk_ordinal"],
-                body_text=row["body_text"],
-                contextualized_text=row["contextualized_text"],
-                page_start=row["page_start"],
-                page_end=row["page_end"],
-                document_title=row["document_title"],
-                authors=tuple(cast(list[str], row["authors"] or [])),
-                abstract=row["abstract"],
-                publication_year=row["publication_year"],
-                section_path=tuple(cast(list[str], row["section_path"] or [])),
-            )
-            for row in rows
-        ]
+            if not rows:
+                return
+            yield [self._row_to_passage_index_row(row) for row in rows]
+            offset += len(rows)
 
-    def _load_table_rows(
+    def _iter_table_row_batches(
         self,
         connection: Connection,
         *,
         document_id: uuid.UUID,
-    ) -> list[_TableIndexRow]:
-        rows = (
-            connection.execute(
-                text(
-                    """
+        batch_size: int,
+    ) -> Iterator[list[_TableIndexRow]]:
+        offset = 0
+        while True:
+            rows = (
+                connection.execute(
+                    text(
+                        """
                     SELECT
                         tables.id AS table_id,
                         tables.document_id,
@@ -569,35 +456,163 @@ class DocumentRetrievalIndexer:
                     JOIN document_sections sections ON sections.id = tables.section_id
                     WHERE tables.document_id = :document_id
                     ORDER BY sections.ordinal, tables.id
+                    LIMIT :batch_size
+                    OFFSET :offset
                     """
-                ),
-                {"document_id": document_id},
+                    ),
+                    {
+                        "document_id": document_id,
+                        "batch_size": batch_size,
+                        "offset": offset,
+                    },
+                )
+                .mappings()
+                .all()
             )
-            .mappings()
-            .all()
+            if not rows:
+                return
+            yield [self._row_to_table_index_row(row) for row in rows]
+            offset += len(rows)
+
+    def _insert_passage_asset_batch(
+        self,
+        connection: Connection,
+        *,
+        run_id: uuid.UUID,
+        rows: list[_PassageIndexRow],
+        embeddings: tuple[tuple[float, ...], ...],
+        created_at: datetime,
+    ) -> None:
+        connection.execute(
+            text(
+                """
+                INSERT INTO retrieval_passage_assets (
+                    id,
+                    retrieval_index_run_id,
+                    passage_id,
+                    document_id,
+                    section_id,
+                    publication_year,
+                    search_text,
+                    search_tsvector,
+                    embedding,
+                    created_at
+                )
+                VALUES (
+                    :id,
+                    :retrieval_index_run_id,
+                    :passage_id,
+                    :document_id,
+                    :section_id,
+                    :publication_year,
+                    :search_text,
+                    to_tsvector('english', :search_text),
+                    CAST(:embedding AS vector),
+                    :created_at
+                )
+                """
+            ),
+            [
+                {
+                    "id": uuid.uuid4(),
+                    "retrieval_index_run_id": run_id,
+                    "passage_id": row.passage_id,
+                    "document_id": row.document_id,
+                    "section_id": row.section_id,
+                    "publication_year": row.publication_year,
+                    "search_text": self._build_passage_search_text(row),
+                    "embedding": _vector_literal(embedding),
+                    "created_at": created_at,
+                }
+                for row, embedding in zip(rows, embeddings, strict=True)
+            ],
         )
-        return [
-            _TableIndexRow(
-                table_id=row["table_id"],
-                document_id=row["document_id"],
-                section_id=row["section_id"],
-                caption=row["caption"],
-                table_type=row["table_type"],
-                headers=tuple(
-                    str(header) for header in cast(list[object], row["headers_json"] or [])
-                ),
-                rows=tuple(
-                    tuple(str(cell) for cell in cast(list[object], table_row))
-                    for table_row in cast(list[list[object]], row["rows_json"] or [])
-                ),
-                page_start=row["page_start"],
-                page_end=row["page_end"],
-                document_title=row["document_title"],
-                publication_year=row["publication_year"],
-                section_path=tuple(cast(list[str], row["section_path"] or [])),
-            )
-            for row in rows
-        ]
+
+    def _insert_table_asset_batch(
+        self,
+        connection: Connection,
+        *,
+        run_id: uuid.UUID,
+        rows: list[_TableIndexRow],
+        created_at: datetime,
+    ) -> None:
+        connection.execute(
+            text(
+                """
+                INSERT INTO retrieval_table_assets (
+                    id,
+                    retrieval_index_run_id,
+                    table_id,
+                    document_id,
+                    section_id,
+                    publication_year,
+                    search_text,
+                    search_tsvector,
+                    created_at
+                )
+                VALUES (
+                    :id,
+                    :retrieval_index_run_id,
+                    :table_id,
+                    :document_id,
+                    :section_id,
+                    :publication_year,
+                    :search_text,
+                    to_tsvector('english', :search_text),
+                    :created_at
+                )
+                """
+            ),
+            [
+                {
+                    "id": uuid.uuid4(),
+                    "retrieval_index_run_id": run_id,
+                    "table_id": row.table_id,
+                    "document_id": row.document_id,
+                    "section_id": row.section_id,
+                    "publication_year": row.publication_year,
+                    "search_text": self._build_table_search_text(row),
+                    "created_at": created_at,
+                }
+                for row in rows
+            ],
+        )
+
+    def _row_to_passage_index_row(self, row: Any) -> _PassageIndexRow:
+        return _PassageIndexRow(
+            passage_id=row["passage_id"],
+            document_id=row["document_id"],
+            section_id=row["section_id"],
+            chunk_ordinal=row["chunk_ordinal"],
+            body_text=row["body_text"],
+            contextualized_text=row["contextualized_text"],
+            page_start=row["page_start"],
+            page_end=row["page_end"],
+            document_title=row["document_title"],
+            authors=tuple(cast(list[str], row["authors"] or [])),
+            abstract=row["abstract"],
+            publication_year=row["publication_year"],
+            section_path=tuple(cast(list[str], row["section_path"] or [])),
+        )
+
+    def _row_to_table_index_row(self, row: Any) -> _TableIndexRow:
+        return _TableIndexRow(
+            table_id=row["table_id"],
+            document_id=row["document_id"],
+            section_id=row["section_id"],
+            caption=row["caption"],
+            table_type=row["table_type"],
+            headers=tuple(str(header) for header in cast(list[object], row["headers_json"] or [])),
+            rows=tuple(
+                tuple(str(cell) for cell in cast(list[object], table_row))
+                for table_row in cast(list[list[object]], row["rows_json"] or [])
+            ),
+            page_start=row["page_start"],
+            page_end=row["page_end"],
+            document_title=row["document_title"],
+            publication_year=row["publication_year"],
+            section_path=tuple(cast(list[str], row["section_path"] or [])),
+        )
 
     def _build_passage_search_text(self, row: _PassageIndexRow) -> str:
         metadata_lines: list[str] = [row.contextualized_text]
@@ -660,50 +675,14 @@ class RetrievalService:
         filters: RetrievalFilters | None = None,
         limit: int = PASSAGE_RESULT_LIMIT,
     ) -> list[PassageResult]:
-        if not query.strip():
-            return []
         filters = filters or RetrievalFilters()
         with self._connection() as connection:
-            filtered_document_ids = self._resolve_filtered_document_ids(
+            return self._search_passages_with_connection(
                 connection,
+                query=query,
                 filters=filters,
+                limit=limit,
             )
-            if filtered_document_ids == ():
-                return []
-            active_index_version = self._resolve_active_index_version(
-                connection,
-                filtered_document_ids=filtered_document_ids,
-            )
-            if active_index_version is None:
-                return []
-            active_run_ids = self._resolve_active_run_ids(
-                connection,
-                index_version=active_index_version,
-                filtered_document_ids=filtered_document_ids,
-            )
-            if not active_run_ids:
-                return []
-            sparse_candidates = self._load_sparse_passage_candidates(
-                connection,
-                query=query,
-                retrieval_index_run_ids=active_run_ids,
-                filtered_document_ids=filtered_document_ids,
-                limit=PASSAGE_SPARSE_CANDIDATES,
-            )
-            dense_candidates = self._load_dense_passage_candidates(
-                connection,
-                query=query,
-                retrieval_index_run_ids=active_run_ids,
-                filtered_document_ids=filtered_document_ids,
-                limit=PASSAGE_DENSE_CANDIDATES,
-            )
-            fused = self._fuse_candidates(
-                sparse_candidates,
-                dense_candidates,
-                fused_limit=PASSAGE_FUSED_CANDIDATES,
-            )
-            reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
-        return [self._candidate_to_passage_result(candidate) for candidate in reranked[:limit]]
 
     def search_tables(
         self,
@@ -712,43 +691,14 @@ class RetrievalService:
         filters: RetrievalFilters | None = None,
         limit: int = TABLE_RESULT_LIMIT,
     ) -> list[TableResult]:
-        if not query.strip():
-            return []
         filters = filters or RetrievalFilters()
         with self._connection() as connection:
-            filtered_document_ids = self._resolve_filtered_document_ids(
-                connection,
-                filters=filters,
-            )
-            if filtered_document_ids == ():
-                return []
-            active_index_version = self._resolve_active_index_version(
-                connection,
-                filtered_document_ids=filtered_document_ids,
-            )
-            if active_index_version is None:
-                return []
-            active_run_ids = self._resolve_active_run_ids(
-                connection,
-                index_version=active_index_version,
-                filtered_document_ids=filtered_document_ids,
-            )
-            if not active_run_ids:
-                return []
-            sparse_candidates = self._load_sparse_table_candidates(
+            return self._search_tables_with_connection(
                 connection,
                 query=query,
-                retrieval_index_run_ids=active_run_ids,
-                filtered_document_ids=filtered_document_ids,
-                limit=TABLE_SPARSE_CANDIDATES,
+                filters=filters,
+                limit=limit,
             )
-            fused = self._fuse_candidates(
-                sparse_candidates,
-                [],
-                fused_limit=TABLE_FUSED_CANDIDATES,
-            )
-            reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
-        return [self._candidate_to_table_result(candidate) for candidate in reranked[:limit]]
 
     def build_context_pack(
         self,
@@ -757,26 +707,52 @@ class RetrievalService:
         filters: RetrievalFilters | None = None,
     ) -> ContextPackResult:
         filters = filters or RetrievalFilters()
-        passages = tuple(self.search_passages(query=query, filters=filters))
-        tables = tuple(self.search_tables(query=query, filters=filters))
-        active_index_version = self._ensure_single_index_version([*passages, *tables])
-        document_ids = tuple(
-            dict.fromkeys(
-                [
-                    *(result.document_id for result in passages),
-                    *(result.document_id for result in tables),
-                ]
-            )
-        )
-        retrieval_index_run_ids = tuple(
-            dict.fromkeys(
-                [
-                    *(result.retrieval_index_run_id for result in passages),
-                    *(result.retrieval_index_run_id for result in tables),
-                ]
-            )
-        )
         with self._connection() as connection:
+            filtered_document_ids = self._resolve_filtered_document_ids(
+                connection,
+                filters=filters,
+            )
+            active_runs = self._resolve_active_run_selection(
+                connection,
+                filtered_document_ids=filtered_document_ids,
+            )
+            passages = tuple(
+                self._search_passages_with_connection(
+                    connection,
+                    query=query,
+                    filters=filters,
+                    limit=PASSAGE_RESULT_LIMIT,
+                    filtered_document_ids=filtered_document_ids,
+                    active_runs=active_runs,
+                )
+            )
+            tables = tuple(
+                self._search_tables_with_connection(
+                    connection,
+                    query=query,
+                    filters=filters,
+                    limit=TABLE_RESULT_LIMIT,
+                    filtered_document_ids=filtered_document_ids,
+                    active_runs=active_runs,
+                )
+            )
+            active_index_version = self._ensure_single_index_version([*passages, *tables])
+            document_ids = tuple(
+                dict.fromkeys(
+                    [
+                        *(result.document_id for result in passages),
+                        *(result.document_id for result in tables),
+                    ]
+                )
+            )
+            retrieval_index_run_ids = tuple(
+                dict.fromkeys(
+                    [
+                        *(result.retrieval_index_run_id for result in passages),
+                        *(result.retrieval_index_run_id for result in tables),
+                    ]
+                )
+            )
             parent_sections = self._load_parent_sections(
                 connection,
                 passages=passages,
@@ -817,42 +793,135 @@ class RetrievalService:
             raise RetrievalError("retrieval service has no connection factory configured")
         return self._connection_factory()
 
-    def _resolve_active_index_version(
+    def _search_passages_with_connection(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        filters: RetrievalFilters,
+        limit: int,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
+        active_runs: _ActiveRunSelection | None = None,
+    ) -> list[PassageResult]:
+        if not query.strip():
+            return []
+        if filtered_document_ids is None:
+            filtered_document_ids = self._resolve_filtered_document_ids(
+                connection,
+                filters=filters,
+            )
+        if filtered_document_ids == ():
+            return []
+        if active_runs is None:
+            active_runs = self._resolve_active_run_selection(
+                connection,
+                filtered_document_ids=filtered_document_ids,
+            )
+        if not active_runs.run_ids:
+            return []
+        sparse_candidates = self._load_sparse_passage_candidates(
+            connection,
+            query=query,
+            retrieval_index_run_ids=active_runs.run_ids,
+            filtered_document_ids=filtered_document_ids,
+            limit=PASSAGE_SPARSE_CANDIDATES,
+        )
+        dense_candidates = self._load_dense_passage_candidates(
+            connection,
+            query=query,
+            retrieval_index_run_ids=active_runs.run_ids,
+            filtered_document_ids=filtered_document_ids,
+            limit=PASSAGE_DENSE_CANDIDATES,
+        )
+        fused = self._fuse_candidates(
+            sparse_candidates,
+            dense_candidates,
+            fused_limit=PASSAGE_FUSED_CANDIDATES,
+        )
+        reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
+        return [self._candidate_to_passage_result(candidate) for candidate in reranked[:limit]]
+
+    def _search_tables_with_connection(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        filters: RetrievalFilters,
+        limit: int,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
+        active_runs: _ActiveRunSelection | None = None,
+    ) -> list[TableResult]:
+        if not query.strip():
+            return []
+        if filtered_document_ids is None:
+            filtered_document_ids = self._resolve_filtered_document_ids(
+                connection,
+                filters=filters,
+            )
+        if filtered_document_ids == ():
+            return []
+        if active_runs is None:
+            active_runs = self._resolve_active_run_selection(
+                connection,
+                filtered_document_ids=filtered_document_ids,
+            )
+        if not active_runs.run_ids:
+            return []
+        sparse_candidates = self._load_sparse_table_candidates(
+            connection,
+            query=query,
+            retrieval_index_run_ids=active_runs.run_ids,
+            filtered_document_ids=filtered_document_ids,
+            limit=TABLE_SPARSE_CANDIDATES,
+        )
+        fused = self._fuse_candidates(
+            sparse_candidates,
+            [],
+            fused_limit=TABLE_FUSED_CANDIDATES,
+        )
+        reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
+        return [self._candidate_to_table_result(candidate) for candidate in reranked[:limit]]
+
+    def _resolve_active_run_selection(
         self,
         connection: Connection,
         *,
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
-    ) -> str | None:
+    ) -> _ActiveRunSelection:
         if self._active_index_version is not None:
-            return self._active_index_version
+            run_ids = self._resolve_active_run_ids(
+                connection,
+                index_version=self._active_index_version,
+                filtered_document_ids=filtered_document_ids,
+            )
+            index_versions = (self._active_index_version,) if run_ids else ()
+            return _ActiveRunSelection(run_ids=run_ids, index_versions=index_versions)
         query_sql = """
-            SELECT runs.index_version
+            SELECT runs.id, runs.index_version
             FROM retrieval_index_runs runs
             WHERE runs.status = 'ready'
               AND runs.is_active = true
               {document_filter_sql}
-            GROUP BY runs.index_version
             ORDER BY
-                MAX(COALESCE(runs.activated_at, runs.created_at)) DESC,
-                runs.index_version
-            LIMIT 1
+                COALESCE(runs.activated_at, runs.created_at) DESC,
+                runs.id
             """
         document_filter_sql = ""
         params: dict[str, object] = {}
         if filtered_document_ids is not None:
             document_filter_sql = "AND runs.document_id = ANY(CAST(:document_ids AS uuid[]))"
             params["document_ids"] = list(filtered_document_ids)
-        row = (
+        rows = (
             connection.execute(
                 text(query_sql.format(document_filter_sql=document_filter_sql)),
                 params,
             )
             .mappings()
-            .one_or_none()
+            .all()
         )
-        if row is None:
-            return None
-        return cast(str, row["index_version"])
+        run_ids = tuple(cast(uuid.UUID, row["id"]) for row in rows)
+        index_versions = tuple(dict.fromkeys(cast(str, row["index_version"]) for row in rows))
+        return _ActiveRunSelection(run_ids=run_ids, index_versions=index_versions)
 
     def _resolve_filtered_document_ids(
         self,
@@ -1191,7 +1260,6 @@ class RetrievalService:
     ) -> list[_Candidate]:
         if not candidates:
             return []
-        self._ensure_single_index_version(candidates)
         if self._reranker_client is None:
             for candidate in candidates:
                 candidate.score = candidate.fused_score

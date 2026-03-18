@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 GateStatus = Literal["pass", "degraded", "fail"]
@@ -66,7 +69,21 @@ class ParserArtifact:
     artifact_type: str
     parser: str
     filename: str
-    content: bytes
+    content: bytes | None = None
+    content_path: Path | None = None
+    cleanup_root: Path | None = None
+
+    def __post_init__(self) -> None:
+        if (self.content is None) == (self.content_path is None):
+            raise ValueError("parser artifacts must define exactly one content source")
+
+    def cleanup_local_copy(self) -> None:
+        cleanup_root = self.cleanup_root
+        if cleanup_root is not None:
+            shutil.rmtree(cleanup_root, ignore_errors=True)
+            return
+        if self.content_path is not None:
+            self.content_path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -77,6 +94,21 @@ class ParserResult:
     warnings: list[str] = field(default_factory=list)
     failure_code: str | None = None
     failure_message: str | None = None
+    parsed_document_loader: Callable[[], ParsedDocument] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+
+    def load_parsed_document(self) -> ParsedDocument | None:
+        if self.parsed_document is not None:
+            return self.parsed_document
+        if self.parsed_document_loader is None:
+            return None
+        parsed_document = self.parsed_document_loader()
+        object.__setattr__(self, "parsed_document", parsed_document)
+        object.__setattr__(self, "parsed_document_loader", None)
+        return parsed_document
 
 
 @dataclass(frozen=True)

@@ -149,6 +149,10 @@ def _make_processor() -> tuple[
         storage_ref="stored://artifact",
         checksum="abc123",
     )
+    storage.store_file.return_value = SimpleNamespace(
+        storage_ref="stored://artifact",
+        checksum="abc123",
+    )
 
     primary_parser = MagicMock()
     fallback_parser = MagicMock()
@@ -170,12 +174,15 @@ def _make_processor() -> tuple[
     )
     processor._lock_document = MagicMock()  # type: ignore[method-assign]
     processor._is_superseded = MagicMock(return_value=False)  # type: ignore[method-assign]
+    processor._try_claim_processing_lock = MagicMock(return_value=True)  # type: ignore[method-assign]
+    processor._release_processing_lock = MagicMock()  # type: ignore[method-assign]
     return processor, storage, primary_parser, fallback_parser, metadata_enricher
 
 
 def _result_with_row(row: dict[str, object] | None) -> MagicMock:
     result = MagicMock()
     result.mappings.return_value.one_or_none.return_value = row
+    result.mappings.return_value.all.return_value = [] if row is None else [row]
     return result
 
 
@@ -183,10 +190,13 @@ def _row_sequence(rows: list[dict[str, object] | None]) -> Callable[..., MagicMo
     iterator = iter(rows)
 
     def _execute(*args, **kwargs):
+        statement = str(args[0]) if args else ""
+        if "SELECT" not in statement.upper():
+            return MagicMock()
         try:
             row = next(iterator)
         except StopIteration:
-            return MagicMock()
+            return _result_with_row(None)
         return _result_with_row(row)
 
     return _execute
@@ -337,6 +347,96 @@ def test_persist_parser_artifact_stores_bytes_and_records_row() -> None:
     assert params["storage_ref"] == "stored://artifact"
     assert params["checksum"] == "abc123"
     assert params["is_primary"] is True
+
+
+def test_persist_parser_artifact_streams_file_backed_content_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    processor, storage, _, _, _ = _make_processor()
+    connection = MagicMock()
+    document_id = uuid4()
+    ingest_job_id = uuid4()
+    cleanup_root = tmp_path / "parser-output"
+    cleanup_root.mkdir()
+    artifact_path = cleanup_root / "docling.json"
+    artifact_path.write_bytes(b'{"artifact":true}')
+    captured_content: list[bytes] = []
+
+    def _capture_store_file(path: str, fileobj) -> SimpleNamespace:
+        captured_content.append(fileobj.read())
+        return SimpleNamespace(storage_ref="stored://artifact", checksum="abc123")
+
+    storage.store_file.side_effect = _capture_store_file
+    artifact = _make_parser_result()
+    artifact = ParserResult(
+        gate_status=artifact.gate_status,
+        parsed_document=artifact.parsed_document,
+        artifact=ParserArtifact(
+            artifact_type=artifact.artifact.artifact_type,
+            parser=artifact.artifact.parser,
+            filename=artifact.artifact.filename,
+            content_path=artifact_path,
+            cleanup_root=cleanup_root,
+        ),
+        warnings=artifact.warnings,
+        failure_code=artifact.failure_code,
+        failure_message=artifact.failure_message,
+    )
+
+    processor._persist_parser_artifact(
+        connection,
+        document_id=document_id,
+        ingest_job_id=ingest_job_id,
+        artifact=artifact,
+        is_primary=True,
+    )
+
+    storage.store_file.assert_called_once()
+    assert captured_content == [b'{"artifact":true}']
+    assert not cleanup_root.exists()
+
+
+def test_persist_parser_artifact_materializes_lazy_parsed_document_before_cleanup(
+    tmp_path: Path,
+) -> None:
+    processor, storage, _, _, _ = _make_processor()
+    connection = MagicMock()
+    document_id = uuid4()
+    ingest_job_id = uuid4()
+    cleanup_root = tmp_path / "parser-output"
+    cleanup_root.mkdir()
+    artifact_path = cleanup_root / "docling.json"
+    artifact_path.write_bytes(b'{"artifact":true}')
+    parsed_document = _make_document()
+    artifact = _make_parser_result()
+    artifact = ParserResult(
+        gate_status=artifact.gate_status,
+        parsed_document=None,
+        artifact=ParserArtifact(
+            artifact_type=artifact.artifact.artifact_type,
+            parser=artifact.artifact.parser,
+            filename=artifact.artifact.filename,
+            content_path=artifact_path,
+            cleanup_root=cleanup_root,
+        ),
+        warnings=artifact.warnings,
+        failure_code=artifact.failure_code,
+        failure_message=artifact.failure_message,
+        parsed_document_loader=lambda: parsed_document,
+    )
+
+    processor._persist_parser_artifact(
+        connection,
+        document_id=document_id,
+        ingest_job_id=ingest_job_id,
+        artifact=artifact,
+        is_primary=True,
+    )
+
+    storage.store_file.assert_called_once()
+    assert artifact.parsed_document == parsed_document
+    assert artifact.parsed_document_loader is None
+    assert not cleanup_root.exists()
 
 
 def test_normalize_document_persists_hierarchy_tables_and_references() -> None:
@@ -531,6 +631,9 @@ def test_process_success_path_uses_real_helpers_and_marks_low_confidence_warning
     processor, storage, primary_parser, fallback_parser, metadata_enricher = _make_processor()
     connection = MagicMock()
     context = _make_context()
+    processor._sync_processing_warnings = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda _connection, **kwargs: kwargs["warnings"]
+    )
     parsed_document = _make_document(
         metadata_confidence=0.4,
         sections=[
@@ -571,6 +674,24 @@ def test_process_success_path_uses_real_helpers_and_marks_low_confidence_warning
                 warnings=["parser_fallback_used"],
             ),
             {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
+            _job_row(
+                document_id=context.payload.document_id,
+                source_artifact_id=source_artifact_id,
+                status="parsing",
+                warnings=["parser_fallback_used", "metadata_low_confidence"],
+            ),
+            _job_row(
+                document_id=context.payload.document_id,
+                source_artifact_id=source_artifact_id,
+                status="enriching_metadata",
+                warnings=["parser_fallback_used", "metadata_low_confidence"],
+            ),
+            _job_row(
+                document_id=context.payload.document_id,
+                source_artifact_id=source_artifact_id,
+                status="indexing",
+                warnings=["parser_fallback_used", "metadata_low_confidence"],
+            ),
         ]
     )
 
@@ -579,7 +700,7 @@ def test_process_success_path_uses_real_helpers_and_marks_low_confidence_warning
 
     primary_parser.parse.assert_called_once_with(
         filename="documents/test/source.pdf",
-        content=b"%PDF-1.4",
+        source_path=storage.resolve.return_value,
     )
     fallback_parser.parse.assert_not_called()
     metadata_enricher.enrich.assert_called_once_with(parsed_document)
@@ -629,6 +750,9 @@ def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
     processor, _, primary_parser, fallback_parser, _ = _make_processor()
     connection = MagicMock()
     context = _make_context()
+    processor._sync_processing_warnings = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda _connection, **kwargs: kwargs["warnings"]
+    )
     source_artifact_id = uuid4()
     connection.execute.side_effect = _row_sequence(
         [
@@ -638,6 +762,12 @@ def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
                 warnings=[],
             ),
             {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
+            _job_row(
+                document_id=context.payload.document_id,
+                source_artifact_id=source_artifact_id,
+                status="parsing",
+                warnings=["reduced_structure_confidence", "parser_fallback_used"],
+            ),
         ]
     )
     lease = MagicMock()
