@@ -7,6 +7,9 @@ services:
       - .env
     environment:
       PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     networks:
       - dokploy-network
     command:
@@ -37,6 +40,8 @@ services:
     depends_on:
       app:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks:
       - dokploy-network
     command:

@@ -50,13 +50,11 @@ def test_db_service_configures_pg_partman_background_worker_for_local_role() -> 
     assert "pg_partman_bgw.dbname=paper_context" in block
 
 
-def test_migrate_service_is_an_isolated_runner() -> None:
+def test_migrate_service_runs_alembic_upgrade_head() -> None:
     block = _service_block(_compose_text(), "migrate")
     assert "alembic" in block
     assert "upgrade" in block
     assert "head" in block
-    assert "profiles:" in block
-    assert "- migrate" in block
     assert "PAPER_CONTEXT_DATABASE__URL" in block
     assert "@db:5432/" in block
 
@@ -74,6 +72,26 @@ def test_worker_depends_on_app_service() -> None:
     block = _service_block(_compose_text(), "worker")
     assert "depends_on" in block
     assert "app:" in block
+
+
+def test_app_and_worker_wait_for_migration_completion() -> None:
+    app_block = _service_block(_compose_text(), "app")
+    worker_block = _service_block(_compose_text(), "worker")
+
+    assert "migrate:" in app_block
+    assert "service_completed_successfully" in app_block
+    assert "migrate:" in worker_block
+    assert "service_completed_successfully" in worker_block
+
+
+def test_production_app_and_worker_wait_for_migration_completion() -> None:
+    app_block = _service_block(_compose_prod_text(), "app")
+    worker_block = _service_block(_compose_prod_text(), "worker")
+
+    assert "migrate:" in app_block
+    assert "service_completed_successfully" in app_block
+    assert "migrate:" in worker_block
+    assert "service_completed_successfully" in worker_block
 
 
 def test_production_compose_keeps_single_hosted_app_shape() -> None:

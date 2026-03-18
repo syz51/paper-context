@@ -35,6 +35,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     command:
       - python
       - -m
@@ -69,6 +71,8 @@ services:
         condition: service_healthy
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     command:
       - python
       - -m
@@ -93,8 +97,6 @@ services:
       - alembic
       - upgrade
       - head
-    profiles:
-      - migrate
 
 volumes:
   postgres_data:
