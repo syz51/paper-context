@@ -8,9 +8,12 @@ from sqlalchemy import text
 from paper_context.config import get_settings
 from paper_context.db.engine import get_engine
 from paper_context.db.session import connection_scope
+from paper_context.ingestion.enrichment import NullMetadataEnricher
+from paper_context.ingestion.parsers import DoclingPdfParser, PdfPlumberPdfParser
 from paper_context.ingestion.queue import IngestionQueueService
-from paper_context.ingestion.service import SyntheticIngestProcessor
+from paper_context.ingestion.service import DeterministicIngestProcessor, SyntheticIngestProcessor
 from paper_context.queue.contracts import IngestionQueue
+from paper_context.storage.local_fs import LocalFilesystemStorage
 
 from .loop import IngestWorker, WorkerConfig
 
@@ -18,10 +21,24 @@ from .loop import IngestWorker, WorkerConfig
 def build_worker() -> IngestWorker:
     settings = get_settings()
     queue = IngestionQueue(settings.queue.name)
+    storage = LocalFilesystemStorage(settings.storage.root_path)
+    storage.ensure_root()
     return IngestWorker(
         connection_factory=lambda: connection_scope(get_engine()),
         queue_adapter=queue,
-        processor=SyntheticIngestProcessor(),
+        processor=DeterministicIngestProcessor(
+            storage=storage,
+            primary_parser=DoclingPdfParser(),
+            fallback_parser=PdfPlumberPdfParser(),
+            metadata_enricher=NullMetadataEnricher(),
+            index_version=settings.providers.index_version,
+            chunking_version=settings.chunking.version,
+            embedding_model=settings.providers.voyage_model,
+            reranker_model=settings.providers.reranker_model,
+            min_tokens=settings.chunking.min_tokens,
+            max_tokens=settings.chunking.max_tokens,
+            overlap_fraction=settings.chunking.overlap_fraction,
+        ),
         config=WorkerConfig(
             vt_seconds=settings.queue.visibility_timeout_seconds,
             max_poll_seconds=settings.queue.max_poll_seconds,
@@ -53,7 +70,16 @@ def run_synthetic_job_verification() -> dict[str, Any]:
             "trigger": "synthetic",
         }
     )
-    worker = build_worker()
+    worker = IngestWorker(
+        connection_factory=lambda: connection_scope(engine),
+        queue_adapter=queue,
+        processor=SyntheticIngestProcessor(),
+        config=WorkerConfig(
+            vt_seconds=settings.queue.visibility_timeout_seconds,
+            max_poll_seconds=settings.queue.max_poll_seconds,
+            poll_interval_ms=settings.queue.poll_interval_ms,
+        ),
+    )
     handled = worker.run_once()
     with engine.begin() as connection:
         ingest_job = (

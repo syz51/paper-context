@@ -1,0 +1,13 @@
+{
+  "id": "44444444-4444-4444-4444-444444444444",
+  "document_id": "11111111-1111-1111-1111-111111111111",
+  "status": "failed",
+  "failure_code": "parse_failed",
+  "failure_message": "Docling and pdfplumber could not recover stable structure.",
+  "warnings": [
+    "parser_fallback_used"
+  ],
+  "started_at": "2026-03-18T11:00:00Z",
+  "finished_at": "2026-03-18T11:01:00Z",
+  "trigger": "upload"
+}

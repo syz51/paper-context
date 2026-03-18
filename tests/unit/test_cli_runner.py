@@ -21,11 +21,23 @@ pytestmark = pytest.mark.unit
 def make_settings() -> SimpleNamespace:
     return SimpleNamespace(
         log_level="INFO",
+        storage=SimpleNamespace(root_path="/tmp/paper-context-tests"),
         queue=SimpleNamespace(
             name="document_ingest",
             visibility_timeout_seconds=120,
             max_poll_seconds=7,
             poll_interval_ms=80,
+        ),
+        providers=SimpleNamespace(
+            index_version="mvp-v1",
+            voyage_model="voyage-4-large",
+            reranker_model="zerank-2",
+        ),
+        chunking=SimpleNamespace(
+            version="phase1",
+            min_tokens=300,
+            max_tokens=700,
+            overlap_fraction=0.15,
         ),
         runtime=SimpleNamespace(
             app_host="127.0.0.1",
@@ -149,6 +161,18 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     queue_cls = MagicMock()
     queue_instance = MagicMock()
     queue_cls.return_value = queue_instance
+    storage_cls = MagicMock()
+    storage_instance = MagicMock()
+    storage_cls.return_value = storage_instance
+    primary_parser_cls = MagicMock()
+    primary_parser = MagicMock()
+    primary_parser_cls.return_value = primary_parser
+    fallback_parser_cls = MagicMock()
+    fallback_parser = MagicMock()
+    fallback_parser_cls.return_value = fallback_parser
+    enricher_cls = MagicMock()
+    enricher = MagicMock()
+    enricher_cls.return_value = enricher
     processor_cls = MagicMock()
     processor_instance = MagicMock()
     processor_cls.return_value = processor_instance
@@ -157,13 +181,34 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_module, "get_settings", lambda: settings)
     monkeypatch.setattr(runner_module, "get_engine", lambda: engine)
     monkeypatch.setattr(runner_module, "IngestionQueue", queue_cls)
-    monkeypatch.setattr(runner_module, "SyntheticIngestProcessor", processor_cls)
+    monkeypatch.setattr(runner_module, "LocalFilesystemStorage", storage_cls)
+    monkeypatch.setattr(runner_module, "DoclingPdfParser", primary_parser_cls)
+    monkeypatch.setattr(runner_module, "PdfPlumberPdfParser", fallback_parser_cls)
+    monkeypatch.setattr(runner_module, "NullMetadataEnricher", enricher_cls)
+    monkeypatch.setattr(runner_module, "DeterministicIngestProcessor", processor_cls)
     monkeypatch.setattr(runner_module, "IngestWorker", worker_cls)
 
     runner_module.build_worker()
 
     queue_cls.assert_called_once_with("document_ingest")
-    processor_cls.assert_called_once_with()
+    storage_cls.assert_called_once_with("/tmp/paper-context-tests")
+    storage_instance.ensure_root.assert_called_once_with()
+    primary_parser_cls.assert_called_once_with()
+    fallback_parser_cls.assert_called_once_with()
+    enricher_cls.assert_called_once_with()
+    processor_cls.assert_called_once_with(
+        storage=storage_instance,
+        primary_parser=primary_parser,
+        fallback_parser=fallback_parser,
+        metadata_enricher=enricher,
+        index_version="mvp-v1",
+        chunking_version="phase1",
+        embedding_model="voyage-4-large",
+        reranker_model="zerank-2",
+        min_tokens=300,
+        max_tokens=700,
+        overlap_fraction=0.15,
+    )
     worker_cls.assert_called_once()
     kwargs = worker_cls.call_args.kwargs
     assert kwargs["queue_adapter"] is queue_instance
@@ -188,7 +233,15 @@ def test_build_worker_connection_factory_opens_connection_scope(
     monkeypatch.setattr(runner_module, "get_engine", lambda: engine)
     monkeypatch.setattr(runner_module, "connection_scope", connection_scope)
     monkeypatch.setattr(runner_module, "IngestionQueue", MagicMock())
-    monkeypatch.setattr(runner_module, "SyntheticIngestProcessor", MagicMock())
+    monkeypatch.setattr(
+        runner_module,
+        "LocalFilesystemStorage",
+        MagicMock(return_value=MagicMock(ensure_root=MagicMock())),
+    )
+    monkeypatch.setattr(runner_module, "DoclingPdfParser", MagicMock())
+    monkeypatch.setattr(runner_module, "PdfPlumberPdfParser", MagicMock())
+    monkeypatch.setattr(runner_module, "NullMetadataEnricher", MagicMock())
+    monkeypatch.setattr(runner_module, "DeterministicIngestProcessor", MagicMock())
     monkeypatch.setattr(runner_module, "IngestWorker", worker_cls)
 
     runner_module.build_worker()
