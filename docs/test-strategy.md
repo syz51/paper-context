@@ -12,7 +12,7 @@
 ## Supported commands
 
 - `uv run pytest -m "unit or slice"`
-- `uv run pytest -m "integration or migration"`
+- `uv run pytest -m "integration or migration" -n 2 --dist=loadfile`
 - `uv run pytest -m contract`
 - `uv run pytest -m regression`
 
@@ -29,6 +29,7 @@
 - `unit-slice`: PR-blocking fast tests with branch coverage, JUnit XML, and coverage XML artifacts
 - `contract`: schema and golden-response compatibility checks with JUnit XML
 - `integration-postgres`: PR-blocking real Postgres/PGMQ tests, including migration smoke, with retained pytest and Docker logs
+- `integration-postgres` uses `pytest-xdist` with `-n 2` and `--dist=loadfile` to reduce wall-clock time without fanning out the Postgres-backed lane too aggressively.
 - `regression-smoke`: lightweight regression checks that do not require a deployed staging stack
 
 ## Staging regression

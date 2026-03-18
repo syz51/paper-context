@@ -147,6 +147,8 @@ jobs:
         run: |
           mkdir -p .artifacts/integration
           uv run pytest -m "integration or migration" \
+            -n 2 \
+            --dist=loadfile \
             --junitxml=.artifacts/integration/junit.xml \
             --log-file=.artifacts/integration/pytest.log \
             -o log_cli=true

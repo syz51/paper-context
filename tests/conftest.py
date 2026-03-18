@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import os
 import shutil
 import subprocess
 import time
 import uuid
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -22,6 +24,8 @@ DEFAULT_TEST_DATABASE_URL = (
 )
 STAGING_ENV_FLAG = "PAPER_CONTEXT_RUN_STAGING_TESTS"
 TEST_DATABASE_URL_ENV = "PAPER_CONTEXT_TEST_DATABASE_URL"
+POSTGRES_FIXTURE_LOCK_PATH = REPO_ROOT / ".pytest_cache" / "postgres-fixture.lock"
+POSTGRES_FIXTURE_LEASES_DIR = REPO_ROOT / ".pytest_cache" / "postgres-fixture-leases"
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
@@ -83,6 +87,69 @@ def _quoted_identifier(identifier: str) -> str:
     return identifier.replace('"', '""')
 
 
+@contextmanager
+def _postgres_fixture_lock() -> Iterator[None]:
+    POSTGRES_FIXTURE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with POSTGRES_FIXTURE_LOCK_PATH.open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _process_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _prune_dead_postgres_fixture_leases() -> list[Path]:
+    POSTGRES_FIXTURE_LEASES_DIR.mkdir(parents=True, exist_ok=True)
+    active_leases: list[Path] = []
+    for lease_path in POSTGRES_FIXTURE_LEASES_DIR.glob("*.lease"):
+        try:
+            pid = int(lease_path.read_text(encoding="utf-8").strip())
+        except OSError, ValueError:
+            lease_path.unlink(missing_ok=True)
+            continue
+
+        if _process_is_alive(pid):
+            active_leases.append(lease_path)
+            continue
+
+        lease_path.unlink(missing_ok=True)
+
+    return active_leases
+
+
+@contextmanager
+def _postgres_fixture_lease() -> Iterator[None]:
+    lease_path = POSTGRES_FIXTURE_LEASES_DIR / f"{os.getpid()}-{uuid.uuid4().hex}.lease"
+    should_start_compose = False
+
+    with _postgres_fixture_lock():
+        active_leases = _prune_dead_postgres_fixture_leases()
+        should_start_compose = not active_leases
+        lease_path.write_text(str(os.getpid()), encoding="utf-8")
+
+        if should_start_compose:
+            _run_compose("up", "-d", "db")
+
+    try:
+        yield
+    finally:
+        with _postgres_fixture_lock():
+            lease_path.unlink(missing_ok=True)
+            active_leases = _prune_dead_postgres_fixture_leases()
+            if not active_leases:
+                _run_compose("down", "-v", check=False)
+
+
 @pytest.fixture(scope="session")
 def postgres_server_url() -> Iterator[str]:
     database_url = os.environ.get(TEST_DATABASE_URL_ENV, DEFAULT_TEST_DATABASE_URL)
@@ -97,12 +164,9 @@ def postgres_server_url() -> Iterator[str]:
             f"{TEST_DATABASE_URL_ENV} pointing at a prepared Postgres instance."
         )
 
-    _run_compose("up", "-d", "db")
-    try:
+    with _postgres_fixture_lease():
         _wait_for_database(database_url)
         yield database_url
-    finally:
-        _run_compose("down", "-v", check=False)
 
 
 @pytest.fixture(scope="session")
