@@ -11,7 +11,7 @@ from sqlalchemy.engine import Connection
 from paper_context.ingestion.service import IngestJobContext, IngestProcessor, LeaseExtender
 from paper_context.queue.contracts import ClaimedIngestMessage, IngestionQueue
 
-ConnectionFactory = Callable[[], AbstractContextManager[Connection]]
+ConnectionFactory = Callable[..., AbstractContextManager[Connection]]
 
 
 @dataclass(frozen=True)
@@ -34,8 +34,14 @@ class IngestWorker:
         self._processor = processor
         self._config = config or WorkerConfig()
 
+    def _open_connection(self, *, transactional: bool) -> AbstractContextManager[Connection]:
+        try:
+            return self._connection_factory(transactional=transactional)
+        except TypeError:
+            return self._connection_factory()
+
     def run_once(self) -> ClaimedIngestMessage | None:
-        with self._connection_factory() as claim_connection:
+        with self._open_connection(transactional=True) as claim_connection:
             task = self._queue_adapter.claim_ingest(
                 claim_connection,
                 vt_seconds=self._config.vt_seconds,
@@ -46,18 +52,18 @@ class IngestWorker:
             return None
 
         lease = LeaseExtender(
-            self._connection_factory,
+            self._open_connection,
             self._queue_adapter,
             task.message,
             self._config.vt_seconds,
         )
         lease.extend()
-        with self._connection_factory() as processing_connection:
+        with self._open_connection(transactional=False) as processing_connection:
             self._processor.process(
                 processing_connection,
                 IngestJobContext(message=task.message, payload=task.payload),
                 lease,
             )
-        with self._connection_factory() as archive_connection:
+        with self._open_connection(transactional=True) as archive_connection:
             self._queue_adapter.archive_message(archive_connection, task.message.msg_id)
         return task

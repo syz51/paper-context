@@ -72,6 +72,11 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_ingest_jobs_document_id", "ingest_jobs", ["document_id"])
+    op.create_index(
+        "ix_ingest_jobs_document_created_at_id",
+        "ingest_jobs",
+        ["document_id", "created_at", "id"],
+    )
     op.create_index("ix_ingest_jobs_status", "ingest_jobs", ["status"])
 
     op.create_table(
@@ -284,6 +289,7 @@ def downgrade() -> None:
     )
     op.drop_table("document_artifacts")
     op.drop_index("ix_ingest_jobs_status", table_name="ingest_jobs")
+    op.drop_index("ix_ingest_jobs_document_created_at_id", table_name="ingest_jobs")
     op.drop_index("ix_ingest_jobs_document_id", table_name="ingest_jobs")
     op.drop_table("ingest_jobs")
     op.drop_index("ix_document_references_document_id", table_name="document_references")

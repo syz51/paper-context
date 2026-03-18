@@ -10,6 +10,10 @@ from sqlalchemy.engine import Connection
 from .pgmq import PgmqAdapter, PgmqMessage, QueueMetrics
 
 
+class LeaseLostError(RuntimeError):
+    """Raised when a claimed queue message can no longer be extended."""
+
+
 @dataclass(frozen=True)
 class IngestQueuePayload:
     ingest_job_id: UUID
@@ -75,7 +79,10 @@ class IngestionQueue:
         )
 
     def extend_lease(self, conn: Connection, msg_id: int, vt_seconds: int) -> None:
-        self._queue.set_vt(conn, msg_id, vt_seconds)
+        if self._queue.set_vt(conn, msg_id, vt_seconds) is None:
+            raise LeaseLostError(
+                f"queue lease for message {msg_id} was lost before it could be extended"
+            )
 
     def archive_message(self, conn: Connection, message_id: int) -> None:
         self._queue.archive_message(conn, message_id)

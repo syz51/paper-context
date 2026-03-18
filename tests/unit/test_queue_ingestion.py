@@ -14,7 +14,7 @@ from paper_context.ingestion.service import (
     LeaseExtender,
     SyntheticIngestProcessor,
 )
-from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload
+from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload, LeaseLostError
 from paper_context.queue.pgmq import PgmqMessage
 
 pytestmark = pytest.mark.unit
@@ -107,6 +107,16 @@ def test_queue_delegates_extend_archive_delete_metrics() -> None:
     expected_metrics = MagicMock()
     adapter.metrics.return_value = expected_metrics
     assert queue.queue_metrics(connection) is expected_metrics
+
+
+def test_extend_lease_raises_when_queue_lease_is_lost() -> None:
+    adapter = MagicMock()
+    adapter.set_vt.return_value = None
+    queue = IngestionQueue("document_ingest")
+    queue._queue = adapter
+
+    with pytest.raises(LeaseLostError, match="message 11"):
+        queue.extend_lease(MagicMock(), 11, 60)
 
 
 def test_ingestion_queue_service_enqueues_document_with_trace_headers() -> None:

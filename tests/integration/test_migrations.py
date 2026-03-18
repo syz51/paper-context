@@ -10,7 +10,7 @@ pytestmark = [
     pytest.mark.slow,
 ]
 
-EXPECTED_PHASE0_TABLE_COLUMNS = {
+EXPECTED_SCHEMA_TABLE_COLUMNS = {
     "documents": {
         "id",
         "title",
@@ -109,12 +109,38 @@ EXPECTED_PHASE0_TABLE_COLUMNS = {
         "reranker_model",
         "chunking_version",
         "parser_source",
+        "is_active",
+        "activated_at",
+        "deactivated_at",
         "status",
+        "created_at",
+    },
+    "retrieval_passage_assets": {
+        "id",
+        "retrieval_index_run_id",
+        "document_id",
+        "passage_id",
+        "section_id",
+        "publication_year",
+        "search_text",
+        "search_tsvector",
+        "embedding",
+        "created_at",
+    },
+    "retrieval_table_assets": {
+        "id",
+        "retrieval_index_run_id",
+        "document_id",
+        "table_id",
+        "section_id",
+        "publication_year",
+        "search_text",
+        "search_tsvector",
         "created_at",
     },
 }
 
-EXPECTED_PHASE0_INDEX_COLUMNS = {
+EXPECTED_SCHEMA_INDEX_COLUMNS = {
     "ix_documents_current_status": ["current_status"],
     "ix_document_artifacts_document_id": ["document_id"],
     "ix_document_artifacts_ingest_job_id": ["ingest_job_id"],
@@ -125,9 +151,27 @@ EXPECTED_PHASE0_INDEX_COLUMNS = {
     "ix_document_tables_section_id": ["section_id"],
     "ix_document_references_document_id": ["document_id"],
     "ix_ingest_jobs_document_id": ["document_id"],
+    "ix_ingest_jobs_document_created_at_id": ["document_id", "created_at", "id"],
     "ix_ingest_jobs_status": ["status"],
     "ix_retrieval_index_runs_document_id": ["document_id"],
     "ix_retrieval_index_runs_document_version": ["document_id", "index_version"],
+    "ix_retrieval_index_runs_document_active_state": ["document_id", "is_active"],
+    "ix_retrieval_index_runs_one_active_per_document": ["document_id"],
+    "ix_retrieval_passage_assets_retrieval_index_run_id": ["retrieval_index_run_id"],
+    "ix_retrieval_passage_assets_document_run": ["document_id", "retrieval_index_run_id"],
+    "ix_retrieval_passage_assets_publication_year_run": [
+        "publication_year",
+        "retrieval_index_run_id",
+    ],
+    "ix_retrieval_passage_assets_search_tsvector": ["search_tsvector"],
+    "ix_retrieval_passage_assets_embedding": ["embedding"],
+    "ix_retrieval_table_assets_retrieval_index_run_id": ["retrieval_index_run_id"],
+    "ix_retrieval_table_assets_document_run": ["document_id", "retrieval_index_run_id"],
+    "ix_retrieval_table_assets_publication_year_run": [
+        "publication_year",
+        "retrieval_index_run_id",
+    ],
+    "ix_retrieval_table_assets_search_tsvector": ["search_tsvector"],
 }
 
 
@@ -147,7 +191,7 @@ def test_alembic_upgrade_succeeds_on_fresh_database(
                 )
             }
             table_columns: dict[str, set[str]] = {}
-            for table_name in EXPECTED_PHASE0_TABLE_COLUMNS:
+            for table_name in EXPECTED_SCHEMA_TABLE_COLUMNS:
                 table_columns[table_name] = {
                     row[0]
                     for row in connection.execute(
@@ -184,6 +228,23 @@ def test_alembic_upgrade_succeeds_on_fresh_database(
                     )
                 ).mappings()
             }
+            unique_active_index = (
+                connection.execute(
+                    text(
+                        """
+                    SELECT
+                        idx.relname AS index_name,
+                        i.indisunique AS is_unique,
+                        pg_get_expr(i.indpred, i.indrelid) AS predicate
+                    FROM pg_class idx
+                    JOIN pg_index i ON i.indexrelid = idx.oid
+                    WHERE idx.relname = 'ix_retrieval_index_runs_one_active_per_document'
+                    """
+                    )
+                )
+                .mappings()
+                .one()
+            )
             extensions = {
                 row[0] for row in connection.execute(text("SELECT extname FROM pg_extension"))
             }
@@ -192,10 +253,12 @@ def test_alembic_upgrade_succeeds_on_fresh_database(
                 {"queue_name": "document_ingest"},
             ).scalar_one()
 
-        assert set(EXPECTED_PHASE0_TABLE_COLUMNS) <= tables
-        for table_name, expected_columns in EXPECTED_PHASE0_TABLE_COLUMNS.items():
+        assert set(EXPECTED_SCHEMA_TABLE_COLUMNS) <= tables
+        for table_name, expected_columns in EXPECTED_SCHEMA_TABLE_COLUMNS.items():
             assert table_columns[table_name] == expected_columns
-        assert index_columns == EXPECTED_PHASE0_INDEX_COLUMNS
+        assert index_columns == EXPECTED_SCHEMA_INDEX_COLUMNS
+        assert unique_active_index["is_unique"] is True
+        assert unique_active_index["predicate"] == "(is_active = true)"
         assert {"pgmq", "vector"} <= extensions
         assert queue_name == "document_ingest"
     finally:

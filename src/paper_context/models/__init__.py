@@ -8,7 +8,7 @@ from .documents import (
     DocumentTable,
 )
 from .ingestion import IngestJob
-from .retrieval import RetrievalIndexRun
+from .retrieval import RetrievalIndexRun, RetrievalPassageAsset, RetrievalTableAsset
 
 __all__ = [
     "Base",
@@ -20,4 +20,6 @@ __all__ = [
     "DocumentReference",
     "IngestJob",
     "RetrievalIndexRun",
+    "RetrievalPassageAsset",
+    "RetrievalTableAsset",
 ]

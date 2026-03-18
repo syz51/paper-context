@@ -7,7 +7,12 @@ from uuid import uuid4
 
 import pytest
 
-from paper_context.queue.contracts import ClaimedIngestMessage, IngestionQueue, IngestQueuePayload
+from paper_context.queue.contracts import (
+    ClaimedIngestMessage,
+    IngestionQueue,
+    IngestQueuePayload,
+    LeaseLostError,
+)
 from paper_context.queue.pgmq import PgmqMessage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
 
@@ -80,3 +85,40 @@ def test_worker_processes_and_archives_message() -> None:
         ANY,
     )
     queue.archive_message.assert_called_once_with(archive_connection, 7)
+
+
+def test_worker_stops_when_initial_lease_extension_is_lost() -> None:
+    payload = IngestQueuePayload(ingest_job_id=uuid4(), document_id=uuid4())
+    message = PgmqMessage(
+        msg_id=7,
+        read_ct=1,
+        enqueued_at=datetime.now(UTC),
+        vt=datetime.now(UTC),
+        message={
+            "ingest_job_id": str(payload.ingest_job_id),
+            "document_id": str(payload.document_id),
+        },
+    )
+    queue = MagicMock(spec=IngestionQueue)
+    queue.claim_ingest.return_value = ClaimedIngestMessage(message=message, payload=payload)
+    queue.extend_lease.side_effect = LeaseLostError("lost")
+    processor = MagicMock()
+    claim_connection = MagicMock()
+    lease_connection = MagicMock()
+    contexts = iter(
+        [
+            contextlib.nullcontext(claim_connection),
+            contextlib.nullcontext(lease_connection),
+        ]
+    )
+    worker = IngestWorker(
+        connection_factory=lambda: next(contexts),
+        queue_adapter=queue,
+        processor=processor,
+    )
+
+    with pytest.raises(LeaseLostError, match="lost"):
+        worker.run_once()
+
+    processor.process.assert_not_called()
+    queue.archive_message.assert_not_called()

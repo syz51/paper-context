@@ -13,6 +13,13 @@ from paper_context.ingestion.parsers import DoclingPdfParser, PdfPlumberPdfParse
 from paper_context.ingestion.queue import IngestionQueueService
 from paper_context.ingestion.service import DeterministicIngestProcessor, SyntheticIngestProcessor
 from paper_context.queue.contracts import IngestionQueue
+from paper_context.retrieval import (
+    DeterministicEmbeddingClient,
+    DocumentRetrievalIndexer,
+    HeuristicRerankerClient,
+    VoyageEmbeddingClient,
+    ZeroEntropyRerankerClient,
+)
 from paper_context.storage.local_fs import LocalFilesystemStorage
 
 from .loop import IngestWorker, WorkerConfig
@@ -23,6 +30,24 @@ def build_worker() -> IngestWorker:
     queue = IngestionQueue(settings.queue.name)
     storage = LocalFilesystemStorage(settings.storage.root_path)
     storage.ensure_root()
+    voyage_api_key = getattr(settings.providers, "voyage_api_key", None)
+    zero_entropy_api_key = getattr(settings.providers, "zero_entropy_api_key", None)
+    embedding_client = (
+        VoyageEmbeddingClient(
+            api_key=voyage_api_key,
+            model=settings.providers.voyage_model,
+        )
+        if voyage_api_key
+        else DeterministicEmbeddingClient(model=settings.providers.voyage_model)
+    )
+    reranker_client = (
+        ZeroEntropyRerankerClient(
+            api_key=zero_entropy_api_key,
+            model=settings.providers.reranker_model,
+        )
+        if zero_entropy_api_key
+        else HeuristicRerankerClient(model=settings.providers.reranker_model)
+    )
     return IngestWorker(
         connection_factory=lambda: connection_scope(get_engine()),
         queue_adapter=queue,
@@ -38,6 +63,14 @@ def build_worker() -> IngestWorker:
             min_tokens=settings.chunking.min_tokens,
             max_tokens=settings.chunking.max_tokens,
             overlap_fraction=settings.chunking.overlap_fraction,
+            retrieval_indexer=DocumentRetrievalIndexer(
+                index_version=settings.providers.index_version,
+                chunking_version=settings.chunking.version,
+                embedding_model=settings.providers.voyage_model,
+                reranker_model=settings.providers.reranker_model,
+                embedding_client=embedding_client,
+                reranker_client=reranker_client,
+            ),
         ),
         config=WorkerConfig(
             vt_seconds=settings.queue.visibility_timeout_seconds,

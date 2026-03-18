@@ -60,6 +60,69 @@ def test_make_engine_connects() -> None:
     engine.dispose()
 
 
+def test_make_engine_applies_postgres_hardening(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_create_engine(url: str, **kwargs: object) -> MagicMock:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        engine = MagicMock()
+        engine.dispose = MagicMock()
+        return engine
+
+    monkeypatch.setattr(db_engine, "create_engine", fake_create_engine)
+
+    make_engine(
+        "postgresql+psycopg://paper_context:secret@db/paper_context",
+        database_settings=DatabaseSettings(
+            url="postgresql+psycopg://paper_context:secret@db/paper_context",
+            ssl_mode="require",
+            connect_timeout_seconds=10,
+            statement_timeout_ms=30_000,
+            lock_timeout_ms=5_000,
+            idle_in_transaction_session_timeout_ms=15_000,
+            application_name="paper-context-worker",
+            pool_size=7,
+            max_overflow=3,
+            pool_timeout_seconds=12,
+            pool_recycle_seconds=90,
+        ),
+        app_name="paper-context",
+        environment="production",
+    )
+
+    assert captured["url"] == "postgresql+psycopg://paper_context:secret@db/paper_context"
+    assert captured["kwargs"] == {
+        "future": True,
+        "pool_pre_ping": True,
+        "connect_args": {
+            "application_name": "paper-context-worker",
+            "connect_timeout": 10,
+            "sslmode": "require",
+            "options": (
+                "-c statement_timeout=30000 "
+                "-c lock_timeout=5000 "
+                "-c idle_in_transaction_session_timeout=15000"
+            ),
+        },
+        "pool_size": 7,
+        "max_overflow": 3,
+        "pool_timeout": 12,
+        "pool_recycle": 90,
+    }
+
+
+def test_make_engine_rejects_incomplete_production_settings() -> None:
+    with pytest.raises(ValueError, match="production database settings are incomplete"):
+        make_engine(
+            "postgresql+psycopg://paper_context:secret@db/paper_context",
+            database_settings=DatabaseSettings(
+                url="postgresql+psycopg://paper_context:secret@db/paper_context",
+            ),
+            environment="production",
+        )
+
+
 def test_get_engine_returns_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = AppSettings(
         database=DatabaseSettings(url="sqlite+pysqlite:///:memory:"),

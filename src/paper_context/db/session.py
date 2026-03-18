@@ -28,6 +28,19 @@ def session_scope(engine: Engine | None = None) -> Iterator[Session]:
 
 
 @contextmanager
-def connection_scope(engine: Engine | None = None) -> Iterator[Connection]:
-    with (engine or get_engine()).begin() as connection:
+def connection_scope(
+    engine: Engine | None = None,
+    *,
+    transactional: bool = True,
+) -> Iterator[Connection]:
+    connection = (engine or get_engine()).connect()
+    try:
         yield connection
+        if transactional and connection.in_transaction():
+            connection.commit()
+    except Exception:
+        if transactional and connection.in_transaction():
+            connection.rollback()
+        raise
+    finally:
+        connection.close()

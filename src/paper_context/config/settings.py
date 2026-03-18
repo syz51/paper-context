@@ -9,6 +9,53 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class DatabaseSettings(BaseModel):
     url: str = "postgresql+psycopg://paper_context:paper_context@localhost:5433/paper_context"
+    ssl_mode: str | None = "disable"
+    ssl_root_cert: Path | None = None
+    ssl_cert: Path | None = None
+    ssl_key: Path | None = None
+    connect_timeout_seconds: int | None = 10
+    statement_timeout_ms: int | None = 30_000
+    lock_timeout_ms: int | None = 10_000
+    idle_in_transaction_session_timeout_ms: int | None = 30_000
+    application_name: str | None = None
+    pool_size: int | None = 5
+    max_overflow: int | None = 10
+    pool_timeout_seconds: int | None = 30
+    pool_recycle_seconds: int | None = 1_800
+
+    def effective_application_name(self, default_app_name: str) -> str:
+        return self.application_name or default_app_name
+
+    def validate_runtime(self, *, environment: str, default_app_name: str) -> None:
+        if environment.lower() != "production":
+            return
+
+        missing: list[str] = []
+        if self.ssl_mode not in {"require", "verify-ca", "verify-full"}:
+            missing.append("database.ssl_mode")
+        for field_name in (
+            "connect_timeout_seconds",
+            "statement_timeout_ms",
+            "lock_timeout_ms",
+            "idle_in_transaction_session_timeout_ms",
+            "pool_size",
+            "max_overflow",
+            "pool_timeout_seconds",
+            "pool_recycle_seconds",
+        ):
+            value = getattr(self, field_name)
+            if value is None or value <= 0:
+                missing.append(f"database.{field_name}")
+
+        application_name = self.effective_application_name(default_app_name)
+        if not application_name.strip():
+            missing.append("database.application_name")
+
+        if missing:
+            missing_fields = ", ".join(missing)
+            raise ValueError(
+                f"production database settings are incomplete or insecure: {missing_fields}"
+            )
 
 
 class StorageSettings(BaseModel):

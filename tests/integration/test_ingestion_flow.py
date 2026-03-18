@@ -105,8 +105,13 @@ class _CrashOnceProcessor(DeterministicIngestProcessor):
             self._crashed = True
             raise RuntimeError(f"crash after {stage}")
 
-    def _persist_parser_artifact(self, connection, **kwargs):
-        parser_artifact_id = super()._persist_parser_artifact(connection, **kwargs)
+    def _store_parser_artifact(self, **kwargs):
+        staged_artifact = super()._store_parser_artifact(**kwargs)
+        self._maybe_crash("parser_artifact")
+        return staged_artifact
+
+    def _record_parser_artifact(self, connection, **kwargs):
+        parser_artifact_id = super()._record_parser_artifact(connection, **kwargs)
         self._maybe_crash("parser_artifact")
         return parser_artifact_id
 
@@ -185,21 +190,35 @@ def _build_processor(
     fallback_parser = _StaticParser(
         fallback_result or _make_parser_result(parser_name="pdfplumber")
     )
-    processor_cls = _CrashOnceProcessor if crash_after is not None else DeterministicIngestProcessor
-    processor = processor_cls(
-        storage=storage,
-        primary_parser=primary_parser,
-        fallback_parser=fallback_parser,
-        metadata_enricher=NullMetadataEnricher(),
-        index_version="mvp-v1",
-        chunking_version="phase1",
-        embedding_model="voyage-4-large",
-        reranker_model="zerank-2",
-        min_tokens=1,
-        max_tokens=20,
-        overlap_fraction=0.1,
-        **({"crash_after": crash_after} if crash_after is not None else {}),
-    )
+    if crash_after is not None:
+        processor = _CrashOnceProcessor(
+            storage=storage,
+            primary_parser=primary_parser,
+            fallback_parser=fallback_parser,
+            metadata_enricher=NullMetadataEnricher(),
+            index_version="mvp-v1",
+            chunking_version="phase1",
+            embedding_model="voyage-4-large",
+            reranker_model="zerank-2",
+            min_tokens=1,
+            max_tokens=20,
+            overlap_fraction=0.1,
+            crash_after=crash_after,
+        )
+    else:
+        processor = DeterministicIngestProcessor(
+            storage=storage,
+            primary_parser=primary_parser,
+            fallback_parser=fallback_parser,
+            metadata_enricher=NullMetadataEnricher(),
+            index_version="mvp-v1",
+            chunking_version="phase1",
+            embedding_model="voyage-4-large",
+            reranker_model="zerank-2",
+            min_tokens=1,
+            max_tokens=20,
+            overlap_fraction=0.1,
+        )
     return processor, primary_parser, fallback_parser
 
 
@@ -433,15 +452,39 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
                 text("SELECT COUNT(*) FROM document_sections WHERE document_id = :document_id"),
                 {"document_id": document_id},
             ).scalar_one()
+            table_count = connection.execute(
+                text("SELECT COUNT(*) FROM document_tables WHERE document_id = :document_id"),
+                {"document_id": document_id},
+            ).scalar_one()
             passage_count = connection.execute(
                 text("SELECT COUNT(*) FROM document_passages WHERE document_id = :document_id"),
+                {"document_id": document_id},
+            ).scalar_one()
+            retrieval_passage_count = connection.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM retrieval_passage_assets
+                    WHERE document_id = :document_id
+                    """
+                ),
+                {"document_id": document_id},
+            ).scalar_one()
+            retrieval_table_count = connection.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM retrieval_table_assets
+                    WHERE document_id = :document_id
+                    """
+                ),
                 {"document_id": document_id},
             ).scalar_one()
             retrieval_index = (
                 connection.execute(
                     text(
                         """
-                        SELECT parser_source, status
+                        SELECT parser_source, status, is_active
                         FROM retrieval_index_runs
                         WHERE document_id = :document_id
                         """
@@ -470,7 +513,10 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
         assert document["metadata_confidence"] is not None
         assert section_count > 0
         assert passage_count > 0
+        assert retrieval_passage_count == passage_count
+        assert retrieval_table_count == table_count
         assert retrieval_index["status"] == "ready"
+        assert retrieval_index["is_active"] is True
         assert retrieval_index["parser_source"] in {"docling", "pdfplumber"}
         assert primary_artifact["parser"] == retrieval_index["parser_source"]
         assert (storage_root / source_artifact["storage_ref"]).is_file()
@@ -611,9 +657,31 @@ def test_replay_after_parser_artifact_crash_is_idempotent(
             ),
             {"document_id": document_id},
         ).scalar_one()
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": document_id},
+        ).scalar_one()
+        retrieval_table_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_table_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": document_id},
+        ).scalar_one()
 
     assert ingest_job["status"] == "ready"
     assert parser_artifact_count == 1
+    assert retrieval_passage_count == 1
+    assert retrieval_table_count == 0
 
 
 def test_replay_after_archive_failure_archives_terminal_job_on_redelivery(
@@ -788,11 +856,15 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
                 index_version="mvp-v1",
                 embedding_provider="voyage",
                 embedding_model="voyage-4-large",
+                embedding_dimensions=1024,
                 reranker_provider="zero_entropy",
                 reranker_model="zerank-2",
                 chunking_version="phase1",
                 parser_source="docling",
                 status="ready",
+                is_active=True,
+                activated_at=now - timedelta(minutes=1),
+                deactivated_at=None,
                 created_at=now - timedelta(minutes=1),
             )
         )
@@ -827,10 +899,32 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
             text("SELECT COUNT(*) FROM retrieval_index_runs WHERE document_id = :document_id"),
             {"document_id": document_id},
         ).scalar_one()
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": document_id},
+        ).scalar_one()
+        retrieval_table_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_table_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": document_id},
+        ).scalar_one()
 
     assert older_job["status"] == "failed"
     assert older_job["failure_code"] == "superseded_by_newer_ingest_job"
     assert retrieval_runs == 1
+    assert retrieval_passage_count == 0
+    assert retrieval_table_count == 0
 
 
 def test_fallback_path_reaches_ready_with_pdfplumber_parser_source(
@@ -867,11 +961,21 @@ def test_fallback_path_reaches_ready_with_pdfplumber_parser_source(
             .mappings()
             .one()
         )
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
         retrieval_index = (
             connection.execute(
                 text(
                     """
-                SELECT parser_source, status
+                SELECT parser_source, status, is_active
                 FROM retrieval_index_runs
                 WHERE document_id = :document_id
                 """
@@ -885,7 +989,9 @@ def test_fallback_path_reaches_ready_with_pdfplumber_parser_source(
     assert ingest_job["status"] == "ready"
     assert "parser_fallback_used" in ingest_job["warnings"]
     assert retrieval_index["status"] == "ready"
+    assert retrieval_index["is_active"] is True
     assert retrieval_index["parser_source"] == "pdfplumber"
+    assert retrieval_passage_count > 0
 
 
 def test_failed_parse_clears_existing_retrieval_index_run(

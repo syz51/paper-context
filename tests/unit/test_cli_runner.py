@@ -172,6 +172,15 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     enricher_cls = MagicMock()
     enricher = MagicMock()
     enricher_cls.return_value = enricher
+    retrieval_indexer_cls = MagicMock()
+    retrieval_indexer = MagicMock()
+    retrieval_indexer_cls.return_value = retrieval_indexer
+    deterministic_embedding_cls = MagicMock()
+    deterministic_embedding = MagicMock()
+    deterministic_embedding_cls.return_value = deterministic_embedding
+    heuristic_reranker_cls = MagicMock()
+    heuristic_reranker = MagicMock()
+    heuristic_reranker_cls.return_value = heuristic_reranker
     processor_cls = MagicMock()
     processor_instance = MagicMock()
     processor_cls.return_value = processor_instance
@@ -184,6 +193,11 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_module, "DoclingPdfParser", primary_parser_cls)
     monkeypatch.setattr(runner_module, "PdfPlumberPdfParser", fallback_parser_cls)
     monkeypatch.setattr(runner_module, "NullMetadataEnricher", enricher_cls)
+    monkeypatch.setattr(runner_module, "DocumentRetrievalIndexer", retrieval_indexer_cls)
+    monkeypatch.setattr(runner_module, "DeterministicEmbeddingClient", deterministic_embedding_cls)
+    monkeypatch.setattr(runner_module, "HeuristicRerankerClient", heuristic_reranker_cls)
+    monkeypatch.setattr(runner_module, "VoyageEmbeddingClient", MagicMock())
+    monkeypatch.setattr(runner_module, "ZeroEntropyRerankerClient", MagicMock())
     monkeypatch.setattr(runner_module, "DeterministicIngestProcessor", processor_cls)
     monkeypatch.setattr(runner_module, "IngestWorker", worker_cls)
 
@@ -207,6 +221,7 @@ def test_build_worker_uses_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         min_tokens=300,
         max_tokens=700,
         overlap_fraction=0.15,
+        retrieval_indexer=retrieval_indexer,
     )
     worker_cls.assert_called_once()
     kwargs = worker_cls.call_args.kwargs
@@ -240,6 +255,11 @@ def test_build_worker_connection_factory_opens_connection_scope(
     monkeypatch.setattr(runner_module, "DoclingPdfParser", MagicMock())
     monkeypatch.setattr(runner_module, "PdfPlumberPdfParser", MagicMock())
     monkeypatch.setattr(runner_module, "NullMetadataEnricher", MagicMock())
+    monkeypatch.setattr(runner_module, "DocumentRetrievalIndexer", MagicMock())
+    monkeypatch.setattr(runner_module, "DeterministicEmbeddingClient", MagicMock())
+    monkeypatch.setattr(runner_module, "HeuristicRerankerClient", MagicMock())
+    monkeypatch.setattr(runner_module, "VoyageEmbeddingClient", MagicMock())
+    monkeypatch.setattr(runner_module, "ZeroEntropyRerankerClient", MagicMock())
     monkeypatch.setattr(runner_module, "DeterministicIngestProcessor", MagicMock())
     monkeypatch.setattr(runner_module, "IngestWorker", worker_cls)
 

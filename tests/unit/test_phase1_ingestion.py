@@ -141,6 +141,10 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         self.failed_calls: list[tuple[str, str, list[str]]] = []
         self.ready_warnings: list[str] | None = None
         self.replaced_index = False
+        self._retrieval_indexer.prepare_rebuild = MagicMock(return_value=object())  # type: ignore[method-assign]
+        self._retrieval_indexer.publish_prepared = MagicMock(  # type: ignore[method-assign]
+            side_effect=lambda connection, prepared: setattr(self, "replaced_index", True)
+        )
 
     def _lock_ingest_job(self, connection, ingest_job_id) -> IngestJobRow | None:
         return {
@@ -182,9 +186,6 @@ class _RecordingProcessor(DeterministicIngestProcessor):
 
     def _insert_passages(self, connection, **kwargs) -> None:
         return None
-
-    def _replace_index_run(self, connection, **kwargs) -> None:
-        self.replaced_index = True
 
     def _mark_ready(self, connection, *, ingest_job_id, document_id, warnings) -> None:
         self.ready_warnings = list(warnings)

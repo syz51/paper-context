@@ -338,7 +338,7 @@ def test_fallback_ingestion_reaches_ready_with_pdfplumber_parser_source(
             connection.execute(
                 text(
                     """
-                SELECT parser_source, status
+                SELECT parser_source, status, is_active
                 FROM retrieval_index_runs
                 WHERE ingest_job_id = :ingest_job_id
                 """
@@ -348,11 +348,23 @@ def test_fallback_ingestion_reaches_ready_with_pdfplumber_parser_source(
             .mappings()
             .one()
         )
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
 
     assert job["status"] == "ready"
     assert "parser_fallback_used" in job["warnings"]
     assert retrieval["status"] == "ready"
+    assert retrieval["is_active"] is True
     assert retrieval["parser_source"] == "pdfplumber"
+    assert retrieval_passage_count > 0
 
 
 def test_failed_parse_leaves_no_active_retrieval_index_run(
@@ -407,10 +419,21 @@ def test_failed_parse_leaves_no_active_retrieval_index_run(
             ),
             {"ingest_job_id": upload.ingest_job_id},
         ).scalar_one()
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
 
     assert job["status"] == "failed"
     assert job["failure_code"] == "docling_failed"
     assert retrieval_count == 0
+    assert retrieval_passage_count == 0
 
 
 def test_worker_replay_after_parser_artifact_crash_cleans_files_and_recovers(
@@ -454,8 +477,34 @@ def test_worker_replay_after_parser_artifact_crash_cleans_files_and_recovers(
             ),
             {"document_id": upload.document_id},
         ).scalar_one()
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
+        table_count = connection.execute(
+            text("SELECT COUNT(*) FROM document_tables WHERE document_id = :document_id"),
+            {"document_id": upload.document_id},
+        ).scalar_one()
+        retrieval_table_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_table_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
 
     assert parser_artifact_count == 0
+    assert retrieval_passage_count == 0
+    assert retrieval_table_count == 0
     assert not (
         storage_root / f"documents/{upload.document_id}/{upload.ingest_job_id}/docling.json"
     ).exists()
@@ -487,8 +536,41 @@ def test_worker_replay_after_parser_artifact_crash_cleans_files_and_recovers(
             .mappings()
             .one()
         )
+        retrieval_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_index_runs
+                WHERE ingest_job_id = :ingest_job_id
+                """
+            ),
+            {"ingest_job_id": upload.ingest_job_id},
+        ).scalar_one()
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
+        retrieval_table_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_table_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
 
     assert job["status"] == "ready"
+    assert retrieval_count == 1
+    assert retrieval_passage_count > 0
+    assert retrieval_table_count == table_count
 
 
 def test_worker_replay_after_normalization_crash_rolls_back_partial_rows(
@@ -532,10 +614,32 @@ def test_worker_replay_after_normalization_crash_rolls_back_partial_rows(
             text("SELECT COUNT(*) FROM retrieval_index_runs WHERE document_id = :document_id"),
             {"document_id": upload.document_id},
         ).scalar_one()
+        retrieval_passage_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_passage_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
+        retrieval_table_count = connection.execute(
+            text(
+                """
+                SELECT COUNT(*)
+                FROM retrieval_table_assets
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": upload.document_id},
+        ).scalar_one()
 
     assert section_count == 0
     assert passage_count == 0
     assert retrieval_count == 0
+    assert retrieval_passage_count == 0
+    assert retrieval_table_count == 0
 
 
 def test_worker_replay_after_archive_failure_archives_terminal_job_on_redelivery(
@@ -686,7 +790,7 @@ def test_stale_redelivery_after_newer_ingest_job_exists_is_failed_without_wiping
             connection.execute(
                 text(
                     """
-                SELECT ingest_job_id, status
+                SELECT ingest_job_id, status, is_active
                 FROM retrieval_index_runs
                 WHERE document_id = :document_id
                 """
@@ -702,3 +806,4 @@ def test_stale_redelivery_after_newer_ingest_job_exists_is_failed_without_wiping
     assert current_document["current_status"] == "ready"
     assert retrieval["ingest_job_id"] == newer_ingest_job_id
     assert retrieval["status"] == "ready"
+    assert retrieval["is_active"] is True

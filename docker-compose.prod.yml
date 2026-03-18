@@ -6,6 +6,8 @@ services:
     env_file:
       - .env
     environment:
+      PAPER_CONTEXT_ENVIRONMENT: production
+      PAPER_CONTEXT_DATABASE__APPLICATION_NAME: paper-context-app
       PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
     depends_on:
       migrate:
@@ -36,6 +38,8 @@ services:
     env_file:
       - .env
     environment:
+      PAPER_CONTEXT_ENVIRONMENT: production
+      PAPER_CONTEXT_DATABASE__APPLICATION_NAME: paper-context-worker
       PAPER_CONTEXT_STORAGE__ROOT_PATH: /var/lib/paper-context/artifacts
     depends_on:
       app:
@@ -56,6 +60,9 @@ services:
       dockerfile: Dockerfile
     env_file:
       - .env
+    environment:
+      PAPER_CONTEXT_ENVIRONMENT: production
+      PAPER_CONTEXT_DATABASE__APPLICATION_NAME: paper-context-migrate
     networks:
       - dokploy-network
     command:
