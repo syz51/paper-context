@@ -2,8 +2,6 @@
 
 Always use a pool of sub agents for all the tasks that could be safely delegated
 Use uv for python
-When receiving user input or making code changes, take notes on what choices were made, and whats working whats not working, etc, Anything you deem worth noting down. In a separate folder called memory.
-When you need to look for past memory, look at the memory/ folder for past experiences.
 
 ## Verification
 
@@ -24,36 +22,140 @@ When you need to look for past memory, look at the memory/ folder for past exper
 
 ## Dependency References
 
-Prefer these pinned upstream paths over generic homepages. Where upstream docs are not versioned cleanly, the pinned path is the exact release or tag page for the version used here.
+Prefer official `llms.txt` endpoints when they exist. Otherwise prefer the simplest LLM-readable upstream docs entrypoint available, using versioned raw docs or README paths where practical.
 
 ### Runtime Stack
 
-| Dependency | Version used here | Pinned upstream doc path | Consult when |
-| --- | --- | --- | --- |
-| `alembic` | `1.18.4` | <https://github.com/sqlalchemy/alembic/releases/tag/rel_1_18_4> | migrations, `env.py`, revision scripts, downgrade/upgrade behavior |
-| `docling` | `2.80.0` | <https://github.com/docling-project/docling/releases/tag/v2.80.0> | parser capabilities, conversion behavior, extraction regressions |
-| `fastapi` | `0.135.1` | <https://github.com/fastapi/fastapi/releases/tag/0.135.1> | route behavior, dependency injection, request/response model handling |
-| `fastmcp` | `3.1.1` | <https://github.com/PrefectHQ/fastmcp/releases/tag/v3.1.1> | MCP server wiring, mounted transport behavior, tool registration |
-| `orjson` | `3.11.7` | <https://github.com/ijl/orjson/releases/tag/3.11.7> | serialization edge cases, bytes/datetime behavior, performance-sensitive JSON paths |
-| `pdfplumber` | `0.11.9` | <https://github.com/jsvine/pdfplumber/releases/tag/v0.11.9> | parser fallback behavior, layout extraction quirks, PDF text/table issues |
-| `pgmq` | `1.7.0` | <https://github.com/pgmq/pgmq/releases/tag/v1.7.0> | queue SQL functions, visibility timeout semantics, Postgres queue behavior |
-| `pgvector` | `0.8.1` | <https://github.com/pgvector/pgvector/tree/v0.8.1> | extension DDL, vector column/index behavior, similarity operator semantics |
-| `psycopg` | `3.3.3` | <https://github.com/psycopg/psycopg/releases/tag/3.3.3> | connection/session behavior, SQL execution, transaction handling |
-| `pydantic` | `2.12.5` | <https://docs.pydantic.dev/2.12/> | model validation, serialization, settings/model config behavior |
-| `pydantic-settings` | `2.13.1` | <https://github.com/pydantic/pydantic-settings/releases/tag/v2.13.1> | settings loading, env parsing, config source precedence |
-| `python-multipart` | `0.0.22` | <https://github.com/Kludex/python-multipart/releases/tag/0.0.22> | multipart upload parsing, form/file edge cases |
-| `sqlalchemy` | `2.0.48` | <https://docs.sqlalchemy.org/en/20/> | ORM mappings, sessions, Core queries, migration-adjacent SQLAlchemy behavior |
-| `uvicorn` | `0.42.0` | <https://github.com/Kludex/uvicorn/releases/tag/0.42.0> | ASGI serving behavior, local dev server issues, worker/process runtime quirks |
+[dependency]
+name: alembic
+version: 1.18.4
+docs: <https://alembic.sqlalchemy.org/llms.txt>
+consult_when: migrations, alembic env.py, revision scripts, upgrade or downgrade behavior
+
+[dependency]
+name: docling
+version: 2.80.0
+docs: <https://raw.githubusercontent.com/docling-project/docling/v2.80.0/README.md>
+consult_when: parser capabilities, conversion behavior, extraction regressions
+
+[dependency]
+name: fastapi
+version: 0.135.1
+docs: <https://raw.githubusercontent.com/fastapi/fastapi/0.135.1/docs/en/docs/index.md>
+consult_when: route behavior, dependency injection, request parsing, response model handling
+
+[dependency]
+name: fastmcp
+version: 3.1.1
+docs: <https://gofastmcp.com/llms.txt>
+consult_when: MCP server wiring, mounted transport behavior, tool registration
+
+[dependency]
+name: orjson
+version: 3.11.7
+docs: <https://raw.githubusercontent.com/ijl/orjson/3.11.7/README.md>
+consult_when: serialization edge cases, bytes or datetime behavior, performance-sensitive JSON paths
+
+[dependency]
+name: pdfplumber
+version: 0.11.9
+docs: <https://raw.githubusercontent.com/jsvine/pdfplumber/v0.11.9/README.md>
+consult_when: parser fallback behavior, layout extraction quirks, PDF text or table issues
+
+[dependency]
+name: pgmq
+version: 1.7.0
+docs: <https://raw.githubusercontent.com/pgmq/pgmq/v1.7.0/README.md>
+consult_when: queue SQL functions, visibility timeout semantics, Postgres queue behavior
+
+[dependency]
+name: pgvector
+version: 0.8.1
+docs: <https://raw.githubusercontent.com/pgvector/pgvector/v0.8.1/README.md>
+consult_when: extension DDL, vector column or index behavior, similarity operator semantics
+
+[dependency]
+name: psycopg
+version: 3.3.3
+docs: <https://www.psycopg.org/psycopg3/docs/>
+consult_when: connection or session behavior, SQL execution, transaction handling
+
+[dependency]
+name: pydantic
+version: 2.12.5
+docs: <https://docs.pydantic.dev/latest/llms.txt>
+consult_when: model validation, serialization, field config, model config behavior
+
+[dependency]
+name: pydantic-settings
+version: 2.13.1
+docs: <https://docs.pydantic.dev/latest/concepts/pydantic_settings/>
+consult_when: settings loading, env parsing, config source precedence
+
+[dependency]
+name: python-multipart
+version: 0.0.22
+docs: <https://raw.githubusercontent.com/Kludex/python-multipart/0.0.22/docs/index.md>
+consult_when: multipart upload parsing, form or file edge cases
+
+[dependency]
+name: sqlalchemy
+version: 2.0.48
+docs: <https://docs.sqlalchemy.org/llms.txt>
+consult_when: ORM mappings, sessions, Core queries, migration-adjacent SQLAlchemy behavior
+
+[dependency]
+name: uvicorn
+version: 0.42.0
+docs: <https://www.uvicorn.org/llms.txt>
+consult_when: ASGI serving behavior, local dev server issues, worker or process runtime quirks
 
 ### Dev And Test
 
-| Dependency | Version used here | Pinned upstream doc path | Consult when |
-| --- | --- | --- | --- |
-| `bandit` | `1.9.4` | <https://bandit.readthedocs.io/en/1.9.4/> | security lint findings, rule behavior, ignore annotations |
-| `httpx` | `0.28.1` | <https://github.com/encode/httpx/releases/tag/0.28.1> | test clients, request/response API behavior, timeout/transport questions |
-| `pre-commit` | `4.5.1` | <https://github.com/pre-commit/pre-commit/releases/tag/v4.5.1> | hook execution behavior, local hook config, CI/local hook mismatches |
-| `pyright` | `1.1.408` | <https://github.com/RobertCraigie/pyright-python/releases/tag/v1.1.408> | type-check diagnostics, config behavior, Python-version typing issues |
-| `pytest` | `9.0.2` | <https://docs.pytest.org/en/9.0.x/> | fixture behavior, markers, parametrization, assertion semantics |
-| `pytest-cov` | `7.0.0` | <https://github.com/pytest-dev/pytest-cov/releases/tag/v7.0.0> | coverage flags, reporting behavior, coverage integration quirks |
-| `pytest-xdist` | `3.8.0` | <https://github.com/pytest-dev/pytest-xdist/releases/tag/v3.8.0> | parallel test execution, worker isolation, `-n` and `--dist` behavior |
-| `ruff` | `0.15.6` | <https://github.com/astral-sh/ruff/releases/tag/0.15.6> | lint rule behavior, autofix expectations, formatter/linter conflicts |
+[dependency]
+name: bandit
+version: 1.9.4
+docs: <https://bandit.readthedocs.io/en/1.9.4/>
+consult_when: security lint findings, rule behavior, ignore annotations
+
+[dependency]
+name: httpx
+version: 0.28.1
+docs: <https://www.python-httpx.org/>
+consult_when: test clients, request or response API behavior, timeout or transport questions
+
+[dependency]
+name: pre-commit
+version: 4.5.1
+docs: <https://pre-commit.com/>
+consult_when: hook execution behavior, local hook config, CI or local hook mismatches
+
+[dependency]
+name: pyright
+version: 1.1.408
+docs: <https://microsoft.github.io/pyright/>
+consult_when: type-check diagnostics, config behavior, Python-version typing issues
+
+[dependency]
+name: pytest
+version: 9.0.2
+docs: <https://docs.pytest.org/en/9.0.x/>
+consult_when: fixture behavior, markers, parametrization, assertion semantics
+
+[dependency]
+name: pytest-cov
+version: 7.0.0
+docs: <https://pytest-cov.readthedocs.io/en/latest/>
+consult_when: coverage flags, reporting behavior, coverage integration quirks
+
+[dependency]
+name: pytest-xdist
+version: 3.8.0
+docs: <https://pytest-xdist.readthedocs.io/en/latest/>
+consult_when: parallel test execution, worker isolation, -n and --dist behavior
+
+[dependency]
+name: ruff
+version: 0.15.6
+docs: <https://docs.astral.sh/ruff/llms.txt>
+consult_when: lint rule behavior, autofix expectations, formatter or linter conflicts
