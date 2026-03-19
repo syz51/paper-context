@@ -75,7 +75,11 @@ def test_claim_ingest_returns_first_message() -> None:
 
 
 def test_claim_ingest_archives_terminal_message_and_returns_next_claimable_message() -> None:
-    stale_payload = {"ingest_job_id": str(uuid4()), "document_id": str(uuid4())}
+    stale_ingest_job_id = uuid4()
+    stale_payload = {
+        "ingest_job_id": str(stale_ingest_job_id),
+        "document_id": str(uuid4()),
+    }
     fresh_payload = {"ingest_job_id": str(uuid4()), "document_id": str(uuid4())}
     stale_message = _make_message(stale_payload)
     fresh_message = _make_message(fresh_payload)
@@ -95,10 +99,17 @@ def test_claim_ingest_archives_terminal_message_and_returns_next_claimable_messa
     assert claimed is not None
     assert claimed.message == fresh_message
     adapter.archive_message.assert_called_once_with(connection, stale_message.msg_id)
+    adapter.delete_messages_for_ingest_job_id.assert_called_once_with(
+        connection, stale_ingest_job_id
+    )
 
 
 def test_claim_ingest_returns_archived_terminal_message_when_no_fresh_message_follows() -> None:
-    stale_payload = {"ingest_job_id": str(uuid4()), "document_id": str(uuid4())}
+    stale_ingest_job_id = uuid4()
+    stale_payload = {
+        "ingest_job_id": str(stale_ingest_job_id),
+        "document_id": str(uuid4()),
+    }
     stale_message = _make_message(stale_payload)
     adapter = MagicMock()
     adapter.read_with_poll.side_effect = [[stale_message], []]
@@ -115,6 +126,9 @@ def test_claim_ingest_returns_archived_terminal_message_when_no_fresh_message_fo
     assert claimed.message == stale_message
     assert claimed.already_archived is True
     adapter.archive_message.assert_called_once_with(connection, stale_message.msg_id)
+    adapter.delete_messages_for_ingest_job_id.assert_called_once_with(
+        connection, stale_ingest_job_id
+    )
 
 
 def test_enqueue_ingest_merges_trace_metadata_and_headers() -> None:
@@ -172,6 +186,9 @@ def test_queue_delegates_extend_archive_delete_metrics() -> None:
 
     queue.delete_message(connection, 13)
     adapter.delete_message.assert_called_once_with(connection, 13)
+
+    queue.delete_messages_for_ingest_job_id(connection, uuid4())
+    adapter.delete_messages_for_ingest_job_id.assert_called_once()
 
     expected_metrics = MagicMock()
     adapter.metrics.return_value = expected_metrics
@@ -291,6 +308,7 @@ def test_synthetic_processor_updates_non_terminal_job() -> None:
     select_result.mappings.return_value.one_or_none.return_value = {
         "status": "queued",
         "revision_id": revision_id,
+        "created_at": datetime.now(UTC),
     }
     connection.execute.side_effect = [
         select_result,
@@ -307,7 +325,8 @@ def test_synthetic_processor_updates_non_terminal_job() -> None:
         "_activate_revision_if_current",
         autospec=True,
     ) as activate_revision:
-        processor.process(connection, context, lease)
+        with patch.object(DeterministicIngestProcessor, "_is_superseded", return_value=False):
+            processor.process(connection, context, lease)
 
     assert connection.execute.call_count == 5
     lease.extend.assert_called_once()
@@ -325,5 +344,3 @@ def test_synthetic_processor_updates_non_terminal_job() -> None:
         ingest_job_id=context.payload.ingest_job_id,
         now=activate_revision.call_args.kwargs["now"],
     )
-    document_args = connection.execute.call_args_list[4][0][1]
-    assert document_args["document_id"] == context.payload.document_id

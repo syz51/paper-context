@@ -83,6 +83,10 @@ def test_search_passages_page_returns_cursor_bound_to_index_version() -> None:
     assert decode_cursor(first_page.next_cursor)["index_version"] == "mvp-v1"
     assert decode_cursor(first_page.next_cursor)["kind"] == "passages"
     assert [item.passage_id for item in second_page.items] == [passage_c.passage_id]
+    assert all(
+        call.kwargs["limit"] is None
+        for call in service._search_passages_with_connection.call_args_list
+    )
 
 
 def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
@@ -140,6 +144,10 @@ def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
     assert decode_cursor(first_page.next_cursor)["kind"] == "tables"
     assert [item.table_id for item in second_page.items] == [table_b.table_id]
     assert first_page.items[0].preview.headers == ("A",)
+    assert all(
+        call.kwargs["limit"] is None
+        for call in service._search_tables_with_connection.call_args_list
+    )
 
 
 def test_get_table_returns_full_structured_payload() -> None:

@@ -49,30 +49,34 @@ def test_search_documents_applies_query_filters_and_paginates() -> None:
     first_document_id = uuid4()
     second_document_id = uuid4()
     requested_document_id = uuid4()
-    connection.execute.return_value = _result(
-        all_rows=[
-            {
-                "document_id": first_document_id,
-                "title": "Alpha",
-                "authors": ["Ada"],
-                "publication_year": 2024,
-                "quant_tags": {"theme": "rates"},
-                "current_status": "ready",
-                "active_index_version": "index-v1",
-                "updated_at": datetime.now(UTC),
-            },
-            {
-                "document_id": second_document_id,
-                "title": "Beta",
-                "authors": ["Grace"],
-                "publication_year": 2025,
-                "quant_tags": {"theme": "fx"},
-                "current_status": "queued",
-                "active_index_version": None,
-                "updated_at": datetime.now(UTC),
-            },
-        ]
-    )
+    updated_at_1 = datetime(2026, 3, 18, 10, 0, tzinfo=UTC)
+    updated_at_2 = datetime(2026, 3, 18, 9, 0, tzinfo=UTC)
+    rows = [
+        {
+            "document_id": first_document_id,
+            "title": "Alpha",
+            "authors": ["Ada"],
+            "publication_year": 2024,
+            "quant_tags": {"theme": "rates"},
+            "current_status": "ready",
+            "active_index_version": "index-v1",
+            "updated_at": updated_at_1,
+        },
+        {
+            "document_id": second_document_id,
+            "title": "Beta",
+            "authors": ["Grace"],
+            "publication_year": 2025,
+            "quant_tags": {"theme": "fx"},
+            "current_status": "queued",
+            "active_index_version": None,
+            "updated_at": updated_at_2,
+        },
+    ]
+    connection.execute.side_effect = [
+        _result(all_rows=rows[:2]),
+        _result(all_rows=rows[1:2]),
+    ]
 
     first_page = service.search_documents(
         query="  alpha  ",
@@ -85,7 +89,8 @@ def test_search_documents_applies_query_filters_and_paginates() -> None:
 
     assert [document.document_id for document in first_page.documents] == [first_document_id]
     assert first_page.next_cursor is not None
-    assert decode_cursor(first_page.next_cursor)["position"] == 1
+    assert decode_cursor(first_page.next_cursor)["updated_at"] == updated_at_1.isoformat()
+    assert decode_cursor(first_page.next_cursor)["document_id"] == str(first_document_id)
 
     second_page = service.search_documents(
         query="alpha",
@@ -109,6 +114,29 @@ def test_search_documents_supports_blank_query_without_filters() -> None:
 
     assert response.documents == []
     assert response.next_cursor is None
+
+
+def test_document_search_limit_is_clamped() -> None:
+    service, connection, _, _ = _make_service()
+    rows = [
+        {
+            "document_id": uuid4(),
+            "title": "Alpha",
+            "authors": ["Ada"],
+            "publication_year": 2024,
+            "quant_tags": {"theme": "rates"},
+            "current_status": "ready",
+            "active_index_version": "index-v1",
+            "updated_at": datetime(2026, 3, 18, 10, 0, tzinfo=UTC),
+        }
+    ]
+    connection.execute.return_value = _result(all_rows=rows)
+
+    response = service.search_documents(query="alpha", filters=None, limit=10_000)
+
+    assert len(response.documents) == 1
+    executed_statement = connection.execute.call_args.args[0]
+    assert executed_statement._limit_clause.value == 101
 
 
 def test_get_document_returns_model_when_row_exists() -> None:

@@ -226,6 +226,29 @@ def test_connection_requires_factory() -> None:
         service._connection()
 
 
+def test_auto_active_run_selection_collapses_to_newest_index_version() -> None:
+    service = _service(active_index_version=None)
+    newest_run_id = uuid4()
+    second_run_id = uuid4()
+    legacy_run_id = uuid4()
+
+    selection = service._resolve_active_run_selection(
+        _connection(
+            _mock_result(
+                rows=[
+                    {"id": newest_run_id, "index_version": "mvp-v2"},
+                    {"id": second_run_id, "index_version": "mvp-v2"},
+                    {"id": legacy_run_id, "index_version": "mvp-v1"},
+                ]
+            )
+        ),
+        filtered_document_ids=None,
+    )
+
+    assert selection.run_ids == (newest_run_id, second_run_id)
+    assert selection.index_versions == ("mvp-v2",)
+
+
 @pytest.mark.parametrize(
     "method_name",
     ["_search_passages_with_connection", "_search_tables_with_connection"],
@@ -312,8 +335,8 @@ def test_resolve_active_run_selection_fixed_version_and_query_branch() -> None:
         filtered_document_ids=filtered_document_ids,
     )
 
-    assert selection.run_ids == tuple(row["id"] for row in rows)
-    assert selection.index_versions == ("mvp-v2", "mvp-v1")
+    assert selection.run_ids == (rows[0]["id"], rows[2]["id"])
+    assert selection.index_versions == ("mvp-v2",)
     assert query_connection.execute.call_args.args[1] == {
         "apply_document_filter": True,
         "document_ids": [filtered_document_ids[0]],

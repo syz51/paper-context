@@ -770,6 +770,42 @@ def test_process_missing_source_artifact_marks_failure() -> None:
     fallback_parser.parse.assert_not_called()
 
 
+def test_process_invalid_source_artifact_ref_marks_failure() -> None:
+    processor, storage, primary_parser, fallback_parser, _ = _make_processor()
+    connection = MagicMock()
+    context = _make_context()
+    source_artifact_id = uuid4()
+    revision_id = uuid4()
+    connection.execute.side_effect = _row_sequence(
+        [
+            _job_row(
+                document_id=context.payload.document_id,
+                revision_id=revision_id,
+                source_artifact_id=source_artifact_id,
+                warnings=[],
+            ),
+            {"id": source_artifact_id, "storage_ref": "../escape.pdf"},
+        ]
+    )
+    storage.resolve.side_effect = ValueError("escapes storage root")
+    lease = MagicMock()
+    processor._mark_failed = MagicMock()  # type: ignore[method-assign]
+
+    processor.process(connection, context, lease)
+
+    processor._mark_failed.assert_called_once_with(
+        connection,
+        ingest_job_id=context.payload.ingest_job_id,
+        document_id=context.payload.document_id,
+        revision_id=revision_id,
+        failure_code="invalid_source_artifact_ref",
+        failure_message="The source artifact points outside the configured storage root.",
+        warnings=[],
+    )
+    primary_parser.parse.assert_not_called()
+    fallback_parser.parse.assert_not_called()
+
+
 def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
     processor, _, primary_parser, fallback_parser, _ = _make_processor()
     connection = MagicMock()
@@ -950,6 +986,7 @@ def test_synthetic_processor_updates_non_terminal_job() -> None:
     select_result.mappings.return_value.one_or_none.return_value = {
         "status": "queued",
         "revision_id": uuid4(),
+        "created_at": datetime.now(UTC),
     }
     trailing_results = iter([MagicMock() for _ in range(16)])
 
@@ -963,7 +1000,8 @@ def test_synthetic_processor_updates_non_terminal_job() -> None:
     lease = MagicMock()
     context = _make_context()
 
-    processor.process(connection, context, lease)
+    with patch.object(DeterministicIngestProcessor, "_is_superseded", return_value=False):
+        processor.process(connection, context, lease)
 
     assert connection.execute.call_count == 10
     lease.extend.assert_called_once()

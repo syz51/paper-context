@@ -117,6 +117,26 @@ def test_local_filesystem_storage_delete_stops_when_parent_not_empty(tmp_path: P
     assert (root / "deep" / "keep.bin").read_bytes() == b"keep"
 
 
+@pytest.mark.parametrize("method_name", ["store_bytes", "resolve", "delete"])
+def test_local_filesystem_storage_rejects_paths_outside_root(
+    tmp_path: Path, method_name: str
+) -> None:
+    root = tmp_path / "artifacts"
+    storage = LocalFilesystemStorage(root)
+
+    method = getattr(storage, method_name)
+    args: tuple[object, ...]
+    if method_name == "store_bytes":
+        args = ("../escape.bin", b"payload")
+    else:
+        args = ("../escape.bin",)
+
+    with pytest.raises(ValueError, match="escapes storage root"):
+        method(*args)
+
+    assert not (tmp_path / "escape.bin").exists()
+
+
 def test_pgvector_processors_cover_scalar_and_sequence_inputs() -> None:
     unbounded = PgVector()
     bounded = PgVector(3)

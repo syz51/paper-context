@@ -219,18 +219,18 @@ def test_registered_mcp_tools_delegate_to_shared_services(
 
     docs_response = cast(
         DocumentListResponse,
-        fake_fastmcp.tools["search_documents"](query="alpha"),
+        fake_fastmcp.tools["search_documents"](query="alpha", limit=999),
     )
     outline_response = fake_fastmcp.tools["get_document_outline"](
         "11111111-1111-1111-1111-111111111111"
     )
     passages_response = cast(
         PassageSearchResponse,
-        fake_fastmcp.tools["search_passages"](query="beta"),
+        fake_fastmcp.tools["search_passages"](query="beta", limit=999),
     )
     tables_response = cast(
         TableSearchResponse,
-        fake_fastmcp.tools["search_tables"](query="gamma"),
+        fake_fastmcp.tools["search_tables"](query="gamma", limit=999),
     )
     table_response = cast(
         TableDetailResponse,
@@ -242,7 +242,7 @@ def test_registered_mcp_tools_delegate_to_shared_services(
     )
     pack_response = cast(
         ContextPackResponse,
-        fake_fastmcp.tools["build_context_pack"](query="delta"),
+        fake_fastmcp.tools["build_context_pack"](query="delta", limit=999),
     )
 
     assert docs_response == documents.search_documents_response
@@ -257,7 +257,7 @@ def test_registered_mcp_tools_delegate_to_shared_services(
     )
     assert pack_response.context_pack_id == retrieval.context_pack_response.context_pack_id
     assert documents.search_documents_calls == [
-        {"query": "alpha", "filters": None, "cursor": None, "limit": 20}
+        {"query": "alpha", "filters": None, "cursor": None, "limit": 100}
     ]
     assert documents.outline_calls == [UUID("11111111-1111-1111-1111-111111111111")]
     assert retrieval.search_passages_calls == [
@@ -288,6 +288,12 @@ def test_registered_mcp_tools_delegate_to_shared_services(
             "limit": 8,
         }
     ]
+
+
+def test_clamp_limit_enforces_positive_bounds() -> None:
+    assert mcp_module._clamp_limit(0, maximum=8) == 1
+    assert mcp_module._clamp_limit(3, maximum=8) == 3
+    assert mcp_module._clamp_limit(99, maximum=8) == 8
 
 
 @pytest.mark.parametrize(

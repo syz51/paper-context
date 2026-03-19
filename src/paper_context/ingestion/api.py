@@ -4,10 +4,10 @@ import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from tempfile import SpooledTemporaryFile
-from typing import Any, BinaryIO, TypeVar, cast
+from typing import Any, BinaryIO, cast
 
 from sqlalchemy import Text as SqlText
-from sqlalchemy import bindparam, func, insert, lateral, or_, select, true, update
+from sqlalchemy import and_, bindparam, func, insert, lateral, literal, or_, select, true, update
 from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Connection, Engine
@@ -44,9 +44,9 @@ from .identifiers import artifact_id
 
 _PDF_MAGIC = b"%PDF-"
 _UPLOAD_CHUNK_SIZE = 1024 * 1024
-_CursorItem = TypeVar("_CursorItem")
 _SUPERSEDED_FAILURE_CODE = "superseded_by_newer_ingest_job"
 _SUPERSEDED_FAILURE_MESSAGE = "A newer ingest job superseded this run before processing began."
+_MAX_DOCUMENT_PAGE_SIZE = 100
 
 
 class UploadTooLargeError(ValueError):
@@ -139,18 +139,24 @@ class DocumentsApiService:
         )
 
     def list_documents(self, *, limit: int = 20, cursor: str | None = None) -> DocumentListResponse:
-        statement = self._document_projection_statement(include_updated_at=True)
-        with self._engine.begin() as connection:
-            rows = connection.execute(statement).mappings().all()
-        documents = [self._row_to_document_result(row) for row in rows]
-        page, next_cursor = self._page_items(
-            items=documents,
-            limit=limit,
+        page_size = self._normalize_document_limit(limit)
+        fingerprint = fingerprint_payload({"kind": "documents:list"})
+        cursor_state = self._decode_document_cursor(
             cursor=cursor,
             kind="documents:list",
-            fingerprint=fingerprint_payload({"kind": "documents:list"}),
+            fingerprint=fingerprint,
         )
-        return DocumentListResponse(documents=list(page), next_cursor=next_cursor)
+        statement = self._document_projection_statement(include_updated_at=True)
+        statement = self._apply_document_cursor(statement, cursor_state)
+        statement = statement.limit(page_size + 1)
+        with self._engine.begin() as connection:
+            rows = connection.execute(statement).mappings().all()
+        return self._document_page_response(
+            rows=rows,
+            limit=page_size,
+            kind="documents:list",
+            fingerprint=fingerprint,
+        )
 
     def search_documents(
         self,
@@ -161,15 +167,25 @@ class DocumentsApiService:
         cursor: str | None = None,
     ) -> DocumentListResponse:
         filters = filters or RetrievalFiltersInput()
+        page_size = self._normalize_document_limit(limit)
         stripped_query = query.strip()
+        fingerprint = fingerprint_payload(
+            {
+                "kind": "documents:search",
+                "query": stripped_query,
+                "filters": filters.model_dump(mode="json"),
+            }
+        )
+        cursor_state = self._decode_document_cursor(
+            cursor=cursor,
+            kind="documents:search",
+            fingerprint=fingerprint,
+        )
         predicates: list[ColumnElement[bool]] = []
         if stripped_query:
-            pattern = f"%{stripped_query}%"
             predicates.append(
-                or_(
-                    func.coalesce(Document.title, "").ilike(pattern),
-                    func.coalesce(Document.abstract, "").ilike(pattern),
-                    func.coalesce(sa_cast(Document.authors, SqlText), "").ilike(pattern),
+                func.to_tsvector("english", self._document_search_text()).op("@@")(
+                    func.websearch_to_tsquery("english", stripped_query)
                 )
             )
         if filters.document_ids:
@@ -181,23 +197,16 @@ class DocumentsApiService:
             *predicates,
             include_updated_at=True,
         )
+        statement = self._apply_document_cursor(statement, cursor_state)
+        statement = statement.limit(page_size + 1)
         with self._engine.begin() as connection:
             rows = connection.execute(statement).mappings().all()
-        documents = [self._row_to_document_result(row) for row in rows]
-        page, next_cursor = self._page_items(
-            items=documents,
-            limit=limit,
-            cursor=cursor,
+        return self._document_page_response(
+            rows=rows,
+            limit=page_size,
             kind="documents:search",
-            fingerprint=fingerprint_payload(
-                {
-                    "kind": "documents:search",
-                    "query": stripped_query,
-                    "filters": filters.model_dump(mode="json"),
-                }
-            ),
+            fingerprint=fingerprint,
         )
-        return DocumentListResponse(documents=list(page), next_cursor=next_cursor)
 
     def get_document(self, document_id: uuid.UUID) -> DocumentResult | None:
         statement = self._document_projection_statement(Document.id == document_id)
@@ -511,7 +520,7 @@ class DocumentsApiService:
         document_id: uuid.UUID,
         now: datetime,
     ) -> None:
-        connection.execute(
+        superseded_rows = connection.execute(
             update(IngestJob)
             .where(
                 IngestJob.document_id == bindparam("b_document_id"),
@@ -523,7 +532,8 @@ class DocumentsApiService:
                 failure_message=bindparam("b_failure_message"),
                 started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
                 finished_at=bindparam("b_now"),
-            ),
+            )
+            .returning(IngestJob.id, IngestJob.revision_id),
             {
                 "document_id": document_id,
                 "b_document_id": document_id,
@@ -534,7 +544,26 @@ class DocumentsApiService:
                 "now": now,
                 "b_now": now,
             },
+        ).all()
+        superseded_job_ids = tuple(cast(uuid.UUID, row[0]) for row in superseded_rows)
+        superseded_revision_ids = tuple(cast(uuid.UUID, row[1]) for row in superseded_rows)
+        if not superseded_revision_ids:
+            return
+        connection.execute(
+            update(DocumentRevision)
+            .where(DocumentRevision.id.in_(superseded_revision_ids))
+            .values(
+                status="failed",
+                superseded_at=bindparam("b_now"),
+                updated_at=bindparam("b_now"),
+            ),
+            {
+                "now": now,
+                "b_now": now,
+            },
         )
+        for ingest_job_id in superseded_job_ids:
+            self._queue.delete_messages_for_ingest_job_id(connection, ingest_job_id)
 
     def _document_projection_statement(
         self,
@@ -580,6 +609,19 @@ class DocumentsApiService:
             statement = statement.where(predicate)
         return statement
 
+    def _document_search_text(self):
+        return (
+            func.coalesce(Document.title, "")
+            + literal(" ")
+            + func.coalesce(Document.abstract, "")
+            + literal(" ")
+            + func.translate(
+                func.coalesce(sa_cast(Document.authors, SqlText), ""),
+                '[]"',
+                "   ",
+            )
+        )
+
     def _document_title_statement(self, *, document_id: uuid.UUID):
         return select(
             Document.id.label("document_id"),
@@ -612,40 +654,74 @@ class DocumentsApiService:
             statement = statement.where(predicate)
         return statement.order_by(DocumentSection.ordinal.asc().nullslast(), DocumentTable.id)
 
-    def _page_items(
+    def _normalize_document_limit(self, limit: int) -> int:
+        return max(1, min(limit, _MAX_DOCUMENT_PAGE_SIZE))
+
+    def _decode_document_cursor(
         self,
         *,
-        items: Sequence[_CursorItem],
-        limit: int,
         cursor: str | None,
         kind: str,
         fingerprint: str,
-    ) -> tuple[tuple[_CursorItem, ...], str | None]:
-        page_size = max(1, limit)
-        start = 0
-        if cursor is not None:
-            try:
-                payload = decode_cursor(cursor)
-            except CursorError as exc:
-                raise InvalidCursorError(str(exc)) from exc
-            if payload.get("kind") != kind or payload.get("fingerprint") != fingerprint:
-                raise InvalidCursorError("cursor does not match request")
-            position = payload.get("position")
-            if not isinstance(position, int) or position < 0:
-                raise InvalidCursorError("cursor does not match request")
-            start = position
+    ) -> tuple[datetime, uuid.UUID] | None:
+        if cursor is None:
+            return None
+        try:
+            payload = decode_cursor(cursor)
+        except CursorError as exc:
+            raise InvalidCursorError(str(exc)) from exc
+        if payload.get("kind") != kind or payload.get("fingerprint") != fingerprint:
+            raise InvalidCursorError("cursor does not match request")
+        updated_at_raw = payload.get("updated_at")
+        document_id_raw = payload.get("document_id")
+        if not isinstance(updated_at_raw, str) or not isinstance(document_id_raw, str):
+            raise InvalidCursorError("cursor does not match request")
+        try:
+            updated_at = datetime.fromisoformat(updated_at_raw)
+            document_id = uuid.UUID(document_id_raw)
+        except ValueError as exc:
+            raise InvalidCursorError("cursor does not match request") from exc
+        return updated_at, document_id
 
-        page = tuple(items[start : start + page_size])
-        next_position = start + len(page)
-        if next_position >= len(items):
-            return page, None
-        return page, encode_cursor(
-            {
-                "kind": kind,
-                "fingerprint": fingerprint,
-                "position": next_position,
-            }
+    def _apply_document_cursor(
+        self,
+        statement,
+        cursor_state: tuple[datetime, uuid.UUID] | None,
+    ):
+        if cursor_state is None:
+            return statement
+        updated_at, document_id = cursor_state
+        return statement.where(
+            or_(
+                Document.updated_at < updated_at,
+                and_(Document.updated_at == updated_at, Document.id < document_id),
+            )
         )
+
+    def _document_page_response(
+        self,
+        *,
+        rows: Sequence[Any],
+        limit: int,
+        kind: str,
+        fingerprint: str,
+    ) -> DocumentListResponse:
+        page_rows = rows[:limit]
+        documents = [self._row_to_document_result(row) for row in page_rows]
+        next_cursor: str | None = None
+        if len(rows) > limit and page_rows:
+            last_row = page_rows[-1]
+            updated_at = cast(datetime, last_row["updated_at"])
+            document_id = cast(uuid.UUID, last_row["document_id"])
+            next_cursor = encode_cursor(
+                {
+                    "kind": kind,
+                    "fingerprint": fingerprint,
+                    "updated_at": updated_at.isoformat(),
+                    "document_id": str(document_id),
+                }
+            )
+        return DocumentListResponse(documents=documents, next_cursor=next_cursor)
 
     def _row_to_document_result(self, row: Any) -> DocumentResult:
         return DocumentResult(

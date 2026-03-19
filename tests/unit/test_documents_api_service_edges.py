@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -38,44 +38,47 @@ def _make_service() -> tuple[DocumentsApiService, MagicMock, MagicMock, MagicMoc
     return service, engine, connection, queue, storage
 
 
-def test_page_items_paginates_and_emits_cursor() -> None:
+def test_decode_document_cursor_accepts_keyset_cursor() -> None:
     service, _, _, _, _ = _make_service()
-    items = [{"item": 1}, {"item": 2}, {"item": 3}]
+    updated_at = datetime(2026, 3, 18, 10, 0, tzinfo=UTC)
     fingerprint = fingerprint_payload({"kind": "documents:list"})
-
-    page, next_cursor = service._page_items(
-        items=items,
-        limit=0,
-        cursor=None,
-        kind="documents:list",
-        fingerprint=fingerprint,
+    cursor = encode_cursor(
+        {
+            "kind": "documents:list",
+            "fingerprint": fingerprint,
+            "updated_at": updated_at.isoformat(),
+            "document_id": "11111111-1111-1111-1111-111111111111",
+        }
     )
 
-    assert page == (items[0],)
-    assert next_cursor is not None
-    assert decode_cursor(next_cursor)["position"] == 1
+    assert service._decode_document_cursor(
+        cursor=cursor,
+        kind="documents:list",
+        fingerprint=fingerprint,
+    ) == (updated_at, UUID("11111111-1111-1111-1111-111111111111"))
 
 
-def test_page_items_rejects_invalid_and_mismatched_cursor() -> None:
+def test_decode_document_cursor_rejects_invalid_and_mismatched_cursor() -> None:
     service, _, _, _, _ = _make_service()
     fingerprint = fingerprint_payload({"kind": "documents:list"})
     bad_kind_cursor = encode_cursor(
-        {"kind": "documents:search", "fingerprint": fingerprint, "position": 1}
+        {
+            "kind": "documents:search",
+            "fingerprint": fingerprint,
+            "updated_at": datetime.now(UTC).isoformat(),
+            "document_id": str(uuid4()),
+        }
     )
 
     with pytest.raises(InvalidCursorError, match="invalid cursor"):
-        service._page_items(
-            items=[{"item": 1}],
-            limit=1,
+        service._decode_document_cursor(
             cursor="not-base64",
             kind="documents:list",
             fingerprint=fingerprint,
         )
 
     with pytest.raises(InvalidCursorError, match="cursor does not match request"):
-        service._page_items(
-            items=[{"item": 1}],
-            limit=1,
+        service._decode_document_cursor(
             cursor=bad_kind_cursor,
             kind="documents:list",
             fingerprint=fingerprint,
@@ -86,36 +89,40 @@ def test_list_documents_returns_paginated_pages() -> None:
     service, _, connection, _, _ = _make_service()
     document_id_1 = uuid4()
     document_id_2 = uuid4()
-    result = _result(
-        all_rows=[
-            {
-                "document_id": document_id_1,
-                "title": "First paper",
-                "authors": ["Ada Lovelace"],
-                "publication_year": 2024,
-                "quant_tags": {"theme": "phase-1"},
-                "current_status": "queued",
-                "active_index_version": "index-v1",
-                "updated_at": datetime.now(UTC),
-            },
-            {
-                "document_id": document_id_2,
-                "title": "Second paper",
-                "authors": [],
-                "publication_year": 2025,
-                "quant_tags": {},
-                "current_status": "ready",
-                "active_index_version": None,
-                "updated_at": datetime.now(UTC),
-            },
-        ]
-    )
-    connection.execute.return_value = result
+    updated_at_1 = datetime(2026, 3, 18, 10, 0, tzinfo=UTC)
+    updated_at_2 = datetime(2026, 3, 18, 9, 0, tzinfo=UTC)
+    rows = [
+        {
+            "document_id": document_id_1,
+            "title": "First paper",
+            "authors": ["Ada Lovelace"],
+            "publication_year": 2024,
+            "quant_tags": {"theme": "phase-1"},
+            "current_status": "queued",
+            "active_index_version": "index-v1",
+            "updated_at": updated_at_1,
+        },
+        {
+            "document_id": document_id_2,
+            "title": "Second paper",
+            "authors": [],
+            "publication_year": 2025,
+            "quant_tags": {},
+            "current_status": "ready",
+            "active_index_version": None,
+            "updated_at": updated_at_2,
+        },
+    ]
+    connection.execute.side_effect = [
+        _result(all_rows=rows[:2]),
+        _result(all_rows=rows[1:2]),
+    ]
 
     first_page = service.list_documents(limit=1)
     assert [document.document_id for document in first_page.documents] == [document_id_1]
     assert first_page.next_cursor is not None
-    assert decode_cursor(first_page.next_cursor)["position"] == 1
+    assert decode_cursor(first_page.next_cursor)["updated_at"] == updated_at_1.isoformat()
+    assert decode_cursor(first_page.next_cursor)["document_id"] == str(document_id_1)
 
     second_page = service.list_documents(limit=1, cursor=first_page.next_cursor)
     assert [document.document_id for document in second_page.documents] == [document_id_2]

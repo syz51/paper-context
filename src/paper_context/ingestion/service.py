@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
 from sqlalchemy import (
@@ -72,6 +73,7 @@ class _PreparedIngestState:
     revision_id: uuid.UUID
     created_at: datetime
     storage_ref: str
+    source_path: Path
     warnings: list[str]
 
 
@@ -193,10 +195,9 @@ class DeterministicIngestProcessor:
             document_id = prepared.document_id
             revision_id = prepared.revision_id
             warnings = list(prepared.warnings)
-            source_path = self._storage.resolve(prepared.storage_ref)
             primary_result = self._primary_parser.parse(
                 filename=prepared.storage_ref,
-                source_path=source_path,
+                source_path=prepared.source_path,
             )
             primary_artifact = self._store_parser_artifact(
                 document_id=document_id,
@@ -216,7 +217,7 @@ class DeterministicIngestProcessor:
                 warnings = _dedupe_warnings([*warnings, "parser_fallback_used"])
                 fallback_result = self._fallback_parser.parse(
                     filename=prepared.storage_ref,
-                    source_path=source_path,
+                    source_path=prepared.source_path,
                 )
                 fallback_artifact = self._store_parser_artifact(
                     document_id=document_id,
@@ -510,6 +511,19 @@ class DeterministicIngestProcessor:
                 warnings=warnings,
             )
             return None
+        try:
+            source_path = self._storage.resolve(source_artifact["storage_ref"])
+        except ValueError:
+            self._mark_failed(
+                connection,
+                ingest_job_id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                failure_code="invalid_source_artifact_ref",
+                failure_message="The source artifact points outside the configured storage root.",
+                warnings=warnings,
+            )
+            return None
 
         self._reset_revision_state(
             connection,
@@ -529,6 +543,7 @@ class DeterministicIngestProcessor:
             revision_id=revision_id,
             created_at=job["created_at"],
             storage_ref=source_artifact["storage_ref"],
+            source_path=source_path,
             warnings=warnings,
         )
 
@@ -1226,9 +1241,14 @@ class DeterministicIngestProcessor:
         result = connection.execute(
             select(
                 exists(
-                    select(1).where(
+                    select(1)
+                    .select_from(newer_job)
+                    .join(Document, Document.id == newer_job.document_id)
+                    .where(
                         newer_job.document_id == document_id,
                         newer_job.id != ingest_job_id,
+                        newer_job.status == "ready",
+                        newer_job.revision_id == Document.active_revision_id,
                         or_(
                             newer_job.created_at > created_at,
                             and_(
@@ -1382,11 +1402,16 @@ class DeterministicIngestProcessor:
             .where(DocumentRevision.id == bindparam("b_revision_id"))
             .values(
                 status="failed",
+                superseded_at=bindparam("b_superseded_at"),
                 updated_at=bindparam("b_now"),
             ),
             {
                 "revision_id": revision_id,
                 "b_revision_id": revision_id,
+                "superseded_at": now if failure_code == "superseded_by_newer_ingest_job" else None,
+                "b_superseded_at": now
+                if failure_code == "superseded_by_newer_ingest_job"
+                else None,
                 "now": now,
                 "b_now": now,
             },
@@ -1569,7 +1594,7 @@ class SyntheticIngestProcessor:
     ) -> None:
         row = (
             connection.execute(
-                select(IngestJob.status, IngestJob.revision_id)
+                select(IngestJob.status, IngestJob.revision_id, IngestJob.created_at)
                 .where(IngestJob.id == context.payload.ingest_job_id)
                 .with_for_update()
             )
@@ -1584,6 +1609,56 @@ class SyntheticIngestProcessor:
 
         revision_id = row["revision_id"]
         now = datetime.now(UTC)
+        if DeterministicIngestProcessor._is_superseded(
+            self,  # type: ignore[arg-type]
+            connection,
+            ingest_job_id=context.payload.ingest_job_id,
+            document_id=context.payload.document_id,
+            created_at=row["created_at"],
+        ):
+            connection.execute(
+                update(IngestJob)
+                .where(IngestJob.id == bindparam("b_ingest_job_id"))
+                .values(
+                    status="failed",
+                    failure_code="superseded_by_newer_ingest_job",
+                    failure_message=(
+                        "A newer ingest job superseded this run before processing began."
+                    ),
+                    started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
+                    finished_at=bindparam("b_now"),
+                ),
+                {
+                    "ingest_job_id": context.payload.ingest_job_id,
+                    "b_ingest_job_id": context.payload.ingest_job_id,
+                    "now": now,
+                    "b_now": now,
+                },
+            )
+            connection.execute(
+                update(DocumentRevision)
+                .where(DocumentRevision.id == bindparam("b_revision_id"))
+                .values(
+                    status="failed",
+                    superseded_at=bindparam("b_now"),
+                    updated_at=bindparam("b_now"),
+                ),
+                {
+                    "revision_id": revision_id,
+                    "b_revision_id": revision_id,
+                    "now": now,
+                    "b_now": now,
+                },
+            )
+            DeterministicIngestProcessor._update_document_status_if_current(
+                self,  # type: ignore[arg-type]
+                connection,
+                document_id=context.payload.document_id,
+                ingest_job_id=context.payload.ingest_job_id,
+                status="failed",
+                now=now,
+            )
+            return
         connection.execute(
             update(IngestJob)
             .where(IngestJob.id == bindparam("b_ingest_job_id"))
@@ -1636,19 +1711,13 @@ class SyntheticIngestProcessor:
             ingest_job_id=context.payload.ingest_job_id,
             now=now,
         )
-        connection.execute(
-            update(Document)
-            .where(Document.id == bindparam("b_document_id"))
-            .values(
-                current_status="ready",
-                updated_at=bindparam("b_now"),
-            ),
-            {
-                "document_id": context.payload.document_id,
-                "b_document_id": context.payload.document_id,
-                "now": now,
-                "b_now": now,
-            },
+        DeterministicIngestProcessor._update_document_status_if_current(
+            self,  # type: ignore[arg-type]
+            connection,
+            document_id=context.payload.document_id,
+            ingest_job_id=context.payload.ingest_job_id,
+            status="ready",
+            now=now,
         )
 
 

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import column, delete, table, text
 from sqlalchemy.engine import Connection
 
 
@@ -33,6 +35,11 @@ class QueueMetrics:
 class PgmqAdapter:
     def __init__(self, queue_name: str) -> None:
         self.queue_name = queue_name
+
+    def _queue_table_name(self) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_]+", self.queue_name):
+            raise ValueError(f"invalid queue name {self.queue_name!r}")
+        return f"pgmq.q_{self.queue_name}"
 
     def send(self, connection: Connection, payload: Any, delay_seconds: int = 0) -> int:
         stmt = text(
@@ -117,6 +124,26 @@ class PgmqAdapter:
             {"queue_name": self.queue_name, "msg_id": msg_id},
         )
         return bool(result.scalar_one())
+
+    def delete_messages_for_ingest_job_id(
+        self, connection: Connection, ingest_job_id: UUID
+    ) -> list[int]:
+        queue_name = self._queue_table_name().split(".", 1)[1]
+        queue = table(
+            queue_name,
+            column("msg_id"),
+            column("message"),
+            schema="pgmq",
+        )
+        stmt = (
+            delete(queue)
+            .where(queue.c.message.op("->>")("ingest_job_id") == str(ingest_job_id))
+            .returning(queue.c.msg_id)
+        )
+        result = connection.execute(
+            stmt,
+        )
+        return [int(msg_id) for msg_id in result.scalars().all()]
 
     def metrics(self, connection: Connection) -> QueueMetrics:
         stmt = text(

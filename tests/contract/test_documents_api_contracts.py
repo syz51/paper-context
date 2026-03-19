@@ -170,6 +170,9 @@ def test_documents_routes_expose_expected_openapi_contract(
     assert schema["paths"]["/documents"]["get"]["responses"]["200"]["content"]["application/json"][
         "schema"
     ] == {"$ref": "#/components/schemas/DocumentListResponse"}
+    assert schema["paths"]["/documents"]["post"]["responses"]["201"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/DocumentUploadResponse"}
     assert schema["paths"]["/documents/{document_id}"]["get"]["responses"]["200"]["content"][
         "application/json"
     ]["schema"] == {"$ref": "#/components/schemas/DocumentResult"}
@@ -182,6 +185,9 @@ def test_documents_routes_expose_expected_openapi_contract(
     assert schema["paths"]["/documents/{document_id}/replace"]["post"]["responses"]["202"][
         "content"
     ]["application/json"]["schema"] == {"$ref": "#/components/schemas/DocumentReplaceResponse"}
+    assert schema["paths"]["/ingest-jobs/{ingest_job_id}"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"] == {"$ref": "#/components/schemas/IngestJobResponse"}
 
 
 def test_document_list_response_matches_golden_contract(
@@ -224,3 +230,117 @@ def test_document_detail_response_matches_golden_contract(
 
     assert payload == expected
     assert DocumentResult.model_validate(payload).model_dump(mode="json") == expected
+
+
+def test_document_upload_response_matches_golden_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    expected = _golden_payload("documents-upload.json")
+    service = _DocumentsApiService(
+        DocumentUploadResponse.model_validate(expected),
+        {},
+    )
+
+    with _build_client(monkeypatch, tmp_path, service) as client:
+        payload = client.post(
+            "/documents",
+            data={"title": "Phase 3 paper"},
+            files={"file": ("paper.pdf", b"%PDF-1.4\nphase-3", "application/pdf")},
+        ).json()
+
+    assert payload == expected
+    assert DocumentUploadResponse.model_validate(payload).model_dump(mode="json") == expected
+
+
+def test_document_replace_response_matches_golden_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    expected = _golden_payload("documents-replace.json")
+    replace_response = DocumentReplaceResponse.model_validate(expected)
+    service = _DocumentsApiService(
+        DocumentUploadResponse(
+            document_id=replace_response.document_id,
+            ingest_job_id=UUID("22222222-2222-2222-2222-222222222222"),
+            status="queued",
+        ),
+        {},
+    )
+    service.replace_response = replace_response
+
+    with _build_client(monkeypatch, tmp_path, service) as client:
+        payload = client.post(
+            f"/documents/{replace_response.document_id}/replace",
+            data={"title": "Replacement"},
+            files={"file": ("paper.pdf", b"%PDF-1.4\nreplacement", "application/pdf")},
+        ).json()
+
+    assert payload == expected
+    assert DocumentReplaceResponse.model_validate(payload).model_dump(mode="json") == expected
+
+
+def test_document_outline_response_matches_golden_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    expected = _golden_payload("document-outline.json")
+    service = _DocumentsApiService(
+        DocumentUploadResponse(
+            document_id=UUID("11111111-1111-1111-1111-111111111111"),
+            ingest_job_id=UUID("22222222-2222-2222-2222-222222222222"),
+            status="queued",
+        ),
+        {},
+    )
+
+    with _build_client(monkeypatch, tmp_path, service) as client:
+        payload = client.get("/documents/11111111-1111-1111-1111-111111111111/outline").json()
+
+    assert payload == expected
+    assert DocumentOutlineResponse.model_validate(payload).model_dump(mode="json") == expected
+
+
+def test_document_tables_response_matches_golden_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    expected = _golden_payload("document-tables.json")
+    service = _DocumentsApiService(
+        DocumentUploadResponse(
+            document_id=UUID("11111111-1111-1111-1111-111111111111"),
+            ingest_job_id=UUID("22222222-2222-2222-2222-222222222222"),
+            status="queued",
+        ),
+        {},
+    )
+
+    with _build_client(monkeypatch, tmp_path, service) as client:
+        payload = client.get("/documents/11111111-1111-1111-1111-111111111111/tables").json()
+
+    assert payload == expected
+    assert DocumentTablesResponse.model_validate(payload).model_dump(mode="json") == expected
+
+
+@pytest.mark.parametrize("golden_name", ["ingest-job-failed.json", "ingest-job-ready.json"])
+def test_ingest_job_response_matches_golden_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    golden_name: str,
+) -> None:
+    expected = _golden_payload(golden_name)
+    job = IngestJobResponse.model_validate(expected)
+    service = _DocumentsApiService(
+        DocumentUploadResponse(
+            document_id=job.document_id,
+            ingest_job_id=job.id,
+            status="queued",
+        ),
+        {job.id: job},
+    )
+
+    with _build_client(monkeypatch, tmp_path, service) as client:
+        payload = client.get(f"/ingest-jobs/{job.id}").json()
+
+    assert payload == expected
+    assert IngestJobResponse.model_validate(payload).model_dump(mode="json") == expected

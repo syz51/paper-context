@@ -14,8 +14,10 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    literal,
     text,
 )
+from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -55,6 +57,25 @@ class Document(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+Index("ix_documents_updated_at_id", Document.updated_at, Document.id)
+Index(
+    "ix_documents_search_fts",
+    func.to_tsvector(
+        "english",
+        func.coalesce(Document.title, "")
+        + literal(" ")
+        + func.coalesce(Document.abstract, "")
+        + literal(" ")
+        + func.translate(
+            func.coalesce(sa_cast(Document.authors, Text), ""),
+            '[]"',
+            "   ",
+        ),
+    ),
+    postgresql_using="gin",
+)
 
 
 class DocumentRevision(Base):

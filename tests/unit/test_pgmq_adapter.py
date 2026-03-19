@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -105,6 +106,23 @@ def test_archive_and_delete_return_bool_flags() -> None:
 
     assert adapter.archive_message(connection, 1) is True
     assert adapter.delete_message(connection, 1) is False
+
+
+def test_delete_messages_for_ingest_job_id_returns_deleted_message_ids() -> None:
+    connection = MagicMock()
+    adapter = PgmqAdapter("document_ingest")
+    result = MagicMock()
+    scalars = MagicMock()
+    ingest_job_id = uuid4()
+    scalars.all.return_value = [11, 12]
+    result.scalars.return_value = scalars
+    connection.execute.return_value = result
+
+    deleted_message_ids = adapter.delete_messages_for_ingest_job_id(connection, ingest_job_id)
+
+    assert deleted_message_ids == [11, 12]
+    stmt = connection.execute.call_args.args[0]
+    assert "DELETE FROM pgmq.q_document_ingest" in str(stmt)
 
 
 def test_queue_metrics_returns_struct() -> None:

@@ -244,8 +244,14 @@ def test_replace_document_supersedes_older_queued_jobs_before_enqueuing_new_job(
     engine.begin.return_value = nullcontext(connection)
     update_result = MagicMock()
     update_result.rowcount = 1
+    superseded_job_id = uuid4()
+    superseded_revision_id = uuid4()
+    superseded_rows = MagicMock()
+    superseded_rows.all.return_value = [(superseded_job_id, superseded_revision_id)]
     connection.execute.side_effect = [
         update_result,
+        superseded_rows,
+        MagicMock(),
         MagicMock(),
         MagicMock(),
         MagicMock(),
@@ -279,6 +285,7 @@ def test_replace_document_supersedes_older_queued_jobs_before_enqueuing_new_job(
         and call.args[1].get("failure_code") == "superseded_by_newer_ingest_job"
     ]
     assert len(supersede_calls) == 1
+    queue.delete_messages_for_ingest_job_id.assert_called_once_with(connection, superseded_job_id)
     queue.enqueue_ingest.assert_called_once()
 
 

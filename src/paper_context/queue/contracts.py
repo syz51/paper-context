@@ -89,6 +89,7 @@ class IngestionQueue:
             payload = IngestQueuePayload.from_message(message)
             if self._ingest_job_is_terminal(conn, ingest_job_id=payload.ingest_job_id):
                 self.archive_message(conn, message.msg_id)
+                self.delete_messages_for_ingest_job_id(conn, payload.ingest_job_id)
                 archived_terminal_message = ClaimedIngestMessage(
                     message=message,
                     payload=payload,
@@ -112,6 +113,9 @@ class IngestionQueue:
 
     def delete_message(self, conn: Connection, message_id: int) -> None:
         self._queue.delete_message(conn, message_id)
+
+    def delete_messages_for_ingest_job_id(self, conn: Connection, ingest_job_id: UUID) -> list[int]:
+        return self._queue.delete_messages_for_ingest_job_id(conn, ingest_job_id)
 
     def queue_metrics(self, conn: Connection) -> QueueMetrics:
         return self._queue.metrics(conn)

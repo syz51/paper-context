@@ -3,12 +3,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.db
-    command:
-      - postgres
-      - -c
-      - pg_partman_bgw.role=paper_context
-      - -c
-      - pg_partman_bgw.dbname=paper_context
     environment:
       POSTGRES_DB: paper_context
       POSTGRES_USER: paper_context

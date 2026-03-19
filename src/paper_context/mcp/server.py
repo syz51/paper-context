@@ -38,6 +38,10 @@ from paper_context.schemas.public import (
 from paper_context.storage.local_fs import LocalFilesystemStorage
 
 
+def _clamp_limit(limit: int, *, maximum: int) -> int:
+    return max(1, min(limit, maximum))
+
+
 def create_server(
     *,
     documents_service: DocumentsApiService | None = None,
@@ -58,7 +62,7 @@ def create_server(
             query=query,
             filters=filters,
             cursor=cursor,
-            limit=limit,
+            limit=_clamp_limit(limit, maximum=100),
         )
 
     @mcp.tool
@@ -72,7 +76,7 @@ def create_server(
             query=query,
             filters=_to_retrieval_filters(filters),
             cursor=cursor,
-            limit=limit,
+            limit=_clamp_limit(limit, maximum=8),
         )
         return PassageSearchResponse(
             query=query,
@@ -91,7 +95,7 @@ def create_server(
             query=query,
             filters=_to_retrieval_filters(filters),
             cursor=cursor,
-            limit=limit,
+            limit=_clamp_limit(limit, maximum=5),
         )
         return TableSearchResponse(
             query=query,
@@ -184,7 +188,7 @@ def create_server(
             query=query,
             filters=_to_retrieval_filters(filters),
             cursor=cursor,
-            limit=limit,
+            limit=_clamp_limit(limit, maximum=8),
         )
         return ContextPackResponse(
             context_pack_id=pack.context_pack_id,

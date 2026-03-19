@@ -27,6 +27,7 @@ from paper_context.ingestion.types import (
     ParsedDocument,
     ParsedParagraph,
     ParsedSection,
+    ParsedTable,
     ParserArtifact,
     ParserResult,
 )
@@ -38,6 +39,7 @@ from paper_context.models import (
     RetrievalIndexRun,
 )
 from paper_context.queue.contracts import IngestionQueue
+from paper_context.retrieval import RetrievalService
 from paper_context.storage.local_fs import LocalFilesystemStorage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
 from paper_context.worker.runner import build_worker
@@ -138,9 +140,14 @@ def _live_pdf_path() -> Path:
     return pdf_path
 
 
-def _make_parsed_document() -> ParsedDocument:
+def _make_parsed_document(
+    *,
+    title: str = "Integration paper",
+    paragraph_text: str = "This integration paragraph is long enough to create a chunk.",
+    tables: list[ParsedTable] | None = None,
+) -> ParsedDocument:
     return ParsedDocument(
-        title="Integration paper",
+        title=title,
         authors=["Ada Lovelace"],
         abstract="A deterministic integration fixture.",
         publication_year=2024,
@@ -155,7 +162,7 @@ def _make_parsed_document() -> ParsedDocument:
                 page_end=1,
                 paragraphs=[
                     ParsedParagraph(
-                        text="This integration paragraph is long enough to create a chunk.",
+                        text=paragraph_text,
                         page_start=1,
                         page_end=1,
                         provenance_offsets={"pages": [1], "charspans": [[0, 58]]},
@@ -163,17 +170,21 @@ def _make_parsed_document() -> ParsedDocument:
                 ],
             )
         ],
-        tables=[],
+        tables=tables or [],
         references=[],
     )
 
 
 def _make_parser_result(
-    gate_status: GateStatus = "pass", *, parser_name: str = "docling"
+    gate_status: GateStatus = "pass",
+    *,
+    parser_name: str = "docling",
+    parsed_document: ParsedDocument | None = None,
 ) -> ParserResult:
     return ParserResult(
         gate_status=gate_status,
-        parsed_document=_make_parsed_document() if gate_status != "fail" else None,
+        parsed_document=(parsed_document if gate_status != "fail" else None)
+        or (_make_parsed_document() if gate_status != "fail" else None),
         artifact=ParserArtifact(
             artifact_type=f"{parser_name}_parse",
             parser=parser_name,
@@ -507,7 +518,7 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
                 connection.execute(
                     text(
                         """
-                        SELECT parser_source, status, is_active
+                        SELECT parser_source, status, is_active, index_version
                         FROM retrieval_index_runs
                         WHERE document_id = :document_id
                         """
@@ -518,6 +529,20 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
                 .one()
             )
             metrics = IngestionQueue(unique_queue_name).queue_metrics(connection)
+
+        with TestClient(create_app()) as client:
+            list_response = client.get("/documents", params={"limit": 10})
+            detail_response = client.get(f"/documents/{document_id}")
+            outline_response = client.get(f"/documents/{document_id}/outline")
+            tables_response = client.get(f"/documents/{document_id}/tables")
+
+        retrieval = RetrievalService(
+            connection_factory=lambda: connection_scope(migrated_postgres_engine),
+            active_index_version=retrieval_index["index_version"],
+        )
+        passages_page = retrieval.search_passages_page(query="attention", limit=3)
+        tables_page = retrieval.search_tables_page(query="attention", limit=3)
+        pack = retrieval.build_context_pack(query="attention", limit=3)
 
         artifacts = list(parser_artifacts)
         primary_artifact = next(artifact for artifact in artifacts if artifact["is_primary"])
@@ -545,6 +570,24 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
         assert retrieval_index["is_active"] is True
         assert retrieval_index["parser_source"] in {"docling", "pdfplumber"}
         assert primary_artifact["parser"] == retrieval_index["parser_source"]
+        assert list_response.status_code == 200
+        assert any(
+            item["document_id"] == str(document_id) for item in list_response.json()["documents"]
+        )
+        assert detail_response.status_code == 200
+        assert detail_response.json()["document_id"] == str(document_id)
+        assert outline_response.status_code == 200
+        assert outline_response.json()["document_id"] == str(document_id)
+        assert tables_response.status_code == 200
+        assert tables_response.json()["document_id"] == str(document_id)
+        assert passages_page.index_version == retrieval_index["index_version"]
+        assert len(passages_page.items) > 0
+        assert all(
+            item.index_version == retrieval_index["index_version"] for item in passages_page.items
+        )
+        assert tables_page.index_version == retrieval_index["index_version"]
+        assert pack.provenance.active_index_version == retrieval_index["index_version"]
+        assert len(pack.passages) > 0
         assert (storage_root / source_artifact["storage_ref"]).is_file()
         assert (storage_root / primary_artifact["storage_ref"]).is_file()
         assert metrics.queue_length == 0
@@ -696,6 +739,21 @@ def test_documents_replace_enqueues_new_job_and_preserves_prior_source_pdf(
             .mappings()
             .one()
         )
+        revisions = (
+            connection.execute(
+                text(
+                    """
+                    SELECT revision_number, status, superseded_at
+                    FROM document_revisions
+                    WHERE document_id = :document_id
+                    ORDER BY revision_number
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .all()
+        )
         jobs = (
             connection.execute(
                 text(
@@ -744,7 +802,150 @@ def test_documents_replace_enqueues_new_job_and_preserves_prior_source_pdf(
     assert latest_revision["title"] == "Replacement title"
     assert latest_revision["status"] == "queued"
     assert latest_revision["revision_number"] == 2
+    assert revisions[0]["revision_number"] == 1
+    assert revisions[0]["status"] == "failed"
+    assert revisions[0]["superseded_at"] is not None
     assert all((storage_root / row["storage_ref"]).exists() for row in source_pdfs)
+
+
+def test_documents_replace_worker_promotes_new_revision_and_hides_old_retrieval_state(
+    migrated_postgres_engine,
+    unique_queue_name: str,
+    tmp_path: Path,
+) -> None:
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            text("SELECT pgmq.create(:queue_name)"),
+            {"queue_name": unique_queue_name},
+        )
+
+    queue = IngestionQueue(unique_queue_name)
+    storage_root = tmp_path / "artifacts"
+    initial = _create_uploaded_document(
+        migrated_postgres_engine,
+        queue,
+        storage_root,
+        title="Original upload title",
+    )
+    initial_processor, _, _ = _build_processor(
+        storage_root,
+        primary_result=_make_parser_result(
+            parsed_document=_make_parsed_document(
+                title="Original parsed title",
+                paragraph_text="Original unique passage for replacement flow.",
+            )
+        ),
+    )
+    initial_worker = _make_worker(migrated_postgres_engine, queue, initial_processor, vt_seconds=1)
+    handled_initial = initial_worker.run_once()
+
+    assert handled_initial is not None
+    assert handled_initial.payload.ingest_job_id == initial.ingest_job_id
+
+    service = DocumentsApiService(
+        engine=migrated_postgres_engine,
+        queue=queue,
+        storage=LocalFilesystemStorage(storage_root),
+        max_upload_bytes=5 * 1024 * 1024,
+    )
+    replacement = service.replace_document(
+        initial.document_id,
+        filename="replacement.pdf",
+        content_type="application/pdf",
+        upload=BytesIO(b"%PDF-1.4\nreplacement"),
+        title="Replacement upload title",
+    )
+    replacement_processor, _, _ = _build_processor(
+        storage_root,
+        primary_result=_make_parser_result(
+            parsed_document=_make_parsed_document(
+                title="Replacement parsed title",
+                paragraph_text="Replacement unique passage for replacement flow.",
+                tables=[
+                    ParsedTable(
+                        section_key="intro",
+                        caption="Replacement metrics",
+                        headers=["A"],
+                        rows=[["1"]],
+                        page_start=1,
+                        page_end=1,
+                    )
+                ],
+            )
+        ),
+    )
+    replacement_worker = _make_worker(
+        migrated_postgres_engine,
+        queue,
+        replacement_processor,
+        vt_seconds=1,
+    )
+    handled_replacement = replacement_worker.run_once()
+
+    assert handled_replacement is not None
+    assert handled_replacement.payload.ingest_job_id == replacement.ingest_job_id
+
+    retrieval = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v1",
+    )
+    original_passages = retrieval.search_passages(
+        query="Original unique passage",
+        limit=5,
+    )
+    replacement_passages = retrieval.search_passages(
+        query="Replacement unique passage",
+        limit=5,
+    )
+    replacement_tables = retrieval.search_tables(query="Replacement metrics", limit=5)
+
+    with migrated_postgres_engine.begin() as connection:
+        document = (
+            connection.execute(
+                text(
+                    """
+                    SELECT title, current_status, active_revision_id
+                    FROM documents
+                    WHERE id = :document_id
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .one()
+        )
+        revisions = (
+            connection.execute(
+                text(
+                    """
+                    SELECT revision_number, status, title, superseded_at, activated_at
+                    FROM document_revisions
+                    WHERE document_id = :document_id
+                    ORDER BY revision_number
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .all()
+        )
+
+    assert document["current_status"] == "ready"
+    assert document["title"] == "Replacement parsed title"
+    assert document["active_revision_id"] is not None
+    assert len(revisions) == 2
+    assert revisions[0]["revision_number"] == 1
+    assert revisions[0]["status"] == "ready"
+    assert revisions[0]["superseded_at"] is not None
+    assert revisions[1]["revision_number"] == 2
+    assert revisions[1]["status"] == "ready"
+    assert revisions[1]["title"] == "Replacement parsed title"
+    assert revisions[1]["activated_at"] is not None
+    assert original_passages == []
+    assert len(replacement_passages) == 1
+    assert replacement_passages[0].document_id == initial.document_id
+    assert len(replacement_tables) == 1
+    assert replacement_tables[0].caption == "Replacement metrics"
 
 
 def test_replay_after_parser_artifact_crash_is_idempotent(

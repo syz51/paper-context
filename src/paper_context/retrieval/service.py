@@ -9,7 +9,18 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
-from sqlalchemy import and_, bindparam, column, delete, func, insert, or_, select, table, update
+from sqlalchemy import (
+    and_,
+    bindparam,
+    column,
+    delete,
+    func,
+    insert,
+    or_,
+    select,
+    table,
+    update,
+)
 from sqlalchemy import cast as sa_cast
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -509,56 +520,72 @@ class DocumentRetrievalIndexer:
         revision_id: uuid.UUID,
         batch_size: int,
     ) -> Iterator[list[_PassageIndexRow]]:
-        offset = 0
+        last_key: tuple[int, int, uuid.UUID] | None = None
         while True:
+            statement = (
+                select(
+                    DocumentPassage.id.label("passage_id"),
+                    DocumentPassage.document_id,
+                    DocumentPassage.revision_id,
+                    DocumentPassage.section_id,
+                    DocumentSection.ordinal.label("section_ordinal"),
+                    DocumentPassage.chunk_ordinal,
+                    DocumentPassage.body_text,
+                    DocumentPassage.contextualized_text,
+                    DocumentPassage.page_start,
+                    DocumentPassage.page_end,
+                    func.coalesce(
+                        DocumentRevision.title,
+                        Document.title,
+                        "Untitled document",
+                    ).label("document_title"),
+                    func.coalesce(
+                        DocumentRevision.authors,
+                        Document.authors,
+                        sa_cast([], JSONB),
+                    ).label("authors"),
+                    func.coalesce(DocumentRevision.abstract, Document.abstract).label("abstract"),
+                    func.coalesce(
+                        DocumentRevision.publication_year,
+                        Document.publication_year,
+                    ).label("publication_year"),
+                    func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                        "section_path"
+                    ),
+                )
+                .select_from(DocumentPassage)
+                .join(Document, Document.id == DocumentPassage.document_id)
+                .outerjoin(DocumentRevision, DocumentRevision.id == DocumentPassage.revision_id)
+                .join(DocumentSection, DocumentSection.id == DocumentPassage.section_id)
+                .where(
+                    DocumentPassage.document_id == document_id,
+                    DocumentPassage.revision_id == revision_id,
+                )
+            )
+            if last_key is not None:
+                last_section_ordinal, last_chunk_ordinal, last_passage_id = last_key
+                statement = statement.where(
+                    or_(
+                        DocumentSection.ordinal > last_section_ordinal,
+                        and_(
+                            DocumentSection.ordinal == last_section_ordinal,
+                            or_(
+                                DocumentPassage.chunk_ordinal > last_chunk_ordinal,
+                                and_(
+                                    DocumentPassage.chunk_ordinal == last_chunk_ordinal,
+                                    DocumentPassage.id > last_passage_id,
+                                ),
+                            ),
+                        ),
+                    )
+                )
             rows = (
                 connection.execute(
-                    select(
-                        DocumentPassage.id.label("passage_id"),
-                        DocumentPassage.document_id,
-                        DocumentPassage.revision_id,
-                        DocumentPassage.section_id,
-                        DocumentPassage.chunk_ordinal,
-                        DocumentPassage.body_text,
-                        DocumentPassage.contextualized_text,
-                        DocumentPassage.page_start,
-                        DocumentPassage.page_end,
-                        func.coalesce(
-                            DocumentRevision.title,
-                            Document.title,
-                            "Untitled document",
-                        ).label("document_title"),
-                        func.coalesce(
-                            DocumentRevision.authors,
-                            Document.authors,
-                            sa_cast([], JSONB),
-                        ).label("authors"),
-                        func.coalesce(DocumentRevision.abstract, Document.abstract).label(
-                            "abstract"
-                        ),
-                        func.coalesce(
-                            DocumentRevision.publication_year,
-                            Document.publication_year,
-                        ).label("publication_year"),
-                        func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
-                            "section_path"
-                        ),
-                    )
-                    .select_from(DocumentPassage)
-                    .join(Document, Document.id == DocumentPassage.document_id)
-                    .outerjoin(DocumentRevision, DocumentRevision.id == DocumentPassage.revision_id)
-                    .join(DocumentSection, DocumentSection.id == DocumentPassage.section_id)
-                    .where(
-                        DocumentPassage.document_id == document_id,
-                        DocumentPassage.revision_id == revision_id,
-                    )
-                    .order_by(
+                    statement.order_by(
                         DocumentSection.ordinal,
                         DocumentPassage.chunk_ordinal,
                         DocumentPassage.id,
-                    )
-                    .limit(batch_size)
-                    .offset(offset)
+                    ).limit(batch_size)
                 )
                 .mappings()
                 .all()
@@ -566,7 +593,12 @@ class DocumentRetrievalIndexer:
             if not rows:
                 return
             yield [self._row_to_passage_index_row(row) for row in rows]
-            offset += len(rows)
+            last_row = rows[-1]
+            last_key = (
+                cast(int, last_row["section_ordinal"]),
+                cast(int, last_row["chunk_ordinal"]),
+                cast(uuid.UUID, last_row["passage_id"]),
+            )
 
     def _iter_table_row_batches(
         self,
@@ -576,49 +608,59 @@ class DocumentRetrievalIndexer:
         revision_id: uuid.UUID,
         batch_size: int,
     ) -> Iterator[list[_TableIndexRow]]:
-        offset = 0
+        last_key: tuple[int, uuid.UUID] | None = None
         while True:
+            statement = (
+                select(
+                    DocumentTable.id.label("table_id"),
+                    DocumentTable.document_id,
+                    DocumentTable.revision_id,
+                    DocumentTable.section_id,
+                    DocumentSection.ordinal.label("section_ordinal"),
+                    DocumentTable.caption,
+                    DocumentTable.table_type,
+                    func.coalesce(DocumentTable.headers_json, sa_cast([], JSONB)).label(
+                        "headers_json"
+                    ),
+                    func.coalesce(DocumentTable.rows_json, sa_cast([], JSONB)).label("rows_json"),
+                    DocumentTable.page_start,
+                    DocumentTable.page_end,
+                    func.coalesce(
+                        DocumentRevision.title,
+                        Document.title,
+                        "Untitled document",
+                    ).label("document_title"),
+                    func.coalesce(
+                        DocumentRevision.publication_year,
+                        Document.publication_year,
+                    ).label("publication_year"),
+                    func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                        "section_path"
+                    ),
+                )
+                .select_from(DocumentTable)
+                .join(Document, Document.id == DocumentTable.document_id)
+                .outerjoin(DocumentRevision, DocumentRevision.id == DocumentTable.revision_id)
+                .join(DocumentSection, DocumentSection.id == DocumentTable.section_id)
+                .where(
+                    DocumentTable.document_id == document_id,
+                    DocumentTable.revision_id == revision_id,
+                )
+            )
+            if last_key is not None:
+                last_section_ordinal, last_table_id = last_key
+                statement = statement.where(
+                    or_(
+                        DocumentSection.ordinal > last_section_ordinal,
+                        and_(
+                            DocumentSection.ordinal == last_section_ordinal,
+                            DocumentTable.id > last_table_id,
+                        ),
+                    )
+                )
             rows = (
                 connection.execute(
-                    select(
-                        DocumentTable.id.label("table_id"),
-                        DocumentTable.document_id,
-                        DocumentTable.revision_id,
-                        DocumentTable.section_id,
-                        DocumentTable.caption,
-                        DocumentTable.table_type,
-                        func.coalesce(DocumentTable.headers_json, sa_cast([], JSONB)).label(
-                            "headers_json"
-                        ),
-                        func.coalesce(DocumentTable.rows_json, sa_cast([], JSONB)).label(
-                            "rows_json"
-                        ),
-                        DocumentTable.page_start,
-                        DocumentTable.page_end,
-                        func.coalesce(
-                            DocumentRevision.title,
-                            Document.title,
-                            "Untitled document",
-                        ).label("document_title"),
-                        func.coalesce(
-                            DocumentRevision.publication_year,
-                            Document.publication_year,
-                        ).label("publication_year"),
-                        func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
-                            "section_path"
-                        ),
-                    )
-                    .select_from(DocumentTable)
-                    .join(Document, Document.id == DocumentTable.document_id)
-                    .outerjoin(DocumentRevision, DocumentRevision.id == DocumentTable.revision_id)
-                    .join(DocumentSection, DocumentSection.id == DocumentTable.section_id)
-                    .where(
-                        DocumentTable.document_id == document_id,
-                        DocumentTable.revision_id == revision_id,
-                    )
-                    .order_by(DocumentSection.ordinal, DocumentTable.id)
-                    .limit(batch_size)
-                    .offset(offset)
+                    statement.order_by(DocumentSection.ordinal, DocumentTable.id).limit(batch_size)
                 )
                 .mappings()
                 .all()
@@ -626,7 +668,11 @@ class DocumentRetrievalIndexer:
             if not rows:
                 return
             yield [self._row_to_table_index_row(row) for row in rows]
-            offset += len(rows)
+            last_row = rows[-1]
+            last_key = (
+                cast(int, last_row["section_ordinal"]),
+                cast(uuid.UUID, last_row["table_id"]),
+            )
 
     def _insert_passage_asset_batch(
         self,
@@ -892,7 +938,7 @@ class RetrievalService:
                     connection,
                     query=query,
                     filters=filters,
-                    limit=PASSAGE_FUSED_CANDIDATES,
+                    limit=None,
                     filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
                 )
@@ -942,7 +988,7 @@ class RetrievalService:
                     connection,
                     query=query,
                     filters=filters,
-                    limit=TABLE_FUSED_CANDIDATES,
+                    limit=None,
                     filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
                 )
@@ -992,7 +1038,7 @@ class RetrievalService:
                     connection,
                     query=query,
                     filters=filters,
-                    limit=PASSAGE_FUSED_CANDIDATES,
+                    limit=None,
                     filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
                 )
@@ -1121,8 +1167,8 @@ class RetrievalService:
                         DocumentRevision,
                         _revision_match(DocumentRevision.id, DocumentTable.revision_id),
                     )
-                    .outerjoin(RetrievalIndexRun, and_(*run_join_conditions))
-                    .outerjoin(IngestJob, IngestJob.id == RetrievalIndexRun.ingest_job_id)
+                    .join(RetrievalIndexRun, and_(*run_join_conditions))
+                    .join(IngestJob, IngestJob.id == RetrievalIndexRun.ingest_job_id)
                     .where(
                         DocumentTable.id == table_id,
                         DocumentTable.revision_id == Document.active_revision_id,
@@ -1217,8 +1263,8 @@ class RetrievalService:
                         DocumentRevision,
                         _revision_match(DocumentRevision.id, DocumentPassage.revision_id),
                     )
-                    .outerjoin(RetrievalIndexRun, and_(*run_join_conditions))
-                    .outerjoin(IngestJob, IngestJob.id == RetrievalIndexRun.ingest_job_id)
+                    .join(RetrievalIndexRun, and_(*run_join_conditions))
+                    .join(IngestJob, IngestJob.id == RetrievalIndexRun.ingest_job_id)
                     .where(
                         DocumentPassage.id == passage_id,
                         DocumentPassage.revision_id == Document.active_revision_id,
@@ -1319,7 +1365,7 @@ class RetrievalService:
         *,
         query: str,
         filters: RetrievalFilters,
-        limit: int,
+        limit: int | None,
         filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
         active_runs: _ActiveRunSelection | None = None,
     ) -> list[PassageResult]:
@@ -1356,10 +1402,10 @@ class RetrievalService:
         fused = self._fuse_candidates(
             sparse_candidates,
             dense_candidates,
-            fused_limit=PASSAGE_FUSED_CANDIDATES,
+            fused_limit=None if limit is None else PASSAGE_FUSED_CANDIDATES,
         )
         reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
-        return [self._candidate_to_passage_result(candidate) for candidate in reranked[:limit]]
+        return [self._candidate_to_passage_result(candidate) for candidate in reranked]
 
     def _search_tables_with_connection(
         self,
@@ -1367,7 +1413,7 @@ class RetrievalService:
         *,
         query: str,
         filters: RetrievalFilters,
-        limit: int,
+        limit: int | None,
         filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
         active_runs: _ActiveRunSelection | None = None,
     ) -> list[TableResult]:
@@ -1397,10 +1443,10 @@ class RetrievalService:
         fused = self._fuse_candidates(
             sparse_candidates,
             [],
-            fused_limit=TABLE_FUSED_CANDIDATES,
+            fused_limit=None if limit is None else TABLE_FUSED_CANDIDATES,
         )
         reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
-        return [self._candidate_to_table_result(candidate) for candidate in reranked[:limit]]
+        return [self._candidate_to_table_result(candidate) for candidate in reranked]
 
     def _resolve_active_run_selection(
         self,
@@ -1452,6 +1498,16 @@ class RetrievalService:
             )
         )
         rows = connection.execute(statement, params).mappings().all()
+        if not rows:
+            return _ActiveRunSelection(run_ids=(), index_versions=())
+        if self._active_index_version is None:
+            selected_index_version = cast(str, rows[0]["index_version"])
+            rows = [row for row in rows if row["index_version"] == selected_index_version]
+            run_ids = tuple(cast(uuid.UUID, row["id"]) for row in rows)
+            return _ActiveRunSelection(
+                run_ids=run_ids,
+                index_versions=(selected_index_version,),
+            )
         run_ids = tuple(cast(uuid.UUID, row["id"]) for row in rows)
         index_versions = tuple(dict.fromkeys(cast(str, row["index_version"]) for row in rows))
         return _ActiveRunSelection(run_ids=run_ids, index_versions=index_versions)
@@ -1811,7 +1867,7 @@ class RetrievalService:
         sparse_candidates: list[_Candidate],
         dense_candidates: list[_Candidate],
         *,
-        fused_limit: int,
+        fused_limit: int | None,
     ) -> list[_Candidate]:
         merged: dict[uuid.UUID, _Candidate] = {}
         for rank, candidate in enumerate(sparse_candidates, start=1):
@@ -1826,29 +1882,30 @@ class RetrievalService:
             merged.values(),
             key=lambda candidate: (-candidate.fused_score, str(candidate.entity_id)),
         )
-        return fused[:fused_limit]
+        return fused if fused_limit is None else fused[:fused_limit]
 
     def _rerank_candidates(
         self,
         *,
         query: str,
         candidates: list[_Candidate],
-        limit: int,
+        limit: int | None,
     ) -> list[_Candidate]:
         if not candidates:
             return []
         if self._reranker_client is None:
             for candidate in candidates:
                 candidate.score = candidate.fused_score
-            return sorted(
+            ranked = sorted(
                 candidates,
                 key=lambda candidate: (-candidate.score, str(candidate.entity_id)),
-            )[:limit]
+            )
+            return ranked if limit is None else ranked[:limit]
 
         reranked_items = self._reranker_client.rerank(
             query=query,
             documents=[candidate.rerank_text for candidate in candidates],
-            top_n=min(limit, len(candidates)),
+            top_n=None if limit is None else min(limit, len(candidates)),
         )
         ordered: list[_Candidate] = []
         seen_indexes: set[int] = set()
@@ -1866,7 +1923,7 @@ class RetrievalService:
             candidate.score = candidate.fused_score
         ranked = [*ordered, *remainder]
         ranked.sort(key=lambda candidate: (-candidate.score, str(candidate.entity_id)))
-        return ranked[:limit]
+        return ranked if limit is None else ranked[:limit]
 
     def _row_to_passage_candidate(self, row: Any) -> _Candidate:
         warnings = tuple(cast(list[str], row["warnings"] or []))

@@ -20,7 +20,7 @@ from paper_context.models import (
 from paper_context.retrieval import DocumentRetrievalIndexer, RetrievalService
 from paper_context.retrieval import service as retrieval_service_module
 from paper_context.retrieval.clients import EmbeddingBatch
-from paper_context.retrieval.types import MixedIndexVersionError, RerankItem, RetrievalFilters
+from paper_context.retrieval.types import RerankItem, RetrievalFilters
 
 pytestmark = [
     pytest.mark.integration,
@@ -1332,14 +1332,15 @@ def test_search_passages_and_tables_include_all_active_versions_during_rollout(
 
     passages = service.search_passages(query="rollout keyword")
     tables = service.search_tables(query="rollout keyword")
+    pack = service.build_context_pack(query="rollout keyword")
 
-    assert {result.document_id for result in passages} == {newer_document_id, older_document_id}
-    assert {result.index_version for result in passages} == {"mvp-v1", "mvp-v2"}
-    assert {result.document_id for result in tables} == {newer_document_id, older_document_id}
-    assert {result.index_version for result in tables} == {"mvp-v1", "mvp-v2"}
-
-    with pytest.raises(MixedIndexVersionError, match="mixed index versions"):
-        service.build_context_pack(query="rollout keyword")
+    assert {result.document_id for result in passages} == {newer_document_id}
+    assert {result.index_version for result in passages} == {"mvp-v2"}
+    assert {result.document_id for result in tables} == {newer_document_id}
+    assert {result.index_version for result in tables} == {"mvp-v2"}
+    assert pack.provenance.active_index_version == "mvp-v2"
+    assert {result.document_id for result in pack.passages} == {newer_document_id}
+    assert {result.index_version for result in pack.passages} == {"mvp-v2"}
 
 
 def test_search_passages_dense_path_uses_embeddings(
@@ -2121,3 +2122,67 @@ def test_phase3_retrieval_helpers_support_cursor_table_detail_and_passage_contex
         "sibling",
     ]
     assert context.warnings == ("parser_fallback_used",)
+
+
+def test_detail_helpers_require_active_retrieval_provenance(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    passage_id = uuid4()
+    table_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Provenance paper",
+            created_at=now,
+            updated_at=now,
+        )
+        _insert_revisioned_section(
+            connection,
+            section_id=section_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            heading="Methods",
+            heading_path=["Methods"],
+        )
+        _insert_revisioned_passage(
+            connection,
+            passage_id=passage_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            section_id=section_id,
+            chunk_ordinal=1,
+            body_text="Shared provenance keyword.",
+            contextualized_text="Shared provenance keyword.",
+            token_count=3,
+            page_start=1,
+            page_end=1,
+            provenance_offsets={"pages": [1], "charspans": [[0, 26]]},
+        )
+        _insert_revisioned_table(
+            connection,
+            table_id=table_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            section_id=section_id,
+            caption="Provenance table",
+            headers_json=["A"],
+            rows_json=[["1"]],
+            page_start=1,
+            page_end=1,
+        )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+    )
+
+    assert service.get_table(table_id=table_id) is None
+    assert service.get_passage_context(passage_id=passage_id) is None

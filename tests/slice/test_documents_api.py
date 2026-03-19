@@ -378,6 +378,25 @@ def test_document_list_invalid_cursor_returns_400(
     assert response.json() == {"detail": "invalid cursor"}
 
 
+def test_document_list_limit_above_route_bound_returns_422(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = _DocumentsApiService(
+        DocumentUploadResponse(
+            document_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            ingest_job_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            status="queued",
+        ),
+        {},
+    )
+
+    with _patch_documents_app(monkeypatch, tmp_path, service) as client:
+        response = client.get("/documents", params={"limit": 101})
+
+    assert response.status_code == 422
+
+
 def test_post_document_replace_creates_new_ingest_job(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

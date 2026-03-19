@@ -13,6 +13,17 @@ class LocalFilesystemStorage(StorageInterface):
     def __init__(self, root_path: Path) -> None:
         self._root_path = root_path
 
+    def _resolve_storage_path(self, storage_ref: str) -> Path:
+        if Path(storage_ref).is_absolute():
+            raise ValueError(f"storage ref {storage_ref!r} escapes storage root")
+        root = self._root_path.resolve(strict=False)
+        resolved_target = (root / Path(storage_ref)).resolve(strict=False)
+        try:
+            resolved_target.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"storage ref {storage_ref!r} escapes storage root") from exc
+        return resolved_target
+
     def ensure_root(self) -> None:
         self._root_path.mkdir(parents=True, exist_ok=True)
 
@@ -27,8 +38,8 @@ class LocalFilesystemStorage(StorageInterface):
         max_size_bytes: int | None = None,
         chunk_size: int = 1024 * 1024,
     ) -> StorageArtifact:
+        target = self._resolve_storage_path(relative_path)
         self.ensure_root()
-        target = self._root_path / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
         temp_target = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
         checksum = hashlib.sha256()
@@ -59,23 +70,24 @@ class LocalFilesystemStorage(StorageInterface):
             raise
 
         return StorageArtifact(
-            storage_ref=str(target.relative_to(self._root_path)),
+            storage_ref=str(target.relative_to(self._root_path.resolve(strict=False))),
             checksum=checksum.hexdigest(),
             size_bytes=size_bytes,
         )
 
     def resolve(self, storage_ref: str) -> Path:
-        return self._root_path / storage_ref
+        return self._resolve_storage_path(storage_ref)
 
     def delete(self, storage_ref: str) -> None:
-        target = self.resolve(storage_ref)
+        target = self._resolve_storage_path(storage_ref)
         try:
             target.unlink()
         except FileNotFoundError:
             return
 
         parent = target.parent
-        while parent != self._root_path and parent.exists():
+        root = self._root_path.resolve(strict=False)
+        while parent != root and parent.exists():
             try:
                 parent.rmdir()
             except OSError:
