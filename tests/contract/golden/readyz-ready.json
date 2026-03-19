@@ -4,5 +4,17 @@
   "version": "0.1.0",
   "database_ready": true,
   "storage_root": "",
-  "queue_name": "document_ingest"
+  "storage_ready": true,
+  "queue_name": "document_ingest",
+  "queue_ready": true,
+  "queue_metrics": {
+    "queue_name": "document_ingest",
+    "queue_length": 3,
+    "queue_visible_length": 2,
+    "newest_msg_age_sec": 5,
+    "oldest_msg_age_sec": 12,
+    "total_messages": 3,
+    "scrape_time": "2026-03-19T08:00:00Z"
+  },
+  "operation_timings": []
 }

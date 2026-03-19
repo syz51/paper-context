@@ -31,6 +31,7 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    # Migrate must finish before the app starts so the HTTP surface only boots on a ready schema.
     command:
       - python
       - -m
@@ -49,7 +50,7 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
-      - ./var/artifacts:/var/lib/paper-context/artifacts
+      - paper_context_artifacts:/var/lib/paper-context/artifacts
 
   worker:
     build:
@@ -67,6 +68,7 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+    # Keep the worker behind migrations and the app health check so runtime state is booted in order.
     command:
       - python
       - -m
@@ -74,7 +76,7 @@ services:
       - worker
     volumes:
       - .:/app
-      - ./var/artifacts:/var/lib/paper-context/artifacts
+      - paper_context_artifacts:/var/lib/paper-context/artifacts
 
   migrate:
     build:
@@ -87,6 +89,7 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # The migrate runner is intentionally isolated and should complete before app or worker start.
     command:
       - alembic
       - upgrade
@@ -94,3 +97,4 @@ services:
 
 volumes:
   postgres_data:
+  paper_context_artifacts:

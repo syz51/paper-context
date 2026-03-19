@@ -108,6 +108,17 @@ def build_worker() -> IngestWorker:
 def run_worker(*, once: bool = False) -> None:
     settings = get_settings()
     worker = build_worker()
+    logger.info(
+        "worker started",
+        extra={
+            "structured_data": {
+                "event": "worker.started",
+                "once": once,
+                "queue_name": settings.queue.name,
+                "vt_seconds": settings.queue.visibility_timeout_seconds,
+            }
+        },
+    )
     while True:
         try:
             handled = worker.run_once()
@@ -169,6 +180,7 @@ def run_synthetic_job_verification() -> dict[str, Any]:
         "queue_metrics": {
             "queue_name": metrics.queue_name,
             "queue_length": metrics.queue_length,
+            "queue_visible_length": metrics.queue_visible_length,
             "total_messages": metrics.total_messages,
         },
     }

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ from paper_context.models import (
     IngestJob,
     RetrievalIndexRun,
 )
+from paper_context.observability import observe_operation
 from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
 from paper_context.retrieval import DocumentRetrievalIndexer
@@ -93,6 +95,8 @@ class IngestJobContext:
 
 ConnectionFactory = Callable[..., AbstractContextManager[Connection]]
 
+logger = logging.getLogger(__name__)
+
 
 class LeaseExtender:
     def __init__(
@@ -127,8 +131,13 @@ class LeaseExtender:
 
     def extend(self, vt_seconds: int | None = None) -> None:
         vt_seconds = vt_seconds or self._default_vt_seconds
-        with self._open_connection() as connection:
-            self._queue_adapter.extend_lease(connection, self._message.msg_id, vt_seconds)
+        with observe_operation(
+            "queue.lease_renewal",
+            logger=logger,
+            fields={"message_id": self._message.msg_id, "vt_seconds": vt_seconds},
+        ):
+            with self._open_connection() as connection:
+                self._queue_adapter.extend_lease(connection, self._message.msg_id, vt_seconds)
 
 
 class IngestExecutionDeferred(RuntimeError):
@@ -189,6 +198,11 @@ class DeterministicIngestProcessor:
         context: IngestJobContext,
         lease: LeaseExtender,
     ) -> None:
+        log_fields = {
+            "ingest_job_id": str(context.payload.ingest_job_id),
+            "document_id": str(context.payload.document_id),
+            "message_id": context.message.msg_id,
+        }
         if not self._try_claim_processing_lock(
             connection,
             ingest_job_id=context.payload.ingest_job_id,
@@ -210,10 +224,17 @@ class DeterministicIngestProcessor:
             document_id = prepared.document_id
             revision_id = prepared.revision_id
             warnings = list(prepared.warnings)
-            primary_result = self._primary_parser.parse(
-                filename=prepared.storage_ref,
-                source_path=prepared.source_path,
-            )
+            stage_timings: dict[str, float | int] = {}
+            with observe_operation(
+                "ingest.parse",
+                logger=logger,
+                fields={**log_fields, "parser": getattr(self._primary_parser, "name", "primary")},
+            ) as parse_timing:
+                primary_result = self._primary_parser.parse(
+                    filename=prepared.storage_ref,
+                    source_path=prepared.source_path,
+                )
+            _accumulate_stage_timing(stage_timings, "parsing_seconds", parse_timing)
             primary_artifact = self._store_parser_artifact(
                 document_id=document_id,
                 revision_id=revision_id,
@@ -230,10 +251,20 @@ class DeterministicIngestProcessor:
             warnings = _dedupe_warnings([*warnings, *primary_result.warnings])
             if primary_result.gate_status == "degraded":
                 warnings = _dedupe_warnings([*warnings, "parser_fallback_used"])
-                fallback_result = self._fallback_parser.parse(
-                    filename=prepared.storage_ref,
-                    source_path=prepared.source_path,
-                )
+                with observe_operation(
+                    "ingest.parse",
+                    logger=logger,
+                    fields={
+                        **log_fields,
+                        "parser": getattr(self._fallback_parser, "name", "fallback"),
+                        "fallback": True,
+                    },
+                ) as fallback_parse_timing:
+                    fallback_result = self._fallback_parser.parse(
+                        filename=prepared.storage_ref,
+                        source_path=prepared.source_path,
+                    )
+                _accumulate_stage_timing(stage_timings, "parsing_seconds", fallback_parse_timing)
                 fallback_artifact = self._store_parser_artifact(
                     document_id=document_id,
                     revision_id=revision_id,
@@ -285,6 +316,7 @@ class DeterministicIngestProcessor:
                                 )
                             ),
                             warnings=warnings,
+                            stage_timings=stage_timings,
                         )
                     return
                 active_result = fallback_result
@@ -319,6 +351,7 @@ class DeterministicIngestProcessor:
                             or "Docling could not recover stable passages with provenance."
                         ),
                         warnings=warnings,
+                        stage_timings=stage_timings,
                     )
                 return
 
@@ -369,13 +402,24 @@ class DeterministicIngestProcessor:
                     revision_id=revision_id,
                     status="normalizing",
                     warnings=warnings,
+                    stage_timings=stage_timings,
                 )
-                section_ids = self._normalize_document(
-                    connection,
-                    document_id=document_id,
-                    revision_id=revision_id,
-                    parsed_document=parsed_document,
-                    artifact_id=active_artifact_id,
+                with observe_operation(
+                    "ingest.normalization",
+                    logger=logger,
+                    fields=log_fields,
+                ) as normalization_timing:
+                    section_ids = self._normalize_document(
+                        connection,
+                        document_id=document_id,
+                        revision_id=revision_id,
+                        parsed_document=parsed_document,
+                        artifact_id=active_artifact_id,
+                    )
+                _accumulate_stage_timing(
+                    stage_timings,
+                    "normalization_seconds",
+                    normalization_timing,
                 )
                 self._apply_document_metadata(
                     connection,
@@ -394,9 +438,16 @@ class DeterministicIngestProcessor:
                     revision_id=revision_id,
                     status="enriching_metadata",
                     warnings=warnings,
+                    stage_timings=stage_timings,
                 )
             lease.extend()
-            enrichment = self._metadata_enricher.enrich(parsed_document)
+            with observe_operation(
+                "ingest.enrichment",
+                logger=logger,
+                fields=log_fields,
+            ) as enrichment_timing:
+                enrichment = self._metadata_enricher.enrich(parsed_document)
+            _accumulate_stage_timing(stage_timings, "enrichment_seconds", enrichment_timing)
             warnings = _dedupe_warnings([*warnings, *enrichment.warnings])
             lease.extend()
             with connection.begin():
@@ -424,15 +475,22 @@ class DeterministicIngestProcessor:
                     revision_id=revision_id,
                     status="chunking",
                     warnings=warnings,
+                    stage_timings=stage_timings,
                 )
-                self._insert_passages(
-                    connection,
-                    document_id=document_id,
-                    revision_id=revision_id,
-                    parsed_document=parsed_document,
-                    section_ids=section_ids,
-                    artifact_id=active_artifact_id,
-                )
+                with observe_operation(
+                    "ingest.chunking",
+                    logger=logger,
+                    fields=log_fields,
+                ) as chunking_timing:
+                    self._insert_passages(
+                        connection,
+                        document_id=document_id,
+                        revision_id=revision_id,
+                        parsed_document=parsed_document,
+                        section_ids=section_ids,
+                        artifact_id=active_artifact_id,
+                    )
+                _accumulate_stage_timing(stage_timings, "chunking_seconds", chunking_timing)
                 self._mark_stage(
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
@@ -440,6 +498,7 @@ class DeterministicIngestProcessor:
                     revision_id=revision_id,
                     status="indexing",
                     warnings=warnings,
+                    stage_timings=stage_timings,
                 )
             lease.extend()
             with connection.begin():
@@ -452,19 +511,27 @@ class DeterministicIngestProcessor:
                 )
                 if warnings is None:
                     return
-                self._retrieval_indexer.rebuild(
-                    connection,
-                    document_id=document_id,
-                    revision_id=revision_id,
-                    ingest_job_id=context.payload.ingest_job_id,
-                    parser_source=parser_source,
-                )
+                with observe_operation(
+                    "ingest.indexing",
+                    logger=logger,
+                    fields=log_fields,
+                ) as indexing_timing:
+                    self._retrieval_indexer.rebuild(
+                        connection,
+                        document_id=document_id,
+                        revision_id=revision_id,
+                        ingest_job_id=context.payload.ingest_job_id,
+                        parser_source=parser_source,
+                        stage_timings=stage_timings,
+                    )
+                _accumulate_stage_timing(stage_timings, "indexing_seconds", indexing_timing)
                 self._mark_ready(
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
                     document_id=document_id,
                     revision_id=revision_id,
                     warnings=warnings,
+                    stage_timings=stage_timings,
                 )
         except Exception:
             for storage_ref in reversed(created_storage_refs):
@@ -1328,6 +1395,7 @@ class DeterministicIngestProcessor:
         revision_id: uuid.UUID,
         status: str,
         warnings: list[str],
+        stage_timings: Mapping[str, float | int] | None = None,
     ) -> None:
         now = datetime.now(UTC)
         connection.execute(
@@ -1338,6 +1406,7 @@ class DeterministicIngestProcessor:
                 failure_code=None,
                 failure_message=None,
                 warnings=bindparam("b_warnings", type_=JSONB),
+                stage_timings=bindparam("b_stage_timings", type_=JSONB),
                 started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
                 finished_at=None,
             ),
@@ -1348,6 +1417,8 @@ class DeterministicIngestProcessor:
                 "b_status": status,
                 "warnings": warnings,
                 "b_warnings": warnings,
+                "stage_timings": dict(stage_timings or {}),
+                "b_stage_timings": dict(stage_timings or {}),
                 "now": now,
                 "b_now": now,
             },
@@ -1386,6 +1457,7 @@ class DeterministicIngestProcessor:
         failure_code: str,
         failure_message: str,
         warnings: list[str],
+        stage_timings: Mapping[str, float | int] | None = None,
     ) -> None:
         now = datetime.now(UTC)
         connection.execute(
@@ -1396,6 +1468,7 @@ class DeterministicIngestProcessor:
                 failure_code=bindparam("b_failure_code"),
                 failure_message=bindparam("b_failure_message"),
                 warnings=bindparam("b_warnings", type_=JSONB),
+                stage_timings=bindparam("b_stage_timings", type_=JSONB),
                 started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
                 finished_at=bindparam("b_now"),
             ),
@@ -1408,6 +1481,8 @@ class DeterministicIngestProcessor:
                 "b_failure_message": failure_message,
                 "warnings": _dedupe_warnings(warnings),
                 "b_warnings": _dedupe_warnings(warnings),
+                "stage_timings": dict(stage_timings or {}),
+                "b_stage_timings": dict(stage_timings or {}),
                 "now": now,
                 "b_now": now,
             },
@@ -1447,6 +1522,7 @@ class DeterministicIngestProcessor:
         document_id: uuid.UUID,
         revision_id: uuid.UUID,
         warnings: list[str],
+        stage_timings: Mapping[str, float | int] | None = None,
     ) -> None:
         now = datetime.now(UTC)
         connection.execute(
@@ -1455,6 +1531,7 @@ class DeterministicIngestProcessor:
             .values(
                 status="ready",
                 warnings=bindparam("b_warnings", type_=JSONB),
+                stage_timings=bindparam("b_stage_timings", type_=JSONB),
                 finished_at=bindparam("b_now"),
             ),
             {
@@ -1462,6 +1539,8 @@ class DeterministicIngestProcessor:
                 "b_ingest_job_id": ingest_job_id,
                 "warnings": _dedupe_warnings(warnings),
                 "b_warnings": _dedupe_warnings(warnings),
+                "stage_timings": dict(stage_timings or {}),
+                "b_stage_timings": dict(stage_timings or {}),
                 "now": now,
                 "b_now": now,
             },
@@ -1750,6 +1829,18 @@ def _dedupe_warnings(warnings: list[str]) -> list[str]:
             seen.add(warning)
             deduped.append(warning)
     return deduped
+
+
+def _accumulate_stage_timing(
+    stage_timings: dict[str, float | int],
+    stage_name: str,
+    timing_payload: Mapping[str, float],
+) -> None:
+    duration_seconds = timing_payload.get("duration_seconds")
+    if duration_seconds is None:
+        return
+    current = float(stage_timings.get(stage_name, 0.0))
+    stage_timings[stage_name] = round(current + duration_seconds, 6)
 
 
 def _advisory_lock_keys(value: uuid.UUID) -> tuple[int, int]:

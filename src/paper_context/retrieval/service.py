@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -38,6 +39,7 @@ from paper_context.models import (
     RetrievalPassageAsset,
     RetrievalTableAsset,
 )
+from paper_context.observability import observe_operation
 from paper_context.pagination import CursorError, decode_cursor, encode_cursor, fingerprint_payload
 
 from .clients import (
@@ -66,6 +68,7 @@ from .types import (
 )
 
 ConnectionFactory = Callable[[], AbstractContextManager[Connection]]
+logger = logging.getLogger(__name__)
 
 PASSAGE_SPARSE_CANDIDATES = 30
 PASSAGE_DENSE_CANDIDATES = 30
@@ -187,6 +190,18 @@ def _dedupe_warnings(warnings: list[str]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def _accumulate_stage_timing(
+    stage_timings: dict[str, float | int],
+    stage_name: str,
+    timing_payload: Mapping[str, float],
+) -> None:
+    duration_seconds = timing_payload.get("duration_seconds")
+    if duration_seconds is None:
+        return
+    current = float(stage_timings.get(stage_name, 0.0))
+    stage_timings[stage_name] = round(current + duration_seconds, 6)
+
+
 def _revision_match(left_revision_id, right_revision_id):
     return or_(
         left_revision_id == right_revision_id,
@@ -288,9 +303,11 @@ class DocumentRetrievalIndexer:
         revision_id: uuid.UUID,
         ingest_job_id: uuid.UUID,
         parser_source: str,
+        stage_timings: dict[str, float | int] | None = None,
     ) -> uuid.UUID:
         run_id = _retrieval_index_run_id(ingest_job_id=ingest_job_id)
         now = datetime.now(UTC)
+        stage_timings = stage_timings if stage_timings is not None else {}
         self._upsert_build_run(
             connection,
             run_id=run_id,
@@ -308,10 +325,21 @@ class DocumentRetrievalIndexer:
             revision_id=revision_id,
             batch_size=INDEX_BUILD_BATCH_SIZE,
         ):
-            passage_embeddings = self.embedding_client.embed(
-                [row.contextualized_text for row in passages],
-                input_type="document",
-            )
+            with observe_operation(
+                "ingest.embedding",
+                logger=logger,
+                fields={
+                    "document_id": str(document_id),
+                    "revision_id": str(revision_id),
+                    "ingest_job_id": str(ingest_job_id),
+                    "batch_size": len(passages),
+                },
+            ) as embedding_timing:
+                passage_embeddings = self.embedding_client.embed(
+                    [row.contextualized_text for row in passages],
+                    input_type="document",
+                )
+            _accumulate_stage_timing(stage_timings, "embedding_seconds", embedding_timing)
             batch_dimensions = passage_embeddings.dimensions
             if batch_dimensions != EMBEDDING_DIMENSIONS:
                 raise RetrievalError(
@@ -960,89 +988,98 @@ class RetrievalService:
                 },
             }
         )
-        with self._connection() as connection:
-            filtered_document_ids = self._resolve_filtered_document_ids(
-                connection,
-                filters=filters,
-            )
-            active_runs = self._resolve_active_run_selection(
-                connection,
-                filtered_document_ids=filtered_document_ids,
-            )
-            passage_page = self._search_passages_page_with_connection(
-                connection,
-                query=query,
-                filters=filters,
-                cursor=cursor,
-                limit=limit,
-                filtered_document_ids=filtered_document_ids,
-                active_runs=active_runs,
-                fingerprint=fingerprint,
-            )
-            passages = passage_page.items
-            pack_document_ids = tuple(dict.fromkeys(result.document_id for result in passages))
-            tables = tuple(
-                self._search_tables_with_connection(
+        with observe_operation(
+            "retrieval.context_pack_assembly",
+            logger=logger,
+            fields={
+                "query": query.strip(),
+                "cursor_present": cursor is not None,
+                "limit": limit,
+            },
+        ):
+            with self._connection() as connection:
+                filtered_document_ids = self._resolve_filtered_document_ids(
+                    connection,
+                    filters=filters,
+                )
+                active_runs = self._resolve_active_run_selection(
+                    connection,
+                    filtered_document_ids=filtered_document_ids,
+                )
+                passage_page = self._search_passages_page_with_connection(
                     connection,
                     query=query,
                     filters=filters,
-                    limit=TABLE_RESULT_LIMIT,
-                    filtered_document_ids=pack_document_ids or filtered_document_ids,
+                    cursor=cursor,
+                    limit=limit,
+                    filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
+                    fingerprint=fingerprint,
                 )
-            )
-            active_index_version = self._ensure_single_index_version([*passages, *tables])
-            document_ids = tuple(
-                dict.fromkeys(
-                    [
-                        *(result.document_id for result in passages),
-                        *(result.document_id for result in tables),
-                    ]
+                passages = passage_page.items
+                pack_document_ids = tuple(dict.fromkeys(result.document_id for result in passages))
+                tables = tuple(
+                    self._search_tables_with_connection(
+                        connection,
+                        query=query,
+                        filters=filters,
+                        limit=TABLE_RESULT_LIMIT,
+                        filtered_document_ids=pack_document_ids or filtered_document_ids,
+                        active_runs=active_runs,
+                    )
                 )
-            )
-            retrieval_index_run_ids = tuple(
-                dict.fromkeys(
-                    [
-                        *(result.retrieval_index_run_id for result in passages),
-                        *(result.retrieval_index_run_id for result in tables),
-                    ]
+                active_index_version = self._ensure_single_index_version([*passages, *tables])
+                document_ids = tuple(
+                    dict.fromkeys(
+                        [
+                            *(result.document_id for result in passages),
+                            *(result.document_id for result in tables),
+                        ]
+                    )
                 )
+                retrieval_index_run_ids = tuple(
+                    dict.fromkeys(
+                        [
+                            *(result.retrieval_index_run_id for result in passages),
+                            *(result.retrieval_index_run_id for result in tables),
+                        ]
+                    )
+                )
+                parent_sections = self._load_parent_sections(
+                    connection,
+                    passages=passages,
+                    tables=tables,
+                )
+                documents = self._load_document_summaries(
+                    connection,
+                    document_ids=document_ids,
+                    active_index_version=active_index_version,
+                )
+
+            warnings = _dedupe_warnings(
+                [
+                    *(warning for result in passages for warning in result.warnings),
+                    *(warning for result in tables for warning in result.warnings),
+                    *(warning for section in parent_sections for warning in section.warnings),
+                ]
             )
-            parent_sections = self._load_parent_sections(
-                connection,
+            retrieval_modes = _dedupe_modes_from_results(passages=passages, tables=tables)
+            provenance = ContextPackProvenance(
+                active_index_version=active_index_version,
+                retrieval_index_run_ids=retrieval_index_run_ids,
+                retrieval_modes=retrieval_modes,
+            )
+            return ContextPackResult(
+                context_pack_id=uuid.uuid4(),
+                query=query,
                 passages=passages,
                 tables=tables,
+                parent_sections=parent_sections,
+                documents=documents,
+                provenance=provenance,
+                warnings=warnings,
+                next_cursor=passage_page.next_cursor,
             )
-            documents = self._load_document_summaries(
-                connection,
-                document_ids=document_ids,
-                active_index_version=active_index_version,
-            )
-
-        warnings = _dedupe_warnings(
-            [
-                *(warning for result in passages for warning in result.warnings),
-                *(warning for result in tables for warning in result.warnings),
-                *(warning for section in parent_sections for warning in section.warnings),
-            ]
-        )
-        retrieval_modes = _dedupe_modes_from_results(passages=passages, tables=tables)
-        provenance = ContextPackProvenance(
-            active_index_version=active_index_version,
-            retrieval_index_run_ids=retrieval_index_run_ids,
-            retrieval_modes=retrieval_modes,
-        )
-        return ContextPackResult(
-            context_pack_id=uuid.uuid4(),
-            query=query,
-            passages=passages,
-            tables=tables,
-            parent_sections=parent_sections,
-            documents=documents,
-            provenance=provenance,
-            warnings=warnings,
-            next_cursor=passage_page.next_cursor,
-        )
 
     def get_table(self, *, table_id: uuid.UUID) -> TableDetailResult | None:
         run_join_conditions = [
@@ -1778,7 +1815,12 @@ class RetrievalService:
     ) -> list[_Candidate]:
         if self._embedding_client is None:
             return []
-        batch = self._embedding_client.embed([query], input_type="query")
+        with observe_operation(
+            "retrieval.embedding",
+            logger=logger,
+            fields={"query": query.strip(), "candidate_limit": limit},
+        ):
+            batch = self._embedding_client.embed([query], input_type="query")
         if not batch.embeddings:
             return []
         if batch.dimensions != EMBEDDING_DIMENSIONS:
@@ -2001,11 +2043,20 @@ class RetrievalService:
             )
             return ranked if limit is None else ranked[:limit]
 
-        reranked_items = self._reranker_client.rerank(
-            query=query,
-            documents=[candidate.rerank_text for candidate in candidates],
-            top_n=None if limit is None else min(limit, len(candidates)),
-        )
+        with observe_operation(
+            "retrieval.rerank",
+            logger=logger,
+            fields={
+                "query": query.strip(),
+                "candidate_count": len(candidates),
+                "result_limit": limit,
+            },
+        ):
+            reranked_items = self._reranker_client.rerank(
+                query=query,
+                documents=[candidate.rerank_text for candidate in candidates],
+                top_n=None if limit is None else min(limit, len(candidates)),
+            )
         ordered: list[_Candidate] = []
         seen_indexes: set[int] = set()
         for item in reranked_items:

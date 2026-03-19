@@ -4,5 +4,9 @@
   "version": "0.1.0",
   "database_ready": false,
   "storage_root": "",
-  "queue_name": "document_ingest"
+  "storage_ready": true,
+  "queue_name": "document_ingest",
+  "queue_ready": false,
+  "queue_metrics": null,
+  "operation_timings": []
 }

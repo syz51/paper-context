@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from paper_context.api.app import create_app
 from paper_context.api.routes import health as health_module
 from paper_context.schemas import api as api_schemas
 from paper_context.schemas import mcp as mcp_schemas
+from paper_context.schemas.common import QueueMetricsResponse
 
 pytestmark = pytest.mark.contract
 
@@ -46,15 +48,44 @@ def _golden_payload(name: str) -> dict[str, object]:
 def _patch_contract_app(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, database_ready: bool
 ) -> None:
+    storage_root = tmp_path / "artifacts"
+    storage_root.mkdir(parents=True, exist_ok=True)
     settings = SimpleNamespace(
         log_level="INFO",
-        storage=SimpleNamespace(root_path=tmp_path / "artifacts"),
+        storage=SimpleNamespace(root_path=storage_root),
         queue=SimpleNamespace(name="document_ingest"),
+        providers=SimpleNamespace(
+            voyage_model="voyage-4-large",
+            reranker_model="zerank-2",
+            index_version="mvp-v1",
+        ),
     )
     monkeypatch.setattr(api_app_module, "create_http_app", _FakeMcpApp)
     monkeypatch.setattr(api_app_module, "get_settings", lambda: settings)
     monkeypatch.setattr(health_module, "get_settings", lambda: settings)
     monkeypatch.setattr(health_module, "database_is_ready", lambda: database_ready)
+    monkeypatch.setattr(
+        health_module,
+        "get_metrics_registry",
+        lambda: SimpleNamespace(timing_snapshots=lambda limit=20: []),
+    )
+    monkeypatch.setattr(
+        health_module,
+        "_queue_metrics",
+        lambda queue_name: (
+            QueueMetricsResponse(
+                queue_name=queue_name,
+                queue_length=3,
+                queue_visible_length=2,
+                newest_msg_age_sec=5,
+                oldest_msg_age_sec=12,
+                total_messages=3,
+                scrape_time=datetime(2026, 3, 19, 8, 0, tzinfo=UTC),
+            )
+            if database_ready
+            else None
+        ),
+    )
     monkeypatch.setattr(
         api_app_module,
         "LocalFilesystemStorage",

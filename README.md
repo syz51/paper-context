@@ -1,6 +1,6 @@
 # Paper Context
 
-Paper Context is a personal, retrieval-first project for born-digital research PDFs, especially quant and trading-relevant papers. The codebase now implements the ingestion loop plus the phase-3 read and retrieval surfaces: PDF upload and replacement, queued ingest jobs, deterministic worker processing, canonical Postgres normalization, local artifact storage, document inspection routes, and curated MCP retrieval tools.
+Paper Context is a personal, retrieval-first project for born-digital research PDFs, especially quant and trading-relevant papers. The codebase now implements the ingestion loop plus the phase-3 read and retrieval surfaces: PDF upload and replacement, queued ingest jobs, deterministic worker processing, canonical Postgres normalization, local artifact storage, document inspection routes, and curated MCP retrieval tools. Revision-safe replacement retention and stable document keyset pagination are already implemented; phase 4 is now about hardening the self-hosted runtime around that core.
 
 > **Status**
 >
@@ -12,13 +12,13 @@ Paper Context is a personal, retrieval-first project for born-digital research P
 > - Normalization into documents, sections, passages, tables, references, artifacts, and retrieval-index metadata
 > - Shared retrieval pagination for passages, tables, and context packs with `index_version`-bound opaque cursors
 > - Mounted FastMCP tools for `search_documents`, `search_passages`, `search_tables`, `get_document_outline`, `get_table`, `get_passage_context`, and `build_context_pack`
-> - Local filesystem artifact storage and Docker Compose bring-up for `db`, `app`, `worker`, and `migrate`
+> - Local filesystem artifact storage, persistent Compose volumes, and Docker Compose bring-up for `db`, `app`, `worker`, and `migrate`
+> - Revision-safe retention for replace flows and stable keyset pagination for document reads
 >
 > What is still target-state / not fully implemented yet:
 >
-> - Replace-document flows still use one active canonical state per `document_id`; revision-safe historical provenance is still deferred
 > - Provider-backed enrichment remains intentionally minimal
-> - Operational hardening, metrics, and broader regression coverage are still ahead of the runtime
+> - Operational hardening, metrics, queue visibility, and broader regression coverage are still ahead of the runtime
 
 ## Why This Exists
 
@@ -50,7 +50,7 @@ The implemented runtime is organized around three active surfaces:
 - `worker`: queue-backed ingestion process that parses, normalizes, writes artifacts, creates passages, and records retrieval-index runs
 - `db`: Postgres + pgvector + PGMQ, started locally through Docker Compose
 
-The top-level README tracks the current runtime. The `docs/` directory still describes the broader MVP design, with phase-4 hardening and revision-safe replacement semantics still ahead of the runtime.
+The top-level README tracks the current runtime. The `docs/` directory still describes the broader MVP design, with phase-4 hardening now focused on observability, deployment defaults, and regression coverage rather than revision-safe replacement semantics.
 
 ## Implemented Ingestion Flow
 
@@ -153,8 +153,25 @@ Notes:
 
 - Host-run commands use the default database URL at `localhost:5433`
 - Compose services override the database hostname to `db:5432`
-- App and worker share the local artifact volume at `./var/artifacts`
+- App and worker share the persistent Compose artifact volume at `/var/lib/paper-context/artifacts`
 - Host-run `uv run ...` commands still expect you to run `docker compose run --rm migrate` first
+
+## Deployment Notes
+
+For a fresh self-hosted deploy, bring the stack up in this order:
+
+1. Start `db`
+2. Run `migrate`
+3. Start `app`
+4. Start `worker`
+
+The Compose files already encode that dependency order, but the explicit sequence is useful when you are operating the stack manually or recovering from a partial outage.
+
+Operator notes:
+
+- Persistent state lives in the `postgres_data` and `paper_context_artifacts` Compose volumes
+- The app and worker should point at `/var/lib/paper-context/artifacts` inside Compose
+- API keys remain optional for local development and should be set explicitly before enabling provider-backed enrichment or retrieval
 
 ## Try The Upload Flow
 

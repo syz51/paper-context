@@ -56,6 +56,7 @@ class IngestJob(Base):
     failure_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
     failure_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     warnings: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    stage_timings: Mapped[dict[str, float | int] | None] = mapped_column(JSONB, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     trigger: Mapped[str | None] = mapped_column(String(64), nullable=True)

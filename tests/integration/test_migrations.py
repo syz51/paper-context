@@ -118,6 +118,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
         "failure_code",
         "failure_message",
         "warnings",
+        "stage_timings",
         "started_at",
         "finished_at",
         "trigger",

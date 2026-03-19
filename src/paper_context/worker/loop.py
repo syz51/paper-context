@@ -14,6 +14,7 @@ from paper_context.ingestion.service import (
     IngestProcessor,
     LeaseExtender,
 )
+from paper_context.observability import get_metrics
 from paper_context.queue.contracts import ClaimedIngestMessage, IngestionQueue
 
 ConnectionFactory = Callable[..., AbstractContextManager[Connection]]
@@ -54,10 +55,13 @@ class IngestWorker:
                 poll_interval_ms=self._config.poll_interval_ms,
             )
         if task is None:
+            get_metrics().increment("worker.poll.empty")
             return None
         if task.already_archived:
+            get_metrics().increment("worker.poll.archived_terminal")
             return task
 
+        get_metrics().increment("worker.poll.claimed")
         lease = LeaseExtender(
             self._open_connection,
             self._queue_adapter,
@@ -73,7 +77,9 @@ class IngestWorker:
                     lease,
                 )
             except IngestExecutionDeferred:
+                get_metrics().increment("worker.poll.deferred")
                 return None
         with self._open_connection(transactional=True) as archive_connection:
             self._queue_adapter.archive_message(archive_connection, task.message.msg_id)
+        get_metrics().increment("worker.poll.completed")
         return task

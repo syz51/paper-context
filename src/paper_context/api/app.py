@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 
 from fastapi import FastAPI
@@ -13,6 +14,8 @@ from paper_context.storage.local_fs import LocalFilesystemStorage
 from .routes.documents import router as documents_router
 from .routes.health import router as health_router
 
+logger = logging.getLogger(__name__)
+
 
 def create_app() -> FastAPI:
     mcp_app = create_http_app()
@@ -23,11 +26,25 @@ def create_app() -> FastAPI:
         configure_logging(settings.log_level)
         storage = LocalFilesystemStorage(settings.storage.root_path)
         storage.ensure_root()
+        logger.info(
+            "app lifespan starting",
+            extra={
+                "structured_data": {
+                    "event": "app.starting",
+                    "storage_root": settings.storage.root_path,
+                    "queue_name": settings.queue.name,
+                }
+            },
+        )
         try:
             async with AsyncExitStack() as stack:
                 await stack.enter_async_context(mcp_app.lifespan(app))
                 yield
         finally:
+            logger.info(
+                "app lifespan stopping",
+                extra={"structured_data": {"event": "app.stopping"}},
+            )
             dispose_engine()
 
     app = FastAPI(title="Paper Context App", lifespan=lifespan)

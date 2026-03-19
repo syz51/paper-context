@@ -178,7 +178,15 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         return uuid4()
 
     def _mark_stage(
-        self, connection, *, ingest_job_id, document_id, revision_id, status, warnings
+        self,
+        connection,
+        *,
+        ingest_job_id,
+        document_id,
+        revision_id,
+        status,
+        warnings,
+        stage_timings=None,
     ) -> None:
         self.stage_calls.append((status, list(warnings)))
 
@@ -196,7 +204,16 @@ class _RecordingProcessor(DeterministicIngestProcessor):
     def _insert_passages(self, connection, **kwargs) -> None:
         return None
 
-    def _mark_ready(self, connection, *, ingest_job_id, document_id, revision_id, warnings) -> None:
+    def _mark_ready(
+        self,
+        connection,
+        *,
+        ingest_job_id,
+        document_id,
+        revision_id,
+        warnings,
+        stage_timings=None,
+    ) -> None:
         self.ready_warnings = list(warnings)
 
     def _mark_failed(
@@ -209,6 +226,7 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         failure_code,
         failure_message,
         warnings,
+        stage_timings=None,
     ) -> None:
         self.failed_calls.append((failure_code, failure_message, list(warnings)))
 

@@ -482,6 +482,7 @@ def test_run_synthetic_job_verification_returns_summary(
     queue_metrics = SimpleNamespace(
         queue_name="document_ingest",
         queue_length=2,
+        queue_visible_length=1,
         total_messages=5,
     )
     queue = MagicMock()
@@ -520,6 +521,7 @@ def test_run_synthetic_job_verification_returns_summary(
         "queue_metrics": {
             "queue_name": "document_ingest",
             "queue_length": 2,
+            "queue_visible_length": 1,
             "total_messages": 5,
         },
     }

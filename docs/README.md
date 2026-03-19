@@ -4,7 +4,7 @@ This `docs/` set is the implementation-facing design for the revised Paper Conte
 
 The system is a retrieval substrate for downstream tools and agents. It ingests PDFs, preserves sections, passages, tables, and provenance, and returns grounded context packs. It is not an answer-generation product, not a generic agent framework, and not a place to hide retrieval decisions behind LlamaIndex or PydanticAI abstractions.
 
-Status note: this documentation set supersedes `~/Downloads/rag-plan.md` and is the current source of truth for the MVP design.
+Status note: this documentation set supersedes `~/Downloads/rag-plan.md` and is the current source of truth for the MVP design. Phase 4 is now focused on self-hosted hardening; revision-safe retention and stable document keyset pagination are already implemented in the runtime.
 
 > **Current defaults**
 >

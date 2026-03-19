@@ -103,3 +103,21 @@ def test_production_compose_keeps_single_hosted_app_shape() -> None:
     assert "\n  migrate:" in text
     assert "dokploy-network" in text
     assert "8001:8001" not in text
+
+
+def test_compose_uses_persistent_artifact_volume_for_app_and_worker() -> None:
+    text = _compose_text()
+    assert "paper_context_artifacts:/var/lib/paper-context/artifacts" in text
+    assert "./var/artifacts:/var/lib/paper-context/artifacts" not in text
+
+
+def test_production_compose_uses_persistent_artifact_volume() -> None:
+    text = _compose_prod_text()
+    assert "paper_context_artifacts:/var/lib/paper-context/artifacts" in text
+    assert "\nvolumes:\n  paper_context_artifacts:" in text
+
+
+@pytest.mark.parametrize("service", ["app", "worker"])
+def test_production_services_restart_unless_stopped(service: str) -> None:
+    block = _service_block(_compose_prod_text(), service)
+    assert "restart: unless-stopped" in block
