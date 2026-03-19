@@ -7,7 +7,7 @@ Use uv for python
 - Run the narrowest meaningful checks for the files you changed, then widen if the change crosses boundaries.
 - Static checks: `uv run pre-commit run --all-files`
 - Types: `uv run pyright`
-- Unit and slice tests: `uv run pytest -m "unit or slice"`
+- Unit and slice tests: `uv run pytest -m "unit or slice"`. Important: Don't lower coverage threshold. Implement more tests to increase coverage.
 - Contract tests: `uv run pytest -m contract`
 - Integration and migration tests: `uv run pytest -m "integration or migration" -n 2 --dist=loadfile`
 - Regression tests: `uv run pytest -m "regression and not staging_only"`
