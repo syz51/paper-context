@@ -27,6 +27,7 @@ from paper_context.schemas.api import (
     TableDetailResponse,
     TableSearchResponse,
 )
+from paper_context.schemas.public import RetrievalFiltersInput
 
 pytestmark = pytest.mark.unit
 
@@ -56,7 +57,7 @@ class _DocumentsServiceStub:
         self.search_documents_calls: list[dict[str, object]] = []
         self.outline_calls: list[UUID] = []
         self.search_documents_response = DocumentListResponse()
-        self.outline_response = DocumentOutlineResponse(
+        self.outline_response: DocumentOutlineResponse | None = DocumentOutlineResponse(
             document_id=UUID("11111111-1111-1111-1111-111111111111"),
             title="Paper",
             sections=[],
@@ -287,6 +288,114 @@ def test_registered_mcp_tools_delegate_to_shared_services(
             "limit": 8,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    ("response_attr", "tool_name", "tool_args", "message"),
+    [
+        (
+            "outline_response",
+            "get_document_outline",
+            ("11111111-1111-1111-1111-111111111111",),
+            "document not found",
+        ),
+        (
+            "table_response",
+            "get_table",
+            ("22222222-2222-2222-2222-222222222222",),
+            "table not found",
+        ),
+        (
+            "passage_context_response",
+            "get_passage_context",
+            ("55555555-5555-5555-5555-555555555555",),
+            "passage not found",
+        ),
+    ],
+)
+def test_registered_mcp_tools_raise_not_found_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    response_attr: str,
+    tool_name: str,
+    tool_args: tuple[str, ...],
+    message: str,
+) -> None:
+    fake_fastmcp = _FakeFastMcp("paper-context")
+    documents = _DocumentsServiceStub()
+    retrieval = _RetrievalServiceStub()
+
+    monkeypatch.setattr(mcp_module, "FastMCP", lambda name: fake_fastmcp)
+    monkeypatch.setattr(mcp_module, "_build_documents_service", lambda: documents)
+    monkeypatch.setattr(mcp_module, "_build_retrieval_service", lambda: retrieval)
+    if response_attr == "outline_response":
+        documents.outline_response = None
+    else:
+        setattr(retrieval, response_attr, None)
+
+    exported_create_server()
+
+    with pytest.raises(ValueError, match=message):
+        fake_fastmcp.tools[tool_name](*tool_args)
+
+
+def test_mcp_helper_converters_normalize_collections() -> None:
+    document_id = UUID("11111111-1111-1111-1111-111111111111")
+    passage_id = UUID("55555555-5555-5555-5555-555555555555")
+    table_id = UUID("22222222-2222-2222-2222-222222222222")
+    section_id = UUID("33333333-3333-3333-3333-333333333333")
+    run_id = UUID("44444444-4444-4444-4444-444444444444")
+    filters = RetrievalFiltersInput(document_ids=[document_id], publication_years=[2024])
+    passage = SimpleNamespace(
+        passage_id=passage_id,
+        document_id=document_id,
+        section_id=section_id,
+        document_title="Paper",
+        section_path=("Methods", "Ablations"),
+        text="Context",
+        score=0.75,
+        retrieval_modes=("dense", "sparse"),
+        page_start=1,
+        page_end=2,
+        index_version="mvp-v1",
+        retrieval_index_run_id=run_id,
+        parser_source="docling",
+        warnings=("parser_fallback_used",),
+    )
+    table = SimpleNamespace(
+        table_id=table_id,
+        document_id=document_id,
+        section_id=section_id,
+        document_title="Paper",
+        section_path=("Results",),
+        caption="Metrics",
+        table_type="lexical",
+        preview=SimpleNamespace(headers=("A", "B"), rows=(("1", "2"),), row_count=1),
+        score=0.8,
+        retrieval_modes=("dense",),
+        page_start=3,
+        page_end=4,
+        index_version="mvp-v1",
+        retrieval_index_run_id=run_id,
+        parser_source="docling",
+        warnings=("parent_context_truncated",),
+    )
+
+    assert mcp_module._to_retrieval_filters(filters) == RetrievalFilters(
+        document_ids=(document_id,),
+        publication_years=(2024,),
+    )
+
+    passage_model = mcp_module._to_passage_model(passage)
+    assert passage_model.section_path == ["Methods", "Ablations"]
+    assert passage_model.retrieval_modes == ["dense", "sparse"]
+    assert passage_model.warnings == ["parser_fallback_used"]
+
+    table_model = mcp_module._to_table_model(table)
+    assert table_model.section_path == ["Results"]
+    assert table_model.preview.headers == ["A", "B"]
+    assert table_model.preview.rows == [["1", "2"]]
+    assert table_model.retrieval_modes == ["dense"]
+    assert table_model.warnings == ["parent_context_truncated"]
 
 
 def test_create_http_app_uses_streamable_http_transport(monkeypatch: pytest.MonkeyPatch) -> None:

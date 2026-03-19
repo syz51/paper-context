@@ -127,6 +127,75 @@ def test_make_engine_rejects_incomplete_production_settings() -> None:
         )
 
 
+def test_database_settings_validate_runtime_rejects_blank_app_name_and_zero_values() -> None:
+    settings = DatabaseSettings(
+        url="postgresql+psycopg://paper_context:secret@db/paper_context",
+        ssl_mode="require",
+        connect_timeout_seconds=10,
+        statement_timeout_ms=30_000,
+        lock_timeout_ms=5_000,
+        idle_in_transaction_session_timeout_ms=15_000,
+        application_name="   ",
+        pool_size=7,
+        max_overflow=3,
+        pool_timeout_seconds=0,
+        pool_recycle_seconds=90,
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        settings.validate_runtime(environment="production", default_app_name="paper-context")
+
+    message = str(exc_info.value)
+    assert "database.pool_timeout_seconds" in message
+    assert "database.application_name" in message
+
+
+def test_make_engine_includes_ssl_paths_and_omits_unset_postgres_kwargs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_create_engine(url: str, **kwargs: object) -> MagicMock:
+        captured["url"] = url
+        captured["kwargs"] = kwargs
+        engine = MagicMock()
+        engine.dispose = MagicMock()
+        return engine
+
+    monkeypatch.setattr(db_engine, "create_engine", fake_create_engine)
+
+    make_engine(
+        "postgresql+psycopg://paper_context:secret@db/paper_context",
+        database_settings=DatabaseSettings(
+            url="postgresql+psycopg://paper_context:secret@db/paper_context",
+            ssl_mode=None,
+            ssl_root_cert=tmp_path / "root.pem",
+            ssl_cert=tmp_path / "client.pem",
+            ssl_key=tmp_path / "client.key",
+            connect_timeout_seconds=None,
+            statement_timeout_ms=None,
+            lock_timeout_ms=None,
+            idle_in_transaction_session_timeout_ms=None,
+            pool_size=None,
+            max_overflow=None,
+            pool_timeout_seconds=None,
+            pool_recycle_seconds=None,
+        ),
+    )
+
+    assert captured["url"] == "postgresql+psycopg://paper_context:secret@db/paper_context"
+    assert captured["kwargs"] == {
+        "future": True,
+        "pool_pre_ping": True,
+        "connect_args": {
+            "application_name": "paper-context",
+            "sslrootcert": str(tmp_path / "root.pem"),
+            "sslcert": str(tmp_path / "client.pem"),
+            "sslkey": str(tmp_path / "client.key"),
+        },
+    }
+
+
 def test_get_engine_returns_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = AppSettings(
         database=DatabaseSettings(url="sqlite+pysqlite:///:memory:"),

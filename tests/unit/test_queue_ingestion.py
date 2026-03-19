@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+import paper_context.queue.contracts as queue_contracts
 from paper_context.ingestion.queue import IngestionQueueService
 from paper_context.ingestion.service import (
     DeterministicIngestProcessor,
@@ -137,6 +138,26 @@ def test_enqueue_ingest_merges_trace_metadata_and_headers() -> None:
     assert sent_payload["trace"] == {"t": "2", "h": "1"}
 
 
+def test_enqueue_ingest_omits_trace_when_headers_and_metadata_are_absent() -> None:
+    adapter = MagicMock()
+    queue = IngestionQueue("document_ingest")
+    queue._queue = adapter
+    ingest_job_id = uuid4()
+    document_id = uuid4()
+
+    queue.enqueue_ingest(
+        MagicMock(),
+        ingest_job_id=ingest_job_id,
+        document_id=document_id,
+    )
+
+    sent_payload = adapter.send.call_args[0][1]
+    assert sent_payload == {
+        "ingest_job_id": str(ingest_job_id),
+        "document_id": str(document_id),
+    }
+
+
 def test_queue_delegates_extend_archive_delete_metrics() -> None:
     adapter = MagicMock()
     queue = IngestionQueue("document_ingest")
@@ -165,6 +186,30 @@ def test_extend_lease_raises_when_queue_lease_is_lost() -> None:
 
     with pytest.raises(LeaseLostError, match="message 11"):
         queue.extend_lease(MagicMock(), 11, 60)
+
+
+def test_claim_ingest_returns_archived_message_when_missing_job_and_poll_budget_expires(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {"ingest_job_id": str(uuid4()), "document_id": str(uuid4())}
+    message = _make_message(payload)
+    adapter = MagicMock()
+    adapter.read_with_poll.return_value = [message]
+    queue = IngestionQueue("document_ingest")
+    queue._queue = adapter
+    connection = MagicMock()
+    missing_status = MagicMock()
+    missing_status.mappings.return_value.one_or_none.return_value = None
+    connection.execute.return_value = missing_status
+    monotonic = MagicMock(side_effect=[100.0, 102.0])
+    monkeypatch.setattr(queue_contracts.time, "monotonic", monotonic)
+
+    claimed = queue.claim_ingest(connection, 3, 1, poll_interval_ms=1)
+
+    assert claimed is not None
+    assert claimed.message == message
+    assert claimed.already_archived is True
+    adapter.archive_message.assert_called_once_with(connection, message.msg_id)
 
 
 def test_ingestion_queue_service_enqueues_document_with_trace_headers() -> None:

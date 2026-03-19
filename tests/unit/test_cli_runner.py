@@ -332,6 +332,60 @@ def test_build_worker_warns_when_provider_keys_are_missing(
     )
 
 
+def test_build_worker_uses_provider_clients_when_keys_are_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings()
+    settings.providers.voyage_api_key = "voyage-key"
+    settings.providers.zero_entropy_api_key = "ze-key"
+    voyage_client = MagicMock()
+    reranker_client = MagicMock()
+    voyage_client_cls = MagicMock(return_value=voyage_client)
+    reranker_client_cls = MagicMock(return_value=reranker_client)
+    deterministic_embedding_cls = MagicMock()
+    heuristic_reranker_cls = MagicMock()
+    retrieval_indexer_cls = MagicMock()
+    logger = MagicMock()
+    monkeypatch.setattr(runner_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_module, "get_engine", MagicMock())
+    monkeypatch.setattr(runner_module, "IngestionQueue", MagicMock())
+    monkeypatch.setattr(
+        runner_module,
+        "LocalFilesystemStorage",
+        MagicMock(return_value=MagicMock(ensure_root=MagicMock())),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "build_pdf_parser",
+        MagicMock(side_effect=[MagicMock(), MagicMock()]),
+    )
+    monkeypatch.setattr(runner_module, "NullMetadataEnricher", MagicMock())
+    monkeypatch.setattr(runner_module, "DocumentRetrievalIndexer", retrieval_indexer_cls)
+    monkeypatch.setattr(runner_module, "DeterministicEmbeddingClient", deterministic_embedding_cls)
+    monkeypatch.setattr(runner_module, "HeuristicRerankerClient", heuristic_reranker_cls)
+    monkeypatch.setattr(runner_module, "VoyageEmbeddingClient", voyage_client_cls)
+    monkeypatch.setattr(runner_module, "ZeroEntropyRerankerClient", reranker_client_cls)
+    monkeypatch.setattr(runner_module, "DeterministicIngestProcessor", MagicMock())
+    monkeypatch.setattr(runner_module, "IngestWorker", MagicMock())
+    monkeypatch.setattr(runner_module, "logger", logger)
+
+    runner_module.build_worker()
+
+    voyage_client_cls.assert_called_once_with(api_key="voyage-key", model="voyage-4-large")
+    reranker_client_cls.assert_called_once_with(api_key="ze-key", model="zerank-2")
+    deterministic_embedding_cls.assert_not_called()
+    heuristic_reranker_cls.assert_not_called()
+    retrieval_indexer_cls.assert_called_once_with(
+        index_version="mvp-v1",
+        chunking_version="phase1",
+        embedding_model="voyage-4-large",
+        reranker_model="zerank-2",
+        embedding_client=voyage_client,
+        reranker_client=reranker_client,
+    )
+    logger.warning.assert_not_called()
+
+
 def test_run_worker_returns_immediately_in_once_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = MagicMock()
     worker.run_once.return_value = object()
@@ -344,6 +398,44 @@ def test_run_worker_returns_immediately_in_once_mode(monkeypatch: pytest.MonkeyP
 
     worker.run_once.assert_called_once_with()
     sleep.assert_not_called()
+
+
+def test_run_worker_reraises_failure_in_once_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = MagicMock()
+    worker.run_once.side_effect = RuntimeError("boom")
+    logger = MagicMock()
+    sleep = MagicMock()
+    monkeypatch.setattr(runner_module, "get_settings", make_settings)
+    monkeypatch.setattr(runner_module, "build_worker", lambda: worker)
+    monkeypatch.setattr(runner_module.time, "sleep", sleep)
+    monkeypatch.setattr(runner_module, "logger", logger)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        runner_module.run_worker(once=True)
+
+    logger.exception.assert_not_called()
+    sleep.assert_not_called()
+
+
+def test_run_worker_repolls_without_sleep_after_handled_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings()
+    worker = MagicMock()
+    worker.run_once.side_effect = [object(), RuntimeError("boom")]
+    sleep = MagicMock(side_effect=RuntimeError("stop"))
+    logger = MagicMock()
+    monkeypatch.setattr(runner_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(runner_module, "build_worker", lambda: worker)
+    monkeypatch.setattr(runner_module.time, "sleep", sleep)
+    monkeypatch.setattr(runner_module, "logger", logger)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        runner_module.run_worker()
+
+    assert worker.run_once.call_count == 2
+    logger.exception.assert_called_once_with("worker poll failed; continuing after backoff")
+    sleep.assert_called_once_with(0.25)
 
 
 def test_run_worker_sleeps_when_idle(monkeypatch: pytest.MonkeyPatch) -> None:

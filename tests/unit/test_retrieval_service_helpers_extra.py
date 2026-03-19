@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
 
@@ -982,3 +983,47 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
     indexer._insert_passage_asset_batch.assert_called_once()
     indexer._insert_table_asset_batch.assert_called_once()
     indexer._activate_build_run.assert_called_once()
+
+
+def test_indexer_rebuild_rejects_unexpected_embedding_dimensions() -> None:
+    connection = MagicMock()
+    revision_id = uuid4()
+    indexer = DocumentRetrievalIndexer(
+        index_version="mvp-v1",
+        chunking_version="chunk-v1",
+        embedding_model="embed-v1",
+        reranker_model="rank-v1",
+        embedding_client=_StubEmbeddingClient(
+            [
+                EmbeddingBatch(
+                    provider="stub",
+                    model="stub",
+                    dimensions=64,
+                    embeddings=((0.1,) * 64,),
+                )
+            ]
+        ),
+        reranker_client=_StubRerankerClient([[RerankItem(index=0, score=1.0)]]),
+    )
+    indexer._iter_passage_row_batches = MagicMock(  # type: ignore[method-assign]
+        return_value=iter([[SimpleNamespace(contextualized_text="Context")]])
+    )
+    indexer._iter_table_row_batches = MagicMock(return_value=iter([]))  # type: ignore[method-assign]
+    indexer._upsert_build_run = MagicMock()  # type: ignore[method-assign]
+    indexer._clear_existing_assets = MagicMock()  # type: ignore[method-assign]
+    indexer._insert_passage_asset_batch = MagicMock()  # type: ignore[method-assign]
+    indexer._insert_table_asset_batch = MagicMock()  # type: ignore[method-assign]
+    indexer._activate_build_run = MagicMock()  # type: ignore[method-assign]
+
+    with pytest.raises(RetrievalError, match="embedding dimension mismatch for retrieval assets"):
+        indexer.rebuild(
+            connection,
+            document_id=uuid4(),
+            revision_id=revision_id,
+            ingest_job_id=uuid4(),
+            parser_source="docling",
+        )
+
+    indexer._insert_passage_asset_batch.assert_not_called()
+    indexer._insert_table_asset_batch.assert_not_called()
+    indexer._activate_build_run.assert_not_called()
