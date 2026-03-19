@@ -172,6 +172,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
 EXPECTED_SCHEMA_INDEX_COLUMNS = {
     "ix_documents_current_status": ["current_status"],
     "ix_documents_active_revision_id": ["active_revision_id"],
+    "ix_documents_updated_at_id": ["updated_at", "id"],
     "ix_document_revisions_document_id": ["document_id"],
     "ix_document_revisions_document_status": ["document_id", "status"],
     "ix_document_artifacts_document_id": ["document_id"],

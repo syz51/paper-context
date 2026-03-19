@@ -18,6 +18,7 @@ from paper_context.retrieval.types import (
     ParentSectionResult,
     PassageResult,
     RerankItem,
+    SearchPage,
     TablePreview,
     TableResult,
 )
@@ -294,7 +295,9 @@ def test_build_context_pack_propagates_warnings_and_provenance() -> None:
             index_versions=("mvp-v1",),
         )
     )
-    service._search_passages_with_connection = MagicMock(return_value=[passage])  # type: ignore[method-assign]
+    service._search_passages_page_with_connection = MagicMock(  # type: ignore[method-assign]
+        return_value=SearchPage(items=(passage,), next_cursor=None, index_version="mvp-v1")
+    )
     service._search_tables_with_connection = MagicMock(return_value=[])  # type: ignore[method-assign]
     service._load_parent_sections = MagicMock(return_value=(parent_section,))  # type: ignore[method-assign]
     service._load_document_summaries = MagicMock(return_value=(document,))  # type: ignore[method-assign]
@@ -355,7 +358,9 @@ def test_build_context_pack_rejects_mixed_index_versions() -> None:
             index_versions=("mvp-v1", "mvp-v2"),
         )
     )
-    service._search_passages_with_connection = MagicMock(return_value=[passage])  # type: ignore[method-assign]
+    service._search_passages_page_with_connection = MagicMock(  # type: ignore[method-assign]
+        return_value=SearchPage(items=(passage,), next_cursor=None, index_version="mvp-v1")
+    )
     service._search_tables_with_connection = MagicMock(return_value=[table])  # type: ignore[method-assign]
 
     with pytest.raises(MixedIndexVersionError):
