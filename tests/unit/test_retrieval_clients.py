@@ -83,7 +83,10 @@ def test_post_json_wraps_http_and_url_errors(monkeypatch: pytest.MonkeyPatch) ->
             body: bytes,
             headers: dict[str, str],
         ) -> None:
-            del method, url, body, headers
+            assert method == "POST"
+            assert url == "/api"
+            assert body == b"{}"
+            assert headers["Accept"] == "application/json"
 
         def getresponse(self) -> _FakeResponse:
             return _FakeResponse(b"slow down", status=429)
@@ -106,7 +109,10 @@ def test_post_json_wraps_http_and_url_errors(monkeypatch: pytest.MonkeyPatch) ->
             body: bytes,
             headers: dict[str, str],
         ) -> None:
-            del method, url, body, headers
+            assert method == "POST"
+            assert url == "/api"
+            assert body == b"{}"
+            assert headers["Accept"] == "application/json"
             raise OSError("offline")
 
         def close(self) -> None:

@@ -135,21 +135,6 @@ _DOCUMENT_PASSAGES_SQL = table(
     column("quant_tags"),
     column("artifact_id"),
 )
-_DOCUMENT_TABLES_SQL = table(
-    "document_tables",
-    column("id"),
-    column("document_id"),
-    column("revision_id"),
-    column("section_id"),
-    column("caption"),
-    column("table_type"),
-    column("headers_json"),
-    column("rows_json"),
-    column("page_start"),
-    column("page_end"),
-    column("quant_tags"),
-    column("artifact_id"),
-)
 _RETRIEVAL_INDEX_RUNS_SQL = table(
     "retrieval_index_runs",
     column("id"),
@@ -168,33 +153,6 @@ _RETRIEVAL_INDEX_RUNS_SQL = table(
     column("is_active"),
     column("activated_at"),
     column("deactivated_at"),
-    column("created_at"),
-)
-_RETRIEVAL_PASSAGE_ASSETS_SQL = table(
-    "retrieval_passage_assets",
-    column("id"),
-    column("retrieval_index_run_id"),
-    column("revision_id"),
-    column("document_id"),
-    column("passage_id"),
-    column("section_id"),
-    column("publication_year"),
-    column("search_text"),
-    column("search_tsvector"),
-    column("embedding"),
-    column("created_at"),
-)
-_RETRIEVAL_TABLE_ASSETS_SQL = table(
-    "retrieval_table_assets",
-    column("id"),
-    column("retrieval_index_run_id"),
-    column("revision_id"),
-    column("document_id"),
-    column("table_id"),
-    column("section_id"),
-    column("publication_year"),
-    column("search_text"),
-    column("search_tsvector"),
     column("created_at"),
 )
 

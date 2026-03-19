@@ -8,7 +8,6 @@ from uuid import uuid4
 
 import pytest
 
-import paper_context.queue.contracts as queue_contracts
 from paper_context.ingestion.queue import IngestionQueueService
 from paper_context.ingestion.service import (
     DeterministicIngestProcessor,
@@ -219,7 +218,7 @@ def test_claim_ingest_returns_archived_message_when_missing_job_and_poll_budget_
     missing_status.mappings.return_value.one_or_none.return_value = None
     connection.execute.return_value = missing_status
     monotonic = MagicMock(side_effect=[100.0, 102.0])
-    monkeypatch.setattr(queue_contracts.time, "monotonic", monotonic)
+    monkeypatch.setattr("paper_context.queue.contracts.time.monotonic", monotonic)
 
     claimed = queue.claim_ingest(connection, 3, 1, poll_interval_ms=1)
 
@@ -271,6 +270,24 @@ def test_lease_extender_uses_default_and_overridden_vt() -> None:
 
     adapter.extend_lease.assert_any_call(connection, 7, 60)
     adapter.extend_lease.assert_any_call(connection, 7, 5)
+
+
+def test_lease_extender_passes_transactional_when_factory_supports_it() -> None:
+    adapter = MagicMock()
+    connection = MagicMock()
+    message = MagicMock(msg_id=7)
+    seen: list[bool] = []
+
+    def connection_factory(*, transactional: bool = False):
+        seen.append(transactional)
+        return nullcontext(connection)
+
+    lease = LeaseExtender(connection_factory, adapter, message, default_vt_seconds=60)
+
+    lease.extend()
+
+    assert seen == [True]
+    adapter.extend_lease.assert_called_once_with(connection, 7, 60)
 
 
 def test_synthetic_processor_returns_on_terminal_status() -> None:

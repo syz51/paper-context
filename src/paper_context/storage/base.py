@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Protocol
@@ -17,11 +18,15 @@ class StorageLimitExceededError(ValueError):
 
 
 class StorageInterface(Protocol):
+    @abstractmethod
     def ensure_root(self) -> None:
-        pass
+        return None
 
-    def store_bytes(self, relative_path: str, content: bytes) -> StorageArtifact: ...
+    @abstractmethod
+    def store_bytes(self, relative_path: str, content: bytes) -> StorageArtifact:
+        raise NotImplementedError
 
+    @abstractmethod
     def store_file(
         self,
         relative_path: str,
@@ -29,8 +34,13 @@ class StorageInterface(Protocol):
         *,
         max_size_bytes: int | None = None,
         chunk_size: int = 1024 * 1024,
-    ) -> StorageArtifact: ...
+    ) -> StorageArtifact:
+        raise NotImplementedError
 
-    def resolve(self, storage_ref: str) -> Path: ...
+    @abstractmethod
+    def resolve(self, storage_ref: str) -> Path:
+        raise NotImplementedError
 
-    def delete(self, storage_ref: str) -> None: ...
+    @abstractmethod
+    def delete(self, storage_ref: str) -> None:
+        raise NotImplementedError

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from abc import abstractmethod
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, TypeVar
 
@@ -35,25 +36,29 @@ class EmbeddingClient(Protocol):
     provider: str
     model: str
 
+    @abstractmethod
     def embed(
         self,
         texts: list[str],
         *,
         input_type: EmbeddingInputType,
-    ) -> EmbeddingBatch: ...
+    ) -> EmbeddingBatch:
+        raise NotImplementedError
 
 
 class RerankerClient(Protocol):
     provider: str
     model: str
 
+    @abstractmethod
     def rerank(
         self,
         *,
         query: str,
         documents: list[str],
         top_n: int | None = None,
-    ) -> list[RerankItem]: ...
+    ) -> list[RerankItem]:
+        raise NotImplementedError
 
 
 @dataclass(frozen=True)

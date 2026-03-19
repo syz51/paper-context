@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import tempfile
+from abc import abstractmethod
 from collections import OrderedDict
 from collections.abc import Callable
 from io import BytesIO
@@ -36,6 +37,7 @@ _YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
 class PdfParser(Protocol):
     name: str
 
+    @abstractmethod
     def parse(
         self,
         filename: str,
@@ -44,7 +46,7 @@ class PdfParser(Protocol):
         source_path: Path | None = None,
     ) -> ParserResult:
         """Parse a PDF document into a normalized intermediate representation."""
-        ...
+        raise NotImplementedError
 
 
 def _page_bounds(item) -> tuple[int | None, int | None]:

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Protocol, TypedDict, cast
 
@@ -106,13 +107,27 @@ class LeaseExtender:
         self._message = message
         self._default_vt_seconds = default_vt_seconds
 
+    def _open_connection(self) -> AbstractContextManager[Connection]:
+        try:
+            parameters = signature(self._connection_factory).parameters.values()
+        except TypeError, ValueError:
+            parameters = ()
+
+        supports_transactional = any(
+            parameter.kind is Parameter.VAR_KEYWORD
+            or (
+                parameter.name == "transactional"
+                and parameter.kind in (Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY)
+            )
+            for parameter in parameters
+        )
+        if not supports_transactional:
+            return self._connection_factory()
+        return self._connection_factory(**{"transactional": True})
+
     def extend(self, vt_seconds: int | None = None) -> None:
         vt_seconds = vt_seconds or self._default_vt_seconds
-        try:
-            context = self._connection_factory(transactional=True)
-        except TypeError:
-            context = self._connection_factory()
-        with context as connection:
+        with self._open_connection() as connection:
             self._queue_adapter.extend_lease(connection, self._message.msg_id, vt_seconds)
 
 
