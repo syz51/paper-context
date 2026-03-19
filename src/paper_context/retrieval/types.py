@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Literal, Protocol, TypeVar
 
 EmbeddingInputType = Literal["query", "document"]
 RetrievalMode = Literal["sparse", "dense"]
@@ -83,6 +83,7 @@ class PassageResult:
     page_end: int | None
     index_version: str
     retrieval_index_run_id: uuid.UUID
+    parser_source: str | None = None
     warnings: tuple[str, ...] = ()
 
 
@@ -102,6 +103,44 @@ class TableResult:
     page_end: int | None
     index_version: str
     retrieval_index_run_id: uuid.UUID
+    parser_source: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class TableDetailResult:
+    table_id: uuid.UUID
+    document_id: uuid.UUID
+    section_id: uuid.UUID
+    document_title: str
+    section_path: tuple[str, ...]
+    caption: str | None
+    table_type: str | None
+    headers: tuple[str, ...]
+    rows: tuple[tuple[str, ...], ...]
+    row_count: int
+    page_start: int | None
+    page_end: int | None
+    index_version: str | None
+    retrieval_index_run_id: uuid.UUID | None
+    parser_source: str | None = None
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PassageContextTarget:
+    passage_id: uuid.UUID
+    document_id: uuid.UUID
+    section_id: uuid.UUID
+    document_title: str
+    section_path: tuple[str, ...]
+    text: str
+    chunk_ordinal: int
+    page_start: int | None
+    page_end: int | None
+    index_version: str | None
+    retrieval_index_run_id: uuid.UUID | None
+    parser_source: str | None = None
     warnings: tuple[str, ...] = ()
 
 
@@ -156,3 +195,21 @@ class ContextPackResult:
     documents: tuple[DocumentSummary, ...]
     provenance: ContextPackProvenance
     warnings: tuple[str, ...] = ()
+    next_cursor: str | None = None
+
+
+@dataclass(frozen=True)
+class PassageContextResult:
+    passage: PassageContextTarget
+    context_passages: tuple[ContextPassage, ...]
+    warnings: tuple[str, ...] = ()
+
+
+TResult = TypeVar("TResult")
+
+
+@dataclass(frozen=True)
+class SearchPage[TResult]:
+    items: tuple[TResult, ...]
+    next_cursor: str | None = None
+    index_version: str | None = None

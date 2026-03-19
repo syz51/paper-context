@@ -160,3 +160,38 @@ def test_worker_does_not_archive_when_processing_is_deferred() -> None:
     assert worker.run_once() is None
 
     queue.archive_message.assert_not_called()
+
+
+def test_worker_returns_archived_terminal_redelivery_without_reprocessing() -> None:
+    payload = IngestQueuePayload(ingest_job_id=uuid4(), document_id=uuid4())
+    message = PgmqMessage(
+        msg_id=9,
+        read_ct=2,
+        enqueued_at=datetime.now(UTC),
+        vt=datetime.now(UTC),
+        message={
+            "ingest_job_id": str(payload.ingest_job_id),
+            "document_id": str(payload.document_id),
+        },
+    )
+    queue = MagicMock(spec=IngestionQueue)
+    queue.claim_ingest.return_value = ClaimedIngestMessage(
+        message=message,
+        payload=payload,
+        already_archived=True,
+    )
+    processor = MagicMock()
+    claim_connection = MagicMock()
+    worker = IngestWorker(
+        connection_factory=lambda: contextlib.nullcontext(claim_connection),
+        queue_adapter=queue,
+        processor=processor,
+    )
+
+    handled = worker.run_once()
+
+    assert handled is not None
+    assert handled.already_archived is True
+    queue.extend_lease.assert_not_called()
+    processor.process.assert_not_called()
+    queue.archive_message.assert_not_called()

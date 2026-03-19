@@ -121,3 +121,11 @@ def test_readiness_response_matches_golden_contract(
 def test_api_and_mcp_schema_exports_stay_aligned() -> None:
     assert api_schemas.HealthResponse is mcp_schemas.HealthResponse
     assert api_schemas.ReadinessResponse is mcp_schemas.ReadinessResponse
+    assert api_schemas.DocumentListResponse is mcp_schemas.DocumentListResponse
+    assert api_schemas.DocumentOutlineResponse is mcp_schemas.DocumentOutlineResponse
+    assert api_schemas.DocumentResult is mcp_schemas.DocumentResult
+    assert api_schemas.PassageSearchResponse is mcp_schemas.PassageSearchResponse
+    assert api_schemas.TableSearchResponse is mcp_schemas.TableSearchResponse
+    assert api_schemas.PassageContextResponse is mcp_schemas.PassageContextResponse
+    assert api_schemas.TableDetailResponse is mcp_schemas.TableDetailResponse
+    assert api_schemas.ContextPackResponse is mcp_schemas.ContextPackResponse

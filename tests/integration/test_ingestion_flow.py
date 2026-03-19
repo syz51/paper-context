@@ -604,6 +604,106 @@ def test_documents_upload_cleans_up_source_artifact_when_queue_write_fails(
     assert list((tmp_path / "artifacts").rglob("*")) == []
 
 
+def test_documents_replace_enqueues_new_job_and_preserves_prior_source_pdf(
+    migrated_postgres_engine,
+    unique_queue_name: str,
+    tmp_path: Path,
+) -> None:
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            text("SELECT pgmq.create(:queue_name)"),
+            {"queue_name": unique_queue_name},
+        )
+
+    queue = IngestionQueue(unique_queue_name)
+    storage_root = tmp_path / "artifacts"
+    initial = _create_uploaded_document(
+        migrated_postgres_engine,
+        queue,
+        storage_root,
+        title="Original title",
+    )
+    service = DocumentsApiService(
+        engine=migrated_postgres_engine,
+        queue=queue,
+        storage=LocalFilesystemStorage(storage_root),
+        max_upload_bytes=5 * 1024 * 1024,
+    )
+
+    replacement = service.replace_document(
+        initial.document_id,
+        filename="replacement.pdf",
+        content_type="application/pdf",
+        upload=BytesIO(b"%PDF-1.4\nreplacement"),
+        title="Replacement title",
+    )
+
+    assert replacement.document_id == initial.document_id
+    assert replacement.ingest_job_id != initial.ingest_job_id
+    assert replacement.status == "queued"
+
+    with migrated_postgres_engine.begin() as connection:
+        document = (
+            connection.execute(
+                text(
+                    """
+                    SELECT title, current_status
+                    FROM documents
+                    WHERE id = :document_id
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .one()
+        )
+        jobs = (
+            connection.execute(
+                text(
+                    """
+                    SELECT id, trigger, status
+                    FROM ingest_jobs
+                    WHERE document_id = :document_id
+                    ORDER BY created_at, id
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .all()
+        )
+        source_pdfs = (
+            connection.execute(
+                text(
+                    """
+                    SELECT ingest_job_id, storage_ref
+                    FROM document_artifacts
+                    WHERE document_id = :document_id
+                      AND artifact_type = 'source_pdf'
+                    ORDER BY ingest_job_id
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .all()
+        )
+        claimed = queue.claim_ingest(
+            connection,
+            vt_seconds=30,
+            max_poll_seconds=1,
+            poll_interval_ms=10,
+        )
+
+    assert document["title"] == "Replacement title"
+    assert document["current_status"] == "queued"
+    assert [job["trigger"] for job in jobs] == ["upload", "replace"]
+    assert len(source_pdfs) == 2
+    assert claimed is not None
+    assert claimed.payload.ingest_job_id == replacement.ingest_job_id
+    assert all((storage_root / row["storage_ref"]).exists() for row in source_pdfs)
+
+
 def test_replay_after_parser_artifact_crash_is_idempotent(
     migrated_postgres_engine,
     unique_queue_name: str,

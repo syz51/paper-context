@@ -55,6 +55,8 @@ class IngestWorker:
             )
         if task is None:
             return None
+        if task.already_archived:
+            return task
 
         lease = LeaseExtender(
             self._open_connection,

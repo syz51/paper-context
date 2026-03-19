@@ -62,10 +62,57 @@ def test_claim_ingest_returns_first_message() -> None:
     adapter.read_with_poll.return_value = [_make_message(payload)]
     queue = IngestionQueue("document_ingest")
     queue._queue = adapter
+    connection = MagicMock()
+    status_result = MagicMock()
+    status_result.mappings.return_value.one_or_none.return_value = {"status": "queued"}
+    connection.execute.return_value = status_result
 
-    claimed = queue.claim_ingest(MagicMock(), 3, 1, poll_interval_ms=1)
+    claimed = queue.claim_ingest(connection, 3, 1, poll_interval_ms=1)
     assert claimed is not None
     assert str(claimed.payload.document_id) == payload["document_id"]
+
+
+def test_claim_ingest_archives_terminal_message_and_returns_next_claimable_message() -> None:
+    stale_payload = {"ingest_job_id": str(uuid4()), "document_id": str(uuid4())}
+    fresh_payload = {"ingest_job_id": str(uuid4()), "document_id": str(uuid4())}
+    stale_message = _make_message(stale_payload)
+    fresh_message = _make_message(fresh_payload)
+    adapter = MagicMock()
+    adapter.read_with_poll.side_effect = [[stale_message], [fresh_message]]
+    queue = IngestionQueue("document_ingest")
+    queue._queue = adapter
+    connection = MagicMock()
+    stale_status = MagicMock()
+    stale_status.mappings.return_value.one_or_none.return_value = {"status": "failed"}
+    fresh_status = MagicMock()
+    fresh_status.mappings.return_value.one_or_none.return_value = {"status": "queued"}
+    connection.execute.side_effect = [stale_status, fresh_status]
+
+    claimed = queue.claim_ingest(connection, 3, 5, poll_interval_ms=1)
+
+    assert claimed is not None
+    assert claimed.message == fresh_message
+    adapter.archive_message.assert_called_once_with(connection, stale_message.msg_id)
+
+
+def test_claim_ingest_returns_archived_terminal_message_when_no_fresh_message_follows() -> None:
+    stale_payload = {"ingest_job_id": str(uuid4()), "document_id": str(uuid4())}
+    stale_message = _make_message(stale_payload)
+    adapter = MagicMock()
+    adapter.read_with_poll.side_effect = [[stale_message], []]
+    queue = IngestionQueue("document_ingest")
+    queue._queue = adapter
+    connection = MagicMock()
+    stale_status = MagicMock()
+    stale_status.mappings.return_value.one_or_none.return_value = {"status": "ready"}
+    connection.execute.return_value = stale_status
+
+    claimed = queue.claim_ingest(connection, 3, 1, poll_interval_ms=1)
+
+    assert claimed is not None
+    assert claimed.message == stale_message
+    assert claimed.already_archived is True
+    adapter.archive_message.assert_called_once_with(connection, stale_message.msg_id)
 
 
 def test_enqueue_ingest_merges_trace_metadata_and_headers() -> None:

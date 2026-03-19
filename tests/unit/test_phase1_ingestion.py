@@ -228,6 +228,48 @@ def test_documents_api_service_stores_source_artifact_and_enqueues_job(tmp_path:
     queue.enqueue_ingest.assert_called_once()
 
 
+def test_replace_document_supersedes_older_queued_jobs_before_enqueuing_new_job() -> None:
+    engine = MagicMock()
+    connection = MagicMock()
+    engine.begin.return_value = nullcontext(connection)
+    update_result = MagicMock()
+    update_result.rowcount = 1
+    connection.execute.side_effect = [
+        update_result,
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+    ]
+    queue = MagicMock()
+    storage = MagicMock()
+    storage.store_file.return_value = SimpleNamespace(
+        storage_ref="documents/source.pdf",
+        checksum="abc123",
+    )
+    service = DocumentsApiService(engine=engine, queue=queue, storage=storage)
+
+    response = service.replace_document(
+        uuid4(),
+        filename="replacement.pdf",
+        content_type="application/pdf",
+        upload=BytesIO(b"%PDF-1.4\nreplacement"),
+        title="Replacement title",
+    )
+
+    assert response.status == "queued"
+    supersede_calls = [
+        call
+        for call in connection.execute.call_args_list
+        if len(call.args) > 1
+        and isinstance(call.args[1], dict)
+        and call.args[1].get("failure_code") == "superseded_by_newer_ingest_job"
+    ]
+    assert len(supersede_calls) == 1
+    queue.enqueue_ingest.assert_called_once()
+
+
 def test_documents_api_service_get_ingest_job_returns_schema() -> None:
     engine = MagicMock()
     connection = MagicMock()

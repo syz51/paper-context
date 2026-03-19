@@ -12,6 +12,8 @@ from typing import Any, Literal, cast
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql import text
 
+from paper_context.pagination import CursorError, decode_cursor, encode_cursor, fingerprint_payload
+
 from .clients import (
     DeterministicEmbeddingClient,
     HeuristicRerankerClient,
@@ -24,11 +26,15 @@ from .types import (
     EmbeddingClient,
     MixedIndexVersionError,
     ParentSectionResult,
+    PassageContextResult,
+    PassageContextTarget,
     PassageResult,
     RerankerClient,
     RetrievalError,
     RetrievalFilters,
     RetrievalMode,
+    SearchPage,
+    TableDetailResult,
     TablePreview,
     TableResult,
 )
@@ -128,6 +134,7 @@ class _Candidate:
     index_version: str
     warnings: tuple[str, ...]
     rerank_text: str
+    parser_source: str | None = None
     retrieval_modes: set[str] = field(default_factory=set)
     fused_score: float = 0.0
     score: float = 0.0
@@ -700,13 +707,25 @@ class RetrievalService:
                 limit=limit,
             )
 
-    def build_context_pack(
+    def search_passages_page(
         self,
         *,
         query: str,
         filters: RetrievalFilters | None = None,
-    ) -> ContextPackResult:
+        cursor: str | None = None,
+        limit: int = PASSAGE_RESULT_LIMIT,
+    ) -> SearchPage[PassageResult]:
         filters = filters or RetrievalFilters()
+        fingerprint = fingerprint_payload(
+            {
+                "kind": "passages",
+                "query": query.strip(),
+                "filters": {
+                    "document_ids": [str(document_id) for document_id in filters.document_ids],
+                    "publication_years": list(filters.publication_years),
+                },
+            }
+        )
         with self._connection() as connection:
             filtered_document_ids = self._resolve_filtered_document_ids(
                 connection,
@@ -716,23 +735,136 @@ class RetrievalService:
                 connection,
                 filtered_document_ids=filtered_document_ids,
             )
-            passages = tuple(
+            results = tuple(
                 self._search_passages_with_connection(
                     connection,
                     query=query,
                     filters=filters,
-                    limit=PASSAGE_RESULT_LIMIT,
+                    limit=PASSAGE_FUSED_CANDIDATES,
                     filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
                 )
             )
+            return cast(
+                SearchPage[PassageResult],
+                self._paginate_ranked_results(
+                    kind="passages",
+                    results=results,
+                    limit=limit,
+                    cursor=cursor,
+                    active_runs=active_runs,
+                    fingerprint=fingerprint,
+                ),
+            )
+
+    def search_tables_page(
+        self,
+        *,
+        query: str,
+        filters: RetrievalFilters | None = None,
+        cursor: str | None = None,
+        limit: int = TABLE_RESULT_LIMIT,
+    ) -> SearchPage[TableResult]:
+        filters = filters or RetrievalFilters()
+        fingerprint = fingerprint_payload(
+            {
+                "kind": "tables",
+                "query": query.strip(),
+                "filters": {
+                    "document_ids": [str(document_id) for document_id in filters.document_ids],
+                    "publication_years": list(filters.publication_years),
+                },
+            }
+        )
+        with self._connection() as connection:
+            filtered_document_ids = self._resolve_filtered_document_ids(
+                connection,
+                filters=filters,
+            )
+            active_runs = self._resolve_active_run_selection(
+                connection,
+                filtered_document_ids=filtered_document_ids,
+            )
+            results = tuple(
+                self._search_tables_with_connection(
+                    connection,
+                    query=query,
+                    filters=filters,
+                    limit=TABLE_FUSED_CANDIDATES,
+                    filtered_document_ids=filtered_document_ids,
+                    active_runs=active_runs,
+                )
+            )
+            return cast(
+                SearchPage[TableResult],
+                self._paginate_ranked_results(
+                    kind="tables",
+                    results=results,
+                    limit=limit,
+                    cursor=cursor,
+                    active_runs=active_runs,
+                    fingerprint=fingerprint,
+                ),
+            )
+
+    def build_context_pack(
+        self,
+        *,
+        query: str,
+        filters: RetrievalFilters | None = None,
+        cursor: str | None = None,
+        limit: int = PASSAGE_RESULT_LIMIT,
+    ) -> ContextPackResult:
+        filters = filters or RetrievalFilters()
+        fingerprint = fingerprint_payload(
+            {
+                "kind": "context_pack",
+                "query": query.strip(),
+                "filters": {
+                    "document_ids": [str(document_id) for document_id in filters.document_ids],
+                    "publication_years": list(filters.publication_years),
+                },
+            }
+        )
+        with self._connection() as connection:
+            filtered_document_ids = self._resolve_filtered_document_ids(
+                connection,
+                filters=filters,
+            )
+            active_runs = self._resolve_active_run_selection(
+                connection,
+                filtered_document_ids=filtered_document_ids,
+            )
+            all_passages = tuple(
+                self._search_passages_with_connection(
+                    connection,
+                    query=query,
+                    filters=filters,
+                    limit=PASSAGE_FUSED_CANDIDATES,
+                    filtered_document_ids=filtered_document_ids,
+                    active_runs=active_runs,
+                )
+            )
+            passage_page = cast(
+                SearchPage[PassageResult],
+                self._paginate_ranked_results(
+                    kind="context_pack",
+                    results=all_passages,
+                    limit=limit,
+                    cursor=cursor,
+                    active_runs=active_runs,
+                    fingerprint=fingerprint,
+                ),
+            )
+            passages = passage_page.items
+            pack_document_ids = tuple(dict.fromkeys(result.document_id for result in passages))
             tables = tuple(
                 self._search_tables_with_connection(
                     connection,
                     query=query,
                     filters=filters,
                     limit=TABLE_RESULT_LIMIT,
-                    filtered_document_ids=filtered_document_ids,
+                    filtered_document_ids=pack_document_ids or filtered_document_ids,
                     active_runs=active_runs,
                 )
             )
@@ -786,6 +918,211 @@ class RetrievalService:
             documents=documents,
             provenance=provenance,
             warnings=warnings,
+            next_cursor=passage_page.next_cursor,
+        )
+
+    def get_table(self, *, table_id: uuid.UUID) -> TableDetailResult | None:
+        index_version_clause = ""
+        params: dict[str, object] = {"table_id": table_id}
+        if self._active_index_version is not None:
+            index_version_clause = "AND runs.index_version = :index_version"
+            params["index_version"] = self._active_index_version
+        with self._connection() as connection:
+            row = (
+                connection.execute(
+                    text(
+                        f"""
+                        SELECT
+                            tables.id AS table_id,
+                            tables.document_id,
+                            tables.section_id,
+                            COALESCE(documents.title, 'Untitled document') AS document_title,
+                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
+                            tables.caption,
+                            tables.table_type,
+                            COALESCE(tables.headers_json, '[]'::jsonb) AS headers_json,
+                            COALESCE(tables.rows_json, '[]'::jsonb) AS rows_json,
+                            tables.page_start,
+                            tables.page_end,
+                            runs.id AS retrieval_index_run_id,
+                            runs.index_version,
+                            runs.parser_source,
+                            COALESCE(jobs.warnings, '[]'::jsonb) AS warnings
+                        FROM document_tables tables
+                        JOIN documents
+                          ON documents.id = tables.document_id
+                        JOIN document_sections sections
+                          ON sections.id = tables.section_id
+                        LEFT JOIN retrieval_index_runs runs
+                          ON runs.document_id = tables.document_id
+                         AND runs.status = 'ready'
+                         AND runs.is_active = true
+                         {index_version_clause}
+                        LEFT JOIN ingest_jobs jobs
+                          ON jobs.id = runs.ingest_job_id
+                        WHERE tables.id = :table_id
+                        ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC NULLS LAST
+                        LIMIT 1
+                        """  # nosec B608
+                    ),
+                    params,
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            return None
+        headers = tuple(str(value) for value in cast(list[object], row["headers_json"] or []))
+        rows = tuple(
+            tuple(str(cell) for cell in cast(list[object], table_row))
+            for table_row in cast(list[list[object]], row["rows_json"] or [])
+        )
+        return TableDetailResult(
+            table_id=row["table_id"],
+            document_id=row["document_id"],
+            section_id=row["section_id"],
+            document_title=row["document_title"],
+            section_path=tuple(cast(list[str], row["section_path"] or [])),
+            caption=row["caption"],
+            table_type=row["table_type"],
+            headers=headers,
+            rows=rows,
+            row_count=len(rows),
+            page_start=row["page_start"],
+            page_end=row["page_end"],
+            index_version=row["index_version"],
+            retrieval_index_run_id=row["retrieval_index_run_id"],
+            parser_source=row["parser_source"],
+            warnings=tuple(cast(list[str], row["warnings"] or [])),
+        )
+
+    def get_passage_context(
+        self,
+        *,
+        passage_id: uuid.UUID,
+        before: int = 1,
+        after: int = 1,
+    ) -> PassageContextResult | None:
+        before = max(0, before)
+        after = max(0, after)
+        index_version_clause = ""
+        params: dict[str, object] = {"passage_id": passage_id}
+        if self._active_index_version is not None:
+            index_version_clause = "AND runs.index_version = :index_version"
+            params["index_version"] = self._active_index_version
+        with self._connection() as connection:
+            row = (
+                connection.execute(
+                    text(
+                        f"""
+                        SELECT
+                            passages.id AS passage_id,
+                            passages.document_id,
+                            passages.section_id,
+                            passages.body_text,
+                            passages.chunk_ordinal,
+                            passages.page_start,
+                            passages.page_end,
+                            COALESCE(documents.title, 'Untitled document') AS document_title,
+                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
+                            runs.id AS retrieval_index_run_id,
+                            runs.index_version,
+                            runs.parser_source,
+                            COALESCE(jobs.warnings, '[]'::jsonb) AS warnings
+                        FROM document_passages passages
+                        JOIN document_sections sections
+                          ON sections.id = passages.section_id
+                        JOIN documents
+                          ON documents.id = passages.document_id
+                        LEFT JOIN retrieval_index_runs runs
+                          ON runs.document_id = passages.document_id
+                         AND runs.status = 'ready'
+                         AND runs.is_active = true
+                         {index_version_clause}
+                        LEFT JOIN ingest_jobs jobs
+                          ON jobs.id = runs.ingest_job_id
+                        WHERE passages.id = :passage_id
+                        ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC NULLS LAST
+                        LIMIT 1
+                        """  # nosec B608
+                    ),
+                    params,
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if row is None:
+                return None
+
+            section_rows = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT
+                            passages.id AS passage_id,
+                            passages.body_text,
+                            passages.chunk_ordinal,
+                            passages.page_start,
+                            passages.page_end
+                        FROM document_passages passages
+                        WHERE passages.section_id = :section_id
+                        ORDER BY passages.chunk_ordinal, passages.id
+                        """
+                    ),
+                    {"section_id": row["section_id"]},
+                )
+                .mappings()
+                .all()
+            )
+
+        selected_index = next(
+            (
+                index
+                for index, section_row in enumerate(section_rows)
+                if section_row["passage_id"] == passage_id
+            ),
+            None,
+        )
+        if selected_index is None:
+            return None
+
+        start = max(0, selected_index - before)
+        end = min(len(section_rows), selected_index + after + 1)
+        context_passages = tuple(
+            ContextPassage(
+                passage_id=section_row["passage_id"],
+                text=section_row["body_text"],
+                chunk_ordinal=section_row["chunk_ordinal"],
+                page_start=section_row["page_start"],
+                page_end=section_row["page_end"],
+                relationship=cast(
+                    Literal["selected", "sibling"],
+                    "selected" if index == selected_index else "sibling",
+                ),
+            )
+            for index, section_row in enumerate(section_rows[start:end], start=start)
+        )
+        warnings: list[str] = list(cast(list[str], row["warnings"] or []))
+        if start > 0 or end < len(section_rows):
+            warnings.append("parent_context_truncated")
+        return PassageContextResult(
+            passage=PassageContextTarget(
+                passage_id=row["passage_id"],
+                document_id=row["document_id"],
+                section_id=row["section_id"],
+                document_title=row["document_title"],
+                section_path=tuple(cast(list[str], row["section_path"] or [])),
+                text=row["body_text"],
+                chunk_ordinal=row["chunk_ordinal"],
+                page_start=row["page_start"],
+                page_end=row["page_end"],
+                index_version=row["index_version"],
+                retrieval_index_run_id=row["retrieval_index_run_id"],
+                parser_source=row["parser_source"],
+                warnings=tuple(cast(list[str], row["warnings"] or [])),
+            ),
+            context_passages=context_passages,
+            warnings=_dedupe_warnings(warnings),
         )
 
     def _connection(self) -> AbstractContextManager[Connection]:
@@ -1042,6 +1379,7 @@ class RetrievalService:
                 COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
                 runs.id AS retrieval_index_run_id,
                 runs.index_version,
+                runs.parser_source,
                 COALESCE(jobs.warnings, '[]'::jsonb) AS warnings,
                 candidate_assets.rank_score
             FROM candidate_assets
@@ -1124,6 +1462,7 @@ class RetrievalService:
                 COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
                 runs.id AS retrieval_index_run_id,
                 runs.index_version,
+                runs.parser_source,
                 COALESCE(jobs.warnings, '[]'::jsonb) AS warnings,
                 candidate_assets.dense_score
             FROM candidate_assets
@@ -1201,6 +1540,7 @@ class RetrievalService:
                 COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
                 runs.id AS retrieval_index_run_id,
                 runs.index_version,
+                runs.parser_source,
                 COALESCE(jobs.warnings, '[]'::jsonb) AS warnings,
                 candidate_assets.search_text,
                 candidate_assets.rank_score
@@ -1287,8 +1627,9 @@ class RetrievalService:
         ]
         for candidate in remainder:
             candidate.score = candidate.fused_score
-        remainder.sort(key=lambda candidate: (-candidate.score, str(candidate.entity_id)))
-        return [*ordered, *remainder][:limit]
+        ranked = [*ordered, *remainder]
+        ranked.sort(key=lambda candidate: (-candidate.score, str(candidate.entity_id)))
+        return ranked[:limit]
 
     def _row_to_passage_candidate(self, row: Any) -> _Candidate:
         warnings = tuple(cast(list[str], row["warnings"] or []))
@@ -1303,6 +1644,7 @@ class RetrievalService:
             page_end=row["page_end"],
             retrieval_index_run_id=row["retrieval_index_run_id"],
             index_version=row["index_version"],
+            parser_source=row.get("parser_source"),
             warnings=warnings,
             rerank_text=row["contextualized_text"],
             passage_id=row["passage_id"],
@@ -1328,6 +1670,7 @@ class RetrievalService:
             page_end=row["page_end"],
             retrieval_index_run_id=row["retrieval_index_run_id"],
             index_version=row["index_version"],
+            parser_source=row.get("parser_source"),
             warnings=warnings,
             rerank_text=row["search_text"],
             table_id=row["table_id"],
@@ -1352,6 +1695,7 @@ class RetrievalService:
             page_end=candidate.page_end,
             index_version=candidate.index_version,
             retrieval_index_run_id=candidate.retrieval_index_run_id,
+            parser_source=candidate.parser_source,
             warnings=candidate.warnings,
         )
 
@@ -1373,6 +1717,7 @@ class RetrievalService:
             page_end=candidate.page_end,
             index_version=candidate.index_version,
             retrieval_index_run_id=candidate.retrieval_index_run_id,
+            parser_source=candidate.parser_source,
             warnings=candidate.warnings,
         )
 
@@ -1537,6 +1882,85 @@ class RetrievalService:
                 f"retrieval response mixed index versions: {sorted(versions)}"
             )
         return next(iter(versions))
+
+    def _paginate_ranked_results(
+        self,
+        *,
+        kind: str,
+        results: tuple[PassageResult, ...] | tuple[TableResult, ...],
+        limit: int,
+        cursor: str | None,
+        active_runs: _ActiveRunSelection,
+        fingerprint: str,
+    ) -> SearchPage[PassageResult] | SearchPage[TableResult]:
+        index_version = self._page_index_version(results=results, active_runs=active_runs)
+        ordered = tuple(
+            sorted(
+                results,
+                key=lambda result: (-result.score, self._result_identity(result)),
+            )
+        )
+        start_index = 0
+        if cursor is not None:
+            try:
+                payload = decode_cursor(cursor)
+            except CursorError as exc:
+                raise RetrievalError(str(exc)) from exc
+            if payload.get("kind") != kind or payload.get("fingerprint") != fingerprint:
+                raise RetrievalError("cursor does not match request")
+            cursor_version = payload.get("index_version")
+            if cursor_version != index_version:
+                raise RetrievalError("cursor index version is no longer active")
+            cursor_score = float(payload["score"])
+            cursor_entity_id = str(payload["entity_id"])
+            start_index = len(ordered)
+            for index, result in enumerate(ordered):
+                result_score = result.score
+                result_entity_id = self._result_identity(result)
+                if result_score < cursor_score or (
+                    result_score == cursor_score and result_entity_id > cursor_entity_id
+                ):
+                    start_index = index
+                    break
+
+        page_items = ordered[start_index : start_index + max(0, limit)]
+        next_cursor: str | None = None
+        if start_index + limit < len(ordered) and page_items:
+            last_result = page_items[-1]
+            next_cursor = encode_cursor(
+                {
+                    "kind": kind,
+                    "fingerprint": fingerprint,
+                    "index_version": index_version,
+                    "score": repr(last_result.score),
+                    "entity_id": self._result_identity(last_result),
+                }
+            )
+        return cast(
+            SearchPage[PassageResult] | SearchPage[TableResult],
+            SearchPage(
+                items=page_items,
+                next_cursor=next_cursor,
+                index_version=index_version,
+            ),
+        )
+
+    def _page_index_version(
+        self,
+        *,
+        results: tuple[PassageResult, ...] | tuple[TableResult, ...],
+        active_runs: _ActiveRunSelection,
+    ) -> str | None:
+        if len(active_runs.index_versions) > 1:
+            return self._ensure_single_index_version(list(results))
+        if active_runs.index_versions:
+            return active_runs.index_versions[0]
+        return self._ensure_single_index_version(list(results))
+
+    def _result_identity(self, result: PassageResult | TableResult) -> str:
+        if isinstance(result, PassageResult):
+            return str(result.passage_id)
+        return str(result.table_id)
 
 
 def _build_table_preview(

@@ -1172,3 +1172,178 @@ def test_active_retrieval_run_unique_index_blocks_duplicate_active_rows(
                 activated_at=now,
                 created_at=now,
             )
+
+
+def test_phase3_retrieval_helpers_support_cursor_table_detail_and_passage_context(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    section_id = uuid4()
+    first_passage_id = uuid4()
+    second_passage_id = uuid4()
+    table_id = uuid4()
+    ingest_job_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            insert(Document).values(
+                id=document_id,
+                title="Phase 3 retrieval paper",
+                source_type="upload",
+                current_status="ready",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                status="ready",
+                trigger="upload",
+                warnings=["parser_fallback_used"],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                heading="Methods",
+                heading_path=["Methods"],
+                ordinal=1,
+                page_start=1,
+                page_end=2,
+            )
+        )
+        connection.execute(
+            insert(DocumentPassage).values(
+                id=first_passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                chunk_ordinal=1,
+                body_text="Shared cursor keyword first passage.",
+                contextualized_text="Shared cursor keyword first passage.",
+                token_count=5,
+                page_start=1,
+                page_end=1,
+                provenance_offsets={"pages": [1], "charspans": [[0, 10]]},
+                artifact_id=None,
+            )
+        )
+        connection.execute(
+            insert(DocumentPassage).values(
+                id=second_passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                chunk_ordinal=2,
+                body_text="Shared cursor keyword second passage.",
+                contextualized_text="Shared cursor keyword second passage.",
+                token_count=5,
+                page_start=2,
+                page_end=2,
+                provenance_offsets={"pages": [2], "charspans": [[0, 10]]},
+                artifact_id=None,
+            )
+        )
+        connection.execute(
+            insert(DocumentTable).values(
+                id=table_id,
+                document_id=document_id,
+                section_id=section_id,
+                caption="Methods table",
+                table_type="lexical",
+                headers_json=["A", "B"],
+                rows_json=[["1", "2"], ["3", "4"]],
+                page_start=2,
+                page_end=2,
+                artifact_id=None,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        _insert_passage_asset(
+            connection,
+            run_id=run_id,
+            passage_id=first_passage_id,
+            document_id=document_id,
+            section_id=section_id,
+            publication_year=None,
+            search_text="Shared cursor keyword first passage.",
+            embedding=_vector_string(30),
+        )
+        _insert_passage_asset(
+            connection,
+            run_id=run_id,
+            passage_id=second_passage_id,
+            document_id=document_id,
+            section_id=section_id,
+            publication_year=None,
+            search_text="Shared cursor keyword second passage.",
+            embedding=_vector_string(31),
+        )
+        _insert_table_asset(
+            connection,
+            run_id=run_id,
+            table_id=table_id,
+            document_id=document_id,
+            section_id=section_id,
+            publication_year=None,
+            search_text="Methods table A B 1 2 3 4",
+        )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+        embedding_client=FixedEmbeddingClient({"shared cursor keyword": _vector_values(30)}),
+        reranker_client=IdentityReranker(),
+    )
+
+    first_page = service.search_passages_page(query="shared cursor keyword", limit=1)
+
+    assert len(first_page.items) == 1
+    assert first_page.next_cursor is not None
+    assert first_page.index_version == "mvp-v2"
+
+    second_page = service.search_passages_page(
+        query="shared cursor keyword",
+        limit=1,
+        cursor=first_page.next_cursor,
+    )
+
+    assert len(second_page.items) == 1
+    assert {first_page.items[0].passage_id, second_page.items[0].passage_id} == {
+        first_passage_id,
+        second_passage_id,
+    }
+
+    table = service.get_table(table_id=table_id)
+
+    assert table is not None
+    assert table.retrieval_index_run_id == run_id
+    assert table.index_version == "mvp-v2"
+    assert table.parser_source == "docling"
+    assert table.rows == (("1", "2"), ("3", "4"))
+    assert table.warnings == ("parser_fallback_used",)
+
+    context = service.get_passage_context(passage_id=first_passage_id, before=0, after=1)
+
+    assert context is not None
+    assert context.passage.parser_source == "docling"
+    assert context.passage.retrieval_index_run_id == run_id
+    assert [passage.relationship for passage in context.context_passages] == [
+        "selected",
+        "sibling",
+    ]
+    assert context.warnings == ("parser_fallback_used",)

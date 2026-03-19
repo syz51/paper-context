@@ -1,22 +1,24 @@
 # Paper Context
 
-Paper Context is a personal, retrieval-first project for born-digital research PDFs, especially quant and trading-relevant papers. The codebase now implements an ingestion-focused MVP slice: PDF upload, queued ingest jobs, deterministic worker processing, canonical Postgres normalization, local artifact storage, and a small operational API surface. The broader retrieval and MCP tool design still exists in `docs/`, but parts of that design are ahead of the current runtime.
+Paper Context is a personal, retrieval-first project for born-digital research PDFs, especially quant and trading-relevant papers. The codebase now implements the ingestion loop plus the phase-3 read and retrieval surfaces: PDF upload and replacement, queued ingest jobs, deterministic worker processing, canonical Postgres normalization, local artifact storage, document inspection routes, and curated MCP retrieval tools.
 
 > **Status**
 >
 > What is implemented today:
 >
-> - FastAPI endpoints for `POST /documents`, `GET /ingest-jobs/{ingest_job_id}`, `GET /healthz`, and `GET /readyz`
+> - FastAPI endpoints for upload, replacement, document inspection, ingest status, health, and readiness
 > - A queue-backed worker that runs deterministic ingest stages from upload through `ready` or `failed`
 > - Docling-first parsing with `pdfplumber` fallback when structure is degraded
 > - Normalization into documents, sections, passages, tables, references, artifacts, and retrieval-index metadata
+> - Shared retrieval pagination for passages, tables, and context packs with `index_version`-bound opaque cursors
+> - Mounted FastMCP tools for `search_documents`, `search_passages`, `search_tables`, `get_document_outline`, `get_table`, `get_passage_context`, and `build_context_pack`
 > - Local filesystem artifact storage and Docker Compose bring-up for `db`, `app`, `worker`, and `migrate`
 >
 > What is still target-state / not fully implemented yet:
 >
-> - Retrieval query APIs and the shared retrieval service are still placeholders
-> - The mounted MCP transport exists at `/mcp`, but the curated retrieval tools described in `docs/apis-and-tools.md` are not wired up yet
-> - Provider-backed enrichment, embedding writes, and reranking are represented in the design and index metadata, but not yet exposed as a live end-to-end retrieval path
+> - Replace-document flows still use one active canonical state per `document_id`; revision-safe historical provenance is still deferred
+> - Provider-backed enrichment remains intentionally minimal
+> - Operational hardening, metrics, and broader regression coverage are still ahead of the runtime
 
 ## Why This Exists
 
@@ -44,11 +46,11 @@ This repo is where I pressure-test that design in code. The current implementati
 
 The implemented runtime is organized around three active surfaces:
 
-- `app`: FastAPI service exposing upload, ingest-status, health, readiness, and a mounted MCP HTTP transport
+- `app`: FastAPI service exposing upload, replacement, document inspection, ingest-status, health, readiness, and a mounted MCP HTTP transport
 - `worker`: queue-backed ingestion process that parses, normalizes, writes artifacts, creates passages, and records retrieval-index runs
 - `db`: Postgres + pgvector + PGMQ, started locally through Docker Compose
 
-The top-level README tracks the current runtime. The `docs/` directory describes the broader MVP design, including retrieval and MCP contracts that are only partially implemented today.
+The top-level README tracks the current runtime. The `docs/` directory still describes the broader MVP design, with phase-4 hardening and revision-safe replacement semantics still ahead of the runtime.
 
 ## Implemented Ingestion Flow
 
@@ -78,21 +80,24 @@ Implemented endpoints:
 - `POST /documents`
   - accepts multipart upload with `file` and optional `title`
   - returns `document_id`, `ingest_job_id`, and initial `status`
+- `GET /documents`
+  - returns paginated lightweight document records with opaque cursors
+- `GET /documents/{document_id}`
+  - returns the current document record, including `active_index_version`
+- `GET /documents/{document_id}/outline`
+  - returns the current section tree for the document
+- `GET /documents/{document_id}/tables`
+  - returns the current canonical table set for the document
 - `GET /ingest-jobs/{ingest_job_id}`
   - returns current job status, warnings, timestamps, trigger, and any failure details
+- `POST /documents/{document_id}/replace`
+  - stages a replacement PDF and enqueues a new ingest job for the same `document_id`
 - `GET /healthz`
   - lightweight liveness check
 - `GET /readyz`
   - readiness check that includes database status, storage root, and queue name
 - `GET /mcp`
-  - mounted Streamable HTTP MCP transport shell
-
-Not yet implemented in the runtime:
-
-- document listing and detail reads
-- retrieval queries
-- table/document/passage search endpoints
-- curated MCP retrieval tools
+  - mounted Streamable HTTP MCP transport with curated tools for document search, passage/table retrieval, outline inspection, table lookup, passage context, and context-pack assembly
 
 ## CLI Commands
 

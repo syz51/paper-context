@@ -1,0 +1,11 @@
+{
+  "document_id": "11111111-1111-1111-1111-111111111111",
+  "title": "Phase 3 paper",
+  "authors": ["Ada Lovelace"],
+  "publication_year": 2024,
+  "quant_tags": {
+    "asset_universe": "rates"
+  },
+  "current_status": "ready",
+  "active_index_version": "mvp-v1"
+}
