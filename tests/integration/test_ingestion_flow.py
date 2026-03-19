@@ -30,7 +30,13 @@ from paper_context.ingestion.types import (
     ParserArtifact,
     ParserResult,
 )
-from paper_context.models import Document, DocumentArtifact, IngestJob, RetrievalIndexRun
+from paper_context.models import (
+    Document,
+    DocumentArtifact,
+    DocumentRevision,
+    IngestJob,
+    RetrievalIndexRun,
+)
 from paper_context.queue.contracts import IngestionQueue
 from paper_context.storage.local_fs import LocalFilesystemStorage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
@@ -430,12 +436,26 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
                 connection.execute(
                     text(
                         """
-                        SELECT current_status, title, metadata_confidence
+                        SELECT current_status, title, metadata_confidence, active_revision_id
                         FROM documents
                         WHERE id = :document_id
                         """
                     ),
                     {"document_id": document_id},
+                )
+                .mappings()
+                .one()
+            )
+            active_revision = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT revision_number, status, title, metadata_confidence
+                        FROM document_revisions
+                        WHERE id = :revision_id
+                        """
+                    ),
+                    {"revision_id": document["active_revision_id"]},
                 )
                 .mappings()
                 .one()
@@ -512,8 +532,11 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
         assert ingest_job["started_at"] is not None
         assert ingest_job["finished_at"] is not None
         assert document["current_status"] == "ready"
-        assert document["title"] == "Attention Is All You Need"
-        assert document["metadata_confidence"] is not None
+        assert document["active_revision_id"] is not None
+        assert document["title"] == active_revision["title"]
+        assert document["metadata_confidence"] == active_revision["metadata_confidence"]
+        assert active_revision["revision_number"] == 1
+        assert active_revision["status"] == "ready"
         assert section_count > 0
         assert passage_count > 0
         assert retrieval_passage_count == passage_count
@@ -647,9 +670,25 @@ def test_documents_replace_enqueues_new_job_and_preserves_prior_source_pdf(
             connection.execute(
                 text(
                     """
-                    SELECT title, current_status
+                    SELECT title, current_status, active_revision_id
                     FROM documents
                     WHERE id = :document_id
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .one()
+        )
+        latest_revision = (
+            connection.execute(
+                text(
+                    """
+                    SELECT id, title, status, revision_number
+                    FROM document_revisions
+                    WHERE document_id = :document_id
+                    ORDER BY revision_number DESC, created_at DESC
+                    LIMIT 1
                     """
                 ),
                 {"document_id": initial.document_id},
@@ -695,12 +734,16 @@ def test_documents_replace_enqueues_new_job_and_preserves_prior_source_pdf(
             poll_interval_ms=10,
         )
 
-    assert document["title"] == "Replacement title"
+    assert document["title"] == "Original title"
     assert document["current_status"] == "queued"
+    assert document["active_revision_id"] is None
     assert [job["trigger"] for job in jobs] == ["upload", "replace"]
     assert len(source_pdfs) == 2
     assert claimed is not None
     assert claimed.payload.ingest_job_id == replacement.ingest_job_id
+    assert latest_revision["title"] == "Replacement title"
+    assert latest_revision["status"] == "queued"
+    assert latest_revision["revision_number"] == 2
     assert all((storage_root / row["storage_ref"]).exists() for row in source_pdfs)
 
 
@@ -855,6 +898,8 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
     now = datetime.now(UTC)
 
     with migrated_postgres_engine.begin() as connection:
+        older_revision_id = uuid4()
+        newer_revision_id = uuid4()
         connection.execute(
             insert(Document).values(
                 id=document_id,
@@ -866,9 +911,62 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
             )
         )
         connection.execute(
+            insert(DocumentRevision).values(
+                id=older_revision_id,
+                document_id=document_id,
+                revision_number=1,
+                status="ready",
+                title="Replay",
+                authors=[],
+                abstract=None,
+                publication_year=None,
+                source_type="upload",
+                metadata_confidence=None,
+                quant_tags={},
+                source_artifact_id=None,
+                ingest_job_id=None,
+                activated_at=now - timedelta(minutes=2),
+                superseded_at=None,
+                created_at=now - timedelta(minutes=2),
+                updated_at=now - timedelta(minutes=2),
+            )
+        )
+        connection.execute(
+            insert(DocumentRevision).values(
+                id=newer_revision_id,
+                document_id=document_id,
+                revision_number=2,
+                status="ready",
+                title="Replay",
+                authors=[],
+                abstract=None,
+                publication_year=None,
+                source_type="upload",
+                metadata_confidence=None,
+                quant_tags={},
+                source_artifact_id=None,
+                ingest_job_id=None,
+                activated_at=now - timedelta(minutes=1),
+                superseded_at=None,
+                created_at=now - timedelta(minutes=1),
+                updated_at=now - timedelta(minutes=1),
+            )
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE documents
+                SET active_revision_id = :active_revision_id
+                WHERE id = :document_id
+                """
+            ),
+            {"document_id": document_id, "active_revision_id": newer_revision_id},
+        )
+        connection.execute(
             insert(IngestJob).values(
                 id=older_ingest_job_id,
                 document_id=document_id,
+                revision_id=older_revision_id,
                 source_artifact_id=None,
                 status="queued",
                 trigger="upload",
@@ -877,9 +975,20 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
             )
         )
         connection.execute(
+            text(
+                """
+                UPDATE document_revisions
+                SET ingest_job_id = :ingest_job_id
+                WHERE id = :revision_id
+                """
+            ),
+            {"revision_id": older_revision_id, "ingest_job_id": older_ingest_job_id},
+        )
+        connection.execute(
             insert(IngestJob).values(
                 id=newer_ingest_job_id,
                 document_id=document_id,
+                revision_id=newer_revision_id,
                 source_artifact_id=None,
                 status="ready",
                 trigger="upload",
@@ -890,9 +999,20 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
             )
         )
         connection.execute(
+            text(
+                """
+                UPDATE document_revisions
+                SET ingest_job_id = :ingest_job_id
+                WHERE id = :revision_id
+                """
+            ),
+            {"revision_id": newer_revision_id, "ingest_job_id": newer_ingest_job_id},
+        )
+        connection.execute(
             insert(DocumentArtifact).values(
                 id=older_source_artifact_id,
                 document_id=document_id,
+                revision_id=older_revision_id,
                 ingest_job_id=older_ingest_job_id,
                 artifact_type="source_pdf",
                 parser="upload",
@@ -905,6 +1025,7 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
             insert(DocumentArtifact).values(
                 id=newer_source_artifact_id,
                 document_id=document_id,
+                revision_id=newer_revision_id,
                 ingest_job_id=newer_ingest_job_id,
                 artifact_type="source_pdf",
                 parser="upload",
@@ -943,6 +1064,7 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
             insert(DocumentArtifact).values(
                 id=newer_parse_artifact_id,
                 document_id=document_id,
+                revision_id=newer_revision_id,
                 ingest_job_id=newer_ingest_job_id,
                 artifact_type="docling_parse",
                 parser="docling",
@@ -955,6 +1077,7 @@ def test_stale_redelivery_does_not_reprocess_when_newer_ingest_job_exists(
             insert(RetrievalIndexRun).values(
                 id=retrieval_index_run_id(ingest_job_id=newer_ingest_job_id),
                 document_id=document_id,
+                revision_id=newer_revision_id,
                 ingest_job_id=newer_ingest_job_id,
                 index_version="mvp-v1",
                 embedding_provider="voyage",
@@ -1122,6 +1245,17 @@ def test_failed_parse_clears_existing_retrieval_index_run(
     _make_worker(migrated_postgres_engine, queue, ready_processor, vt_seconds=1).run_once()
 
     with migrated_postgres_engine.begin() as connection:
+        existing_revision_id = connection.execute(
+            text(
+                """
+                    SELECT active_revision_id
+                    FROM documents
+                    WHERE id = :document_id
+                    """
+            ),
+            {"document_id": initial_upload.document_id},
+        ).scalar_one()
+        retry_revision_id = uuid4()
         new_ingest_job_id = uuid4()
         new_source_artifact_id = artifact_id(
             ingest_job_id=new_ingest_job_id,
@@ -1129,9 +1263,44 @@ def test_failed_parse_clears_existing_retrieval_index_run(
             parser="upload",
         )
         connection.execute(
+            insert(DocumentRevision).values(
+                id=retry_revision_id,
+                document_id=initial_upload.document_id,
+                revision_number=2,
+                status="queued",
+                title="Retry",
+                authors=[],
+                abstract=None,
+                publication_year=None,
+                source_type="upload",
+                metadata_confidence=None,
+                quant_tags={},
+                source_artifact_id=None,
+                ingest_job_id=None,
+                activated_at=None,
+                superseded_at=None,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE documents
+                SET active_revision_id = :active_revision_id
+                WHERE id = :document_id
+                """
+            ),
+            {
+                "document_id": initial_upload.document_id,
+                "active_revision_id": existing_revision_id,
+            },
+        )
+        connection.execute(
             insert(IngestJob).values(
                 id=new_ingest_job_id,
                 document_id=initial_upload.document_id,
+                revision_id=retry_revision_id,
                 source_artifact_id=None,
                 status="queued",
                 trigger="upload",
@@ -1139,9 +1308,20 @@ def test_failed_parse_clears_existing_retrieval_index_run(
             )
         )
         connection.execute(
+            text(
+                """
+                UPDATE document_revisions
+                SET ingest_job_id = :ingest_job_id
+                WHERE id = :revision_id
+                """
+            ),
+            {"revision_id": retry_revision_id, "ingest_job_id": new_ingest_job_id},
+        )
+        connection.execute(
             insert(DocumentArtifact).values(
                 id=new_source_artifact_id,
                 document_id=initial_upload.document_id,
+                revision_id=retry_revision_id,
                 ingest_job_id=new_ingest_job_id,
                 artifact_type="source_pdf",
                 parser="upload",
@@ -1160,6 +1340,19 @@ def test_failed_parse_clears_existing_retrieval_index_run(
             ),
             {
                 "ingest_job_id": new_ingest_job_id,
+                "source_artifact_id": new_source_artifact_id,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE document_revisions
+                SET source_artifact_id = :source_artifact_id
+                WHERE id = :revision_id
+                """
+            ),
+            {
+                "revision_id": retry_revision_id,
                 "source_artifact_id": new_source_artifact_id,
             },
         )
@@ -1188,11 +1381,46 @@ def test_failed_parse_clears_existing_retrieval_index_run(
             .mappings()
             .one()
         )
-        retrieval_runs = connection.execute(
-            text("SELECT COUNT(*) FROM retrieval_index_runs WHERE document_id = :document_id"),
-            {"document_id": initial_upload.document_id},
+        document = (
+            connection.execute(
+                text(
+                    """
+                    SELECT active_revision_id
+                    FROM documents
+                    WHERE id = :document_id
+                    """
+                ),
+                {"document_id": initial_upload.document_id},
+            )
+            .mappings()
+            .one()
+        )
+        active_revision_status = (
+            connection.execute(
+                text(
+                    """
+                    SELECT status
+                    FROM document_revisions
+                    WHERE id = :revision_id
+                    """
+                ),
+                {"revision_id": document["active_revision_id"]},
+            )
+            .mappings()
+            .one()
+        )
+        old_retrieval_runs = connection.execute(
+            text("SELECT COUNT(*) FROM retrieval_index_runs WHERE revision_id = :revision_id"),
+            {"revision_id": existing_revision_id},
+        ).scalar_one()
+        failed_retrieval_runs = connection.execute(
+            text("SELECT COUNT(*) FROM retrieval_index_runs WHERE revision_id = :revision_id"),
+            {"revision_id": retry_revision_id},
         ).scalar_one()
 
     assert failed_job["status"] == "failed"
     assert failed_job["failure_code"] == "docling_failed"
-    assert retrieval_runs == 0
+    assert document["active_revision_id"] == existing_revision_id
+    assert active_revision_status["status"] == "ready"
+    assert old_retrieval_runs == 1
+    assert failed_retrieval_runs == 0

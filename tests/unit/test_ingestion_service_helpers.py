@@ -172,6 +172,7 @@ def _make_processor() -> tuple[
         overlap_fraction=0.5,
     )
     processor._lock_document = MagicMock()  # type: ignore[method-assign]
+    processor._lock_revision = MagicMock()  # type: ignore[method-assign]
     processor._is_superseded = MagicMock(return_value=False)  # type: ignore[method-assign]
     processor._try_claim_processing_lock = MagicMock(return_value=True)  # type: ignore[method-assign]
     processor._release_processing_lock = MagicMock()  # type: ignore[method-assign]
@@ -204,12 +205,14 @@ def _row_sequence(rows: list[dict[str, object] | None]) -> Callable[..., MagicMo
 def _job_row(
     *,
     document_id: UUID | None = None,
+    revision_id: UUID | None = None,
     source_artifact_id: UUID | None = None,
     status: str = "queued",
     warnings: list[str] | None = None,
 ) -> dict[str, object]:
     return {
         "document_id": document_id or uuid4(),
+        "revision_id": revision_id or uuid4(),
         "created_at": datetime.now(UTC),
         "status": status,
         "warnings": warnings or [],
@@ -302,21 +305,21 @@ def test_lock_and_load_helpers_return_rows_and_none() -> None:
     )
 
 
-def test_reset_document_state_executes_all_cleanup_statements() -> None:
+def test_reset_revision_state_executes_all_cleanup_statements() -> None:
     processor, _, _, _, _ = _make_processor()
     connection = MagicMock()
-    document_id = uuid4()
+    revision_id = uuid4()
     ingest_job_id = uuid4()
 
-    processor._reset_document_state(
+    processor._reset_revision_state(
         connection,
-        document_id=document_id,
+        revision_id=revision_id,
         ingest_job_id=ingest_job_id,
     )
 
     assert connection.execute.call_count == 7
     for call in connection.execute.call_args_list:
-        assert call.args[1]["document_id"] == document_id
+        assert call.args[1]["revision_id"] == revision_id
         assert call.args[1]["ingest_job_id"] == ingest_job_id
 
 
@@ -324,12 +327,14 @@ def test_persist_parser_artifact_stores_bytes_and_records_row() -> None:
     processor, storage, _, _, _ = _make_processor()
     connection = MagicMock()
     document_id = uuid4()
+    revision_id = uuid4()
     ingest_job_id = uuid4()
     artifact = _make_parser_result()
 
     artifact_id = processor._persist_parser_artifact(
         connection,
         document_id=document_id,
+        revision_id=revision_id,
         ingest_job_id=ingest_job_id,
         artifact=artifact,
         is_primary=True,
@@ -342,6 +347,7 @@ def test_persist_parser_artifact_stores_bytes_and_records_row() -> None:
     )
     params = connection.execute.call_args.args[1]
     assert params["document_id"] == document_id
+    assert params["revision_id"] == revision_id
     assert params["artifact_type"] == "docling_parse"
     assert params["parser"] == "docling"
     assert params["storage_ref"] == "stored://artifact"
@@ -355,6 +361,7 @@ def test_persist_parser_artifact_streams_file_backed_content_and_cleans_up(
     processor, storage, _, _, _ = _make_processor()
     connection = MagicMock()
     document_id = uuid4()
+    revision_id = uuid4()
     ingest_job_id = uuid4()
     cleanup_root = tmp_path / "parser-output"
     cleanup_root.mkdir()
@@ -386,6 +393,7 @@ def test_persist_parser_artifact_streams_file_backed_content_and_cleans_up(
     processor._persist_parser_artifact(
         connection,
         document_id=document_id,
+        revision_id=revision_id,
         ingest_job_id=ingest_job_id,
         artifact=artifact,
         is_primary=True,
@@ -402,6 +410,7 @@ def test_persist_parser_artifact_materializes_lazy_parsed_document_before_cleanu
     processor, storage, _, _, _ = _make_processor()
     connection = MagicMock()
     document_id = uuid4()
+    revision_id = uuid4()
     ingest_job_id = uuid4()
     cleanup_root = tmp_path / "parser-output"
     cleanup_root.mkdir()
@@ -428,6 +437,7 @@ def test_persist_parser_artifact_materializes_lazy_parsed_document_before_cleanu
     processor._persist_parser_artifact(
         connection,
         document_id=document_id,
+        revision_id=revision_id,
         ingest_job_id=ingest_job_id,
         artifact=artifact,
         is_primary=True,
@@ -443,6 +453,7 @@ def test_normalize_document_persists_hierarchy_tables_and_references() -> None:
     processor, _, _, _, _ = _make_processor()
     connection = MagicMock()
     document_id = uuid4()
+    revision_id = uuid4()
     artifact_id = uuid4()
     root_section_id = uuid4()
     child_section_id = uuid4()
@@ -499,6 +510,7 @@ def test_normalize_document_persists_hierarchy_tables_and_references() -> None:
         section_ids = processor._normalize_document(
             connection,
             document_id=document_id,
+            revision_id=revision_id,
             parsed_document=document,
             artifact_id=artifact_id,
         )
@@ -522,6 +534,7 @@ def test_normalize_document_inserts_root_section_when_sections_missing() -> None
     processor, _, _, _, _ = _make_processor()
     connection = MagicMock()
     document_id = uuid4()
+    revision_id = uuid4()
     artifact_id = uuid4()
     root_section_id = uuid4()
 
@@ -529,6 +542,7 @@ def test_normalize_document_inserts_root_section_when_sections_missing() -> None
         section_ids = processor._normalize_document(
             connection,
             document_id=document_id,
+            revision_id=revision_id,
             parsed_document=_make_document(sections=[], tables=[], references=[]),
             artifact_id=artifact_id,
         )
@@ -604,9 +618,11 @@ def test_apply_enriched_document_metadata_prefers_higher_confidence_and_flags_lo
 
     with patch.object(processor, "_apply_document_metadata") as apply_document_metadata:
         document_id = uuid4()
+        revision_id = uuid4()
         processor._apply_enriched_document_metadata(
             connection,
             document_id=document_id,
+            revision_id=revision_id,
             parsed_document=parsed_document,
             enrichment=enrichment,
             warnings=warnings,
@@ -615,6 +631,7 @@ def test_apply_enriched_document_metadata_prefers_higher_confidence_and_flags_lo
     apply_document_metadata.assert_called_once_with(
         connection,
         document_id=document_id,
+        revision_id=revision_id,
         title=expected_title,
         authors=expected_authors,
         abstract=expected_abstract,
@@ -665,29 +682,34 @@ def test_process_success_path_uses_real_helpers_and_marks_low_confidence_warning
     )
     primary_parser.parse.return_value = _make_parser_result(parsed_document=parsed_document)
     source_artifact_id = uuid4()
+    revision_id = uuid4()
 
     connection.execute.side_effect = _row_sequence(
         [
             _job_row(
                 document_id=context.payload.document_id,
+                revision_id=revision_id,
                 source_artifact_id=source_artifact_id,
                 warnings=["parser_fallback_used"],
             ),
             {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
             _job_row(
                 document_id=context.payload.document_id,
+                revision_id=revision_id,
                 source_artifact_id=source_artifact_id,
                 status="parsing",
                 warnings=["parser_fallback_used", "metadata_low_confidence"],
             ),
             _job_row(
                 document_id=context.payload.document_id,
+                revision_id=revision_id,
                 source_artifact_id=source_artifact_id,
                 status="enriching_metadata",
                 warnings=["parser_fallback_used", "metadata_low_confidence"],
             ),
             _job_row(
                 document_id=context.payload.document_id,
+                revision_id=revision_id,
                 source_artifact_id=source_artifact_id,
                 status="indexing",
                 warnings=["parser_fallback_used", "metadata_low_confidence"],
@@ -723,9 +745,10 @@ def test_process_missing_source_artifact_marks_failure() -> None:
     processor, _, primary_parser, fallback_parser, _ = _make_processor()
     connection = MagicMock()
     context = _make_context()
+    revision_id = uuid4()
     connection.execute.side_effect = _row_sequence(
         [
-            _job_row(document_id=context.payload.document_id, warnings=[]),
+            _job_row(document_id=context.payload.document_id, revision_id=revision_id, warnings=[]),
             None,
         ]
     )
@@ -738,6 +761,7 @@ def test_process_missing_source_artifact_marks_failure() -> None:
         connection,
         ingest_job_id=context.payload.ingest_job_id,
         document_id=context.payload.document_id,
+        revision_id=revision_id,
         failure_code="missing_source_artifact",
         failure_message="No source PDF artifact exists for this ingest job.",
         warnings=[],
@@ -754,16 +778,19 @@ def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
         side_effect=lambda _connection, **kwargs: kwargs["warnings"]
     )
     source_artifact_id = uuid4()
+    revision_id = uuid4()
     connection.execute.side_effect = _row_sequence(
         [
             _job_row(
                 document_id=context.payload.document_id,
+                revision_id=revision_id,
                 source_artifact_id=source_artifact_id,
                 warnings=[],
             ),
             {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
             _job_row(
                 document_id=context.payload.document_id,
+                revision_id=revision_id,
                 source_artifact_id=source_artifact_id,
                 status="parsing",
                 warnings=["reduced_structure_confidence", "parser_fallback_used"],
@@ -784,6 +811,7 @@ def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
         connection,
         ingest_job_id=context.payload.ingest_job_id,
         document_id=context.payload.document_id,
+        revision_id=revision_id,
         failure_code="pdfplumber_failed",
         failure_message="pdfplumber failed",
         warnings=["reduced_structure_confidence", "parser_fallback_used"],
@@ -797,6 +825,7 @@ def test_insert_passages_chunks_contextualizes_and_merges_provenance() -> None:
     processor, _, _, _, _ = _make_processor()
     connection = MagicMock()
     document_id = uuid4()
+    revision_id = uuid4()
     artifact_id = uuid4()
     section_id = uuid4()
     parsed_document = ParsedDocument(
@@ -845,6 +874,7 @@ def test_insert_passages_chunks_contextualizes_and_merges_provenance() -> None:
     processor._insert_passages(
         connection,
         document_id=document_id,
+        revision_id=revision_id,
         parsed_document=parsed_document,
         section_ids={"s1": section_id},
         artifact_id=artifact_id,
@@ -873,11 +903,13 @@ def test_mark_helpers_issue_expected_updates() -> None:
     connection = MagicMock()
     ingest_job_id = uuid4()
     document_id = uuid4()
+    revision_id = uuid4()
 
     processor._mark_stage(
         connection,
         ingest_job_id=ingest_job_id,
         document_id=document_id,
+        revision_id=revision_id,
         status="parsing",
         warnings=["a", "a"],
     )
@@ -885,6 +917,7 @@ def test_mark_helpers_issue_expected_updates() -> None:
         connection,
         ingest_job_id=ingest_job_id,
         document_id=document_id,
+        revision_id=revision_id,
         failure_code="parse_failed",
         failure_message="Parser failed",
         warnings=["existing", "existing", "new"],
@@ -893,13 +926,14 @@ def test_mark_helpers_issue_expected_updates() -> None:
         connection,
         ingest_job_id=ingest_job_id,
         document_id=document_id,
+        revision_id=revision_id,
         warnings=["ready", "ready"],
     )
 
-    assert connection.execute.call_count == 6
+    assert connection.execute.call_count == 13
     stage_params = connection.execute.call_args_list[0].args[1]
-    failed_params = connection.execute.call_args_list[2].args[1]
-    ready_params = connection.execute.call_args_list[4].args[1]
+    failed_params = connection.execute.call_args_list[3].args[1]
+    ready_params = connection.execute.call_args_list[6].args[1]
 
     assert stage_params["status"] == "parsing"
     assert stage_params["warnings"] == ["a", "a"]
@@ -913,17 +947,23 @@ def test_synthetic_processor_updates_non_terminal_job() -> None:
     processor = SyntheticIngestProcessor()
     connection = MagicMock()
     select_result = MagicMock()
-    select_result.mappings.return_value.one_or_none.return_value = {"status": "queued"}
-    connection.execute.side_effect = [
-        select_result,
-        MagicMock(),
-        MagicMock(),
-        MagicMock(),
-    ]
+    select_result.mappings.return_value.one_or_none.return_value = {
+        "status": "queued",
+        "revision_id": uuid4(),
+    }
+    trailing_results = iter([MagicMock() for _ in range(16)])
+
+    def _execute(*args, **kwargs):
+        statement = str(args[0]) if args else ""
+        if "SELECT" in statement.upper():
+            return select_result
+        return next(trailing_results)
+
+    connection.execute.side_effect = _execute
     lease = MagicMock()
     context = _make_context()
 
     processor.process(connection, context, lease)
 
-    assert connection.execute.call_count == 4
+    assert connection.execute.call_count == 10
     lease.extend.assert_called_once()

@@ -1583,7 +1583,7 @@ requires-dist = [
     { name = "bandit", extras = ["toml"], marker = "extra == 'dev'", specifier = ">=1.9.4,<2.0" },
     { name = "docling", specifier = ">=2.80.0" },
     { name = "fastapi", specifier = ">=0.115,<1.0" },
-    { name = "fastmcp", specifier = "==3.1.1" },
+    { name = "fastmcp", specifier = ">=3.1.1" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28,<1.0" },
     { name = "orjson", specifier = ">=3.10,<4.0" },
     { name = "pdfplumber", specifier = ">=0.11.9" },

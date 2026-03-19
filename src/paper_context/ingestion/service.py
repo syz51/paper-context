@@ -33,6 +33,7 @@ from paper_context.models import (
     DocumentArtifact,
     DocumentPassage,
     DocumentReference,
+    DocumentRevision,
     DocumentSection,
     DocumentTable,
     IngestJob,
@@ -52,6 +53,7 @@ from .types import EnrichmentResult, ParsedDocument, ParsedParagraph, ParsedSect
 class IngestJobRow(TypedDict):
     id: uuid.UUID
     document_id: uuid.UUID
+    revision_id: uuid.UUID
     created_at: datetime
     status: str
     warnings: list[str]
@@ -67,6 +69,7 @@ class SourceArtifactRow(TypedDict):
 @dataclass(frozen=True)
 class _PreparedIngestState:
     document_id: uuid.UUID
+    revision_id: uuid.UUID
     created_at: datetime
     storage_ref: str
     warnings: list[str]
@@ -188,6 +191,7 @@ class DeterministicIngestProcessor:
                 return
 
             document_id = prepared.document_id
+            revision_id = prepared.revision_id
             warnings = list(prepared.warnings)
             source_path = self._storage.resolve(prepared.storage_ref)
             primary_result = self._primary_parser.parse(
@@ -196,6 +200,7 @@ class DeterministicIngestProcessor:
             )
             primary_artifact = self._store_parser_artifact(
                 document_id=document_id,
+                revision_id=revision_id,
                 ingest_job_id=context.payload.ingest_job_id,
                 artifact=primary_result,
                 is_primary=primary_result.gate_status == "pass",
@@ -215,6 +220,7 @@ class DeterministicIngestProcessor:
                 )
                 fallback_artifact = self._store_parser_artifact(
                     document_id=document_id,
+                    revision_id=revision_id,
                     ingest_job_id=context.payload.ingest_job_id,
                     artifact=fallback_result,
                     is_primary=fallback_result.gate_status == "pass",
@@ -236,12 +242,14 @@ class DeterministicIngestProcessor:
                         self._record_parser_artifact(
                             connection,
                             document_id=document_id,
+                            revision_id=revision_id,
                             ingest_job_id=context.payload.ingest_job_id,
                             staged_artifact=primary_artifact,
                         )
                         self._record_parser_artifact(
                             connection,
                             document_id=document_id,
+                            revision_id=revision_id,
                             ingest_job_id=context.payload.ingest_job_id,
                             staged_artifact=fallback_artifact,
                         )
@@ -249,6 +257,7 @@ class DeterministicIngestProcessor:
                             connection,
                             ingest_job_id=context.payload.ingest_job_id,
                             document_id=document_id,
+                            revision_id=revision_id,
                             failure_code=(
                                 fallback_result.failure_code or "pdfplumber_structure_failed"
                             ),
@@ -279,6 +288,7 @@ class DeterministicIngestProcessor:
                     self._record_parser_artifact(
                         connection,
                         document_id=document_id,
+                        revision_id=revision_id,
                         ingest_job_id=context.payload.ingest_job_id,
                         staged_artifact=primary_artifact,
                     )
@@ -286,6 +296,7 @@ class DeterministicIngestProcessor:
                         connection,
                         ingest_job_id=context.payload.ingest_job_id,
                         document_id=document_id,
+                        revision_id=revision_id,
                         failure_code=primary_result.failure_code or "docling_structure_failed",
                         failure_message=(
                             primary_result.failure_message
@@ -319,6 +330,7 @@ class DeterministicIngestProcessor:
                 self._record_parser_artifact(
                     connection,
                     document_id=document_id,
+                    revision_id=revision_id,
                     ingest_job_id=context.payload.ingest_job_id,
                     staged_artifact=primary_artifact,
                 )
@@ -326,6 +338,7 @@ class DeterministicIngestProcessor:
                     self._record_parser_artifact(
                         connection,
                         document_id=document_id,
+                        revision_id=revision_id,
                         ingest_job_id=context.payload.ingest_job_id,
                         staged_artifact=active_artifact,
                     )
@@ -337,18 +350,21 @@ class DeterministicIngestProcessor:
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
                     document_id=document_id,
+                    revision_id=revision_id,
                     status="normalizing",
                     warnings=warnings,
                 )
                 section_ids = self._normalize_document(
                     connection,
                     document_id=document_id,
+                    revision_id=revision_id,
                     parsed_document=parsed_document,
                     artifact_id=active_artifact_id,
                 )
                 self._apply_document_metadata(
                     connection,
                     document_id=document_id,
+                    revision_id=revision_id,
                     title=parsed_document.title,
                     authors=parsed_document.authors,
                     abstract=parsed_document.abstract,
@@ -359,6 +375,7 @@ class DeterministicIngestProcessor:
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
                     document_id=document_id,
+                    revision_id=revision_id,
                     status="enriching_metadata",
                     warnings=warnings,
                 )
@@ -379,6 +396,7 @@ class DeterministicIngestProcessor:
                 self._apply_enriched_document_metadata(
                     connection,
                     document_id=document_id,
+                    revision_id=revision_id,
                     parsed_document=parsed_document,
                     enrichment=enrichment,
                     warnings=warnings,
@@ -387,12 +405,14 @@ class DeterministicIngestProcessor:
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
                     document_id=document_id,
+                    revision_id=revision_id,
                     status="chunking",
                     warnings=warnings,
                 )
                 self._insert_passages(
                     connection,
                     document_id=document_id,
+                    revision_id=revision_id,
                     parsed_document=parsed_document,
                     section_ids=section_ids,
                     artifact_id=active_artifact_id,
@@ -401,6 +421,7 @@ class DeterministicIngestProcessor:
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
                     document_id=document_id,
+                    revision_id=revision_id,
                     status="indexing",
                     warnings=warnings,
                 )
@@ -418,6 +439,7 @@ class DeterministicIngestProcessor:
                 self._retrieval_indexer.rebuild(
                     connection,
                     document_id=document_id,
+                    revision_id=revision_id,
                     ingest_job_id=context.payload.ingest_job_id,
                     parser_source=parser_source,
                 )
@@ -425,6 +447,7 @@ class DeterministicIngestProcessor:
                     connection,
                     ingest_job_id=context.payload.ingest_job_id,
                     document_id=document_id,
+                    revision_id=revision_id,
                     warnings=warnings,
                 )
         except Exception:
@@ -450,8 +473,10 @@ class DeterministicIngestProcessor:
             return None
 
         document_id = job["document_id"]
+        revision_id = job["revision_id"]
         warnings = list(job["warnings"])
         self._lock_document(connection, document_id)
+        self._lock_revision(connection, revision_id)
         if self._is_superseded(
             connection,
             ingest_job_id=ingest_job_id,
@@ -462,6 +487,7 @@ class DeterministicIngestProcessor:
                 connection,
                 ingest_job_id=ingest_job_id,
                 document_id=document_id,
+                revision_id=revision_id,
                 failure_code="superseded_by_newer_ingest_job",
                 failure_message="A newer ingest job superseded this run before processing began.",
                 warnings=warnings,
@@ -478,26 +504,29 @@ class DeterministicIngestProcessor:
                 connection,
                 ingest_job_id=ingest_job_id,
                 document_id=document_id,
+                revision_id=revision_id,
                 failure_code="missing_source_artifact",
                 failure_message="No source PDF artifact exists for this ingest job.",
                 warnings=warnings,
             )
             return None
 
-        self._reset_document_state(
+        self._reset_revision_state(
             connection,
-            document_id=document_id,
+            revision_id=revision_id,
             ingest_job_id=ingest_job_id,
         )
         self._mark_stage(
             connection,
             ingest_job_id=ingest_job_id,
             document_id=document_id,
+            revision_id=revision_id,
             status="parsing",
             warnings=warnings,
         )
         return _PreparedIngestState(
             document_id=document_id,
+            revision_id=revision_id,
             created_at=job["created_at"],
             storage_ref=source_artifact["storage_ref"],
             warnings=warnings,
@@ -561,6 +590,7 @@ class DeterministicIngestProcessor:
                 connection,
                 ingest_job_id=ingest_job_id,
                 document_id=document_id,
+                revision_id=job["revision_id"],
                 failure_code="superseded_by_newer_ingest_job",
                 failure_message=(
                     "A newer ingest job superseded this run before processing completed."
@@ -580,6 +610,7 @@ class DeterministicIngestProcessor:
         statement = select(
             IngestJob.id,
             IngestJob.document_id,
+            IngestJob.revision_id,
             IngestJob.source_artifact_id,
             IngestJob.created_at,
             IngestJob.status,
@@ -606,6 +637,11 @@ class DeterministicIngestProcessor:
     def _lock_document(self, connection: Connection, document_id: uuid.UUID) -> None:
         connection.execute(
             select(Document.id).where(Document.id == document_id).with_for_update()
+        ).scalar_one()
+
+    def _lock_revision(self, connection: Connection, revision_id: uuid.UUID) -> None:
+        connection.execute(
+            select(DocumentRevision.id).where(DocumentRevision.id == revision_id).with_for_update()
         ).scalar_one()
 
     def _load_source_artifact(
@@ -636,54 +672,54 @@ class DeterministicIngestProcessor:
             return None
         return cast(SourceArtifactRow, dict(row))
 
-    def _reset_document_state(
+    def _reset_revision_state(
         self,
         connection: Connection,
         *,
-        document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         ingest_job_id: uuid.UUID,
     ) -> None:
-        params = {"document_id": document_id, "ingest_job_id": ingest_job_id}
+        params = {"revision_id": revision_id, "ingest_job_id": ingest_job_id}
         connection.execute(
             delete(DocumentPassage).where(
-                DocumentPassage.document_id == bindparam("b_document_id")
+                DocumentPassage.revision_id == bindparam("b_revision_id")
             ),
-            {**params, "b_document_id": document_id},
+            {**params, "b_revision_id": revision_id},
         )
         connection.execute(
-            delete(DocumentTable).where(DocumentTable.document_id == bindparam("b_document_id")),
-            {**params, "b_document_id": document_id},
+            delete(DocumentTable).where(DocumentTable.revision_id == bindparam("b_revision_id")),
+            {**params, "b_revision_id": revision_id},
         )
         connection.execute(
             delete(DocumentReference).where(
-                DocumentReference.document_id == bindparam("b_document_id")
+                DocumentReference.revision_id == bindparam("b_revision_id")
             ),
-            {**params, "b_document_id": document_id},
+            {**params, "b_revision_id": revision_id},
         )
         connection.execute(
             delete(DocumentSection).where(
-                DocumentSection.document_id == bindparam("b_document_id")
+                DocumentSection.revision_id == bindparam("b_revision_id")
             ),
-            {**params, "b_document_id": document_id},
+            {**params, "b_revision_id": revision_id},
         )
         connection.execute(
             delete(RetrievalIndexRun).where(
-                RetrievalIndexRun.document_id == bindparam("b_document_id")
+                RetrievalIndexRun.revision_id == bindparam("b_revision_id")
             ),
-            {**params, "b_document_id": document_id},
+            {**params, "b_revision_id": revision_id},
         )
         connection.execute(
             delete(DocumentArtifact).where(
-                DocumentArtifact.document_id == bindparam("b_document_id"),
+                DocumentArtifact.revision_id == bindparam("b_revision_id"),
                 DocumentArtifact.artifact_type != "source_pdf",
             ),
-            {**params, "b_document_id": document_id},
+            {**params, "b_revision_id": revision_id},
         )
         connection.execute(
             update(DocumentArtifact)
-            .where(DocumentArtifact.document_id == bindparam("b_document_id"))
+            .where(DocumentArtifact.revision_id == bindparam("b_revision_id"))
             .values(is_primary=False),
-            {**params, "b_document_id": document_id},
+            {**params, "b_revision_id": revision_id},
         )
 
     def _parser_artifact_id(
@@ -702,6 +738,7 @@ class DeterministicIngestProcessor:
         self,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         ingest_job_id: uuid.UUID,
         artifact: ParserResult,
         is_primary: bool,
@@ -735,6 +772,7 @@ class DeterministicIngestProcessor:
         connection: Connection,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         ingest_job_id: uuid.UUID,
         staged_artifact: _StagedParserArtifact,
     ) -> uuid.UUID:
@@ -745,6 +783,7 @@ class DeterministicIngestProcessor:
         statement = pg_insert(DocumentArtifact).values(
             id=bindparam("b_id"),
             document_id=bindparam("b_document_id"),
+            revision_id=bindparam("b_revision_id"),
             ingest_job_id=bindparam("b_ingest_job_id"),
             artifact_type=bindparam("b_artifact_type"),
             parser=bindparam("b_parser"),
@@ -766,6 +805,8 @@ class DeterministicIngestProcessor:
                 "b_id": parser_artifact_id,
                 "document_id": document_id,
                 "b_document_id": document_id,
+                "revision_id": revision_id,
+                "b_revision_id": revision_id,
                 "ingest_job_id": ingest_job_id,
                 "b_ingest_job_id": ingest_job_id,
                 "artifact_type": staged_artifact.parser_result.artifact.artifact_type,
@@ -787,6 +828,7 @@ class DeterministicIngestProcessor:
         connection: Connection,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         ingest_job_id: uuid.UUID,
         artifact: ParserResult,
         is_primary: bool,
@@ -794,6 +836,7 @@ class DeterministicIngestProcessor:
     ) -> uuid.UUID:
         staged_artifact = self._store_parser_artifact(
             document_id=document_id,
+            revision_id=revision_id,
             ingest_job_id=ingest_job_id,
             artifact=artifact,
             is_primary=is_primary,
@@ -802,6 +845,7 @@ class DeterministicIngestProcessor:
         return self._record_parser_artifact(
             connection,
             document_id=document_id,
+            revision_id=revision_id,
             ingest_job_id=ingest_job_id,
             staged_artifact=staged_artifact,
         )
@@ -811,6 +855,7 @@ class DeterministicIngestProcessor:
         connection: Connection,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         parsed_document: ParsedDocument,
         artifact_id: uuid.UUID,
     ) -> dict[str, uuid.UUID]:
@@ -835,6 +880,7 @@ class DeterministicIngestProcessor:
                 insert(DocumentSection).values(
                     id=bindparam("b_id"),
                     document_id=bindparam("b_document_id"),
+                    revision_id=bindparam("b_revision_id"),
                     parent_section_id=bindparam("b_parent_section_id"),
                     heading=bindparam("b_heading"),
                     heading_path=bindparam("b_heading_path", type_=JSONB),
@@ -848,6 +894,8 @@ class DeterministicIngestProcessor:
                     "b_id": section_id,
                     "document_id": document_id,
                     "b_document_id": document_id,
+                    "revision_id": revision_id,
+                    "b_revision_id": revision_id,
                     "parent_section_id": parent_section_id,
                     "b_parent_section_id": parent_section_id,
                     "heading": section.heading,
@@ -871,6 +919,7 @@ class DeterministicIngestProcessor:
                 insert(DocumentTable).values(
                     id=bindparam("b_id"),
                     document_id=bindparam("b_document_id"),
+                    revision_id=bindparam("b_revision_id"),
                     section_id=bindparam("b_section_id"),
                     caption=bindparam("b_caption"),
                     table_type=bindparam("b_table_type"),
@@ -885,6 +934,8 @@ class DeterministicIngestProcessor:
                     "b_id": table_row_id,
                     "document_id": document_id,
                     "b_document_id": document_id,
+                    "revision_id": revision_id,
+                    "b_revision_id": revision_id,
                     "section_id": section_ids[table.section_key],
                     "b_section_id": section_ids[table.section_key],
                     "caption": table.caption,
@@ -910,6 +961,7 @@ class DeterministicIngestProcessor:
                 insert(DocumentReference).values(
                     id=bindparam("b_id"),
                     document_id=bindparam("b_document_id"),
+                    revision_id=bindparam("b_revision_id"),
                     raw_citation=bindparam("b_raw_citation"),
                     normalized_title=bindparam("b_normalized_title"),
                     authors=bindparam("b_authors", type_=JSONB),
@@ -923,6 +975,8 @@ class DeterministicIngestProcessor:
                     "b_id": reference_row_id,
                     "document_id": document_id,
                     "b_document_id": document_id,
+                    "revision_id": revision_id,
+                    "b_revision_id": revision_id,
                     "raw_citation": reference.raw_citation,
                     "b_raw_citation": reference.raw_citation,
                     "normalized_title": reference.normalized_title,
@@ -947,6 +1001,7 @@ class DeterministicIngestProcessor:
         connection: Connection,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         title: str | None,
         authors: list[str],
         abstract: str | None,
@@ -955,22 +1010,22 @@ class DeterministicIngestProcessor:
     ) -> None:
         now = datetime.now(UTC)
         connection.execute(
-            update(Document)
-            .where(Document.id == bindparam("b_document_id"))
+            update(DocumentRevision)
+            .where(DocumentRevision.id == bindparam("b_revision_id"))
             .values(
-                title=func.coalesce(bindparam("b_title"), Document.title),
+                title=func.coalesce(bindparam("b_title"), DocumentRevision.title),
                 authors=bindparam("b_authors", type_=JSONB),
-                abstract=func.coalesce(bindparam("b_abstract"), Document.abstract),
-                publication_year=func.coalesce(
-                    bindparam("b_publication_year"),
-                    Document.publication_year,
-                ),
+                abstract=bindparam("b_abstract"),
+                publication_year=bindparam("b_publication_year"),
                 metadata_confidence=bindparam("b_metadata_confidence"),
+                status=bindparam("b_status"),
                 updated_at=bindparam("b_now"),
             ),
             {
                 "document_id": document_id,
                 "b_document_id": document_id,
+                "revision_id": revision_id,
+                "b_revision_id": revision_id,
                 "title": title,
                 "b_title": title,
                 "authors": authors,
@@ -981,6 +1036,8 @@ class DeterministicIngestProcessor:
                 "b_publication_year": publication_year,
                 "metadata_confidence": metadata_confidence,
                 "b_metadata_confidence": metadata_confidence,
+                "status": "normalizing",
+                "b_status": "normalizing",
                 "now": now,
                 "b_now": now,
             },
@@ -991,6 +1048,7 @@ class DeterministicIngestProcessor:
         connection: Connection,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         parsed_document: ParsedDocument,
         enrichment: EnrichmentResult,
         warnings: list[str],
@@ -1023,6 +1081,7 @@ class DeterministicIngestProcessor:
         self._apply_document_metadata(
             connection,
             document_id=document_id,
+            revision_id=revision_id,
             title=title,
             authors=authors,
             abstract=abstract,
@@ -1035,6 +1094,7 @@ class DeterministicIngestProcessor:
         connection: Connection,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         parsed_document: ParsedDocument,
         section_ids: dict[str, uuid.UUID],
         artifact_id: uuid.UUID,
@@ -1070,6 +1130,7 @@ class DeterministicIngestProcessor:
                     insert(DocumentPassage).values(
                         id=bindparam("b_id"),
                         document_id=bindparam("b_document_id"),
+                        revision_id=bindparam("b_revision_id"),
                         section_id=bindparam("b_section_id"),
                         chunk_ordinal=bindparam("b_chunk_ordinal"),
                         body_text=bindparam("b_body_text"),
@@ -1085,6 +1146,8 @@ class DeterministicIngestProcessor:
                         "b_id": passage_row_id,
                         "document_id": document_id,
                         "b_document_id": document_id,
+                        "revision_id": revision_id,
+                        "b_revision_id": revision_id,
                         "section_id": section_ids[section.key],
                         "b_section_id": section_ids[section.key],
                         "chunk_ordinal": chunk_ordinal,
@@ -1139,12 +1202,14 @@ class DeterministicIngestProcessor:
         connection: Connection,
         *,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         ingest_job_id: uuid.UUID,
         parser_source: str,
     ) -> None:
         self._retrieval_indexer.rebuild(
             connection,
             document_id=document_id,
+            revision_id=revision_id,
             ingest_job_id=ingest_job_id,
             parser_source=parser_source,
         )
@@ -1225,6 +1290,7 @@ class DeterministicIngestProcessor:
         *,
         ingest_job_id: uuid.UUID,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         status: str,
         warnings: list[str],
     ) -> None:
@@ -1251,6 +1317,22 @@ class DeterministicIngestProcessor:
                 "b_now": now,
             },
         )
+        connection.execute(
+            update(DocumentRevision)
+            .where(DocumentRevision.id == bindparam("b_revision_id"))
+            .values(
+                status=bindparam("b_status"),
+                updated_at=bindparam("b_now"),
+            ),
+            {
+                "revision_id": revision_id,
+                "b_revision_id": revision_id,
+                "status": status,
+                "b_status": status,
+                "now": now,
+                "b_now": now,
+            },
+        )
         self._update_document_status_if_current(
             connection,
             document_id=document_id,
@@ -1265,6 +1347,7 @@ class DeterministicIngestProcessor:
         *,
         ingest_job_id: uuid.UUID,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         failure_code: str,
         failure_message: str,
         warnings: list[str],
@@ -1294,6 +1377,20 @@ class DeterministicIngestProcessor:
                 "b_now": now,
             },
         )
+        connection.execute(
+            update(DocumentRevision)
+            .where(DocumentRevision.id == bindparam("b_revision_id"))
+            .values(
+                status="failed",
+                updated_at=bindparam("b_now"),
+            ),
+            {
+                "revision_id": revision_id,
+                "b_revision_id": revision_id,
+                "now": now,
+                "b_now": now,
+            },
+        )
         self._update_document_status_if_current(
             connection,
             document_id=document_id,
@@ -1308,6 +1405,7 @@ class DeterministicIngestProcessor:
         *,
         ingest_job_id: uuid.UUID,
         document_id: uuid.UUID,
+        revision_id: uuid.UUID,
         warnings: list[str],
     ) -> None:
         now = datetime.now(UTC)
@@ -1328,6 +1426,13 @@ class DeterministicIngestProcessor:
                 "b_now": now,
             },
         )
+        self._activate_revision_if_current(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            now=now,
+        )
         self._update_document_status_if_current(
             connection,
             document_id=document_id,
@@ -1335,6 +1440,120 @@ class DeterministicIngestProcessor:
             status="ready",
             now=now,
         )
+
+    def _activate_revision_if_current(
+        self,
+        connection: Connection,
+        *,
+        document_id: uuid.UUID,
+        revision_id: uuid.UUID,
+        ingest_job_id: uuid.UUID,
+        now: datetime,
+    ) -> None:
+        current_job = aliased(IngestJob)
+        newer_job = aliased(IngestJob)
+        newer_job_exists = exists(
+            select(1)
+            .select_from(current_job)
+            .join(
+                newer_job,
+                and_(
+                    newer_job.document_id == current_job.document_id,
+                    newer_job.id != current_job.id,
+                    or_(
+                        newer_job.created_at > current_job.created_at,
+                        and_(
+                            newer_job.created_at == current_job.created_at,
+                            sa_cast(newer_job.id, String) > sa_cast(current_job.id, String),
+                        ),
+                    ),
+                ),
+            )
+            .where(current_job.id == ingest_job_id)
+        )
+        previous_active_revision_id = connection.execute(
+            select(Document.active_revision_id).where(Document.id == document_id)
+        ).scalar_one()
+        revision_row = (
+            connection.execute(
+                select(
+                    DocumentRevision.title,
+                    DocumentRevision.authors,
+                    DocumentRevision.abstract,
+                    DocumentRevision.publication_year,
+                    DocumentRevision.source_type,
+                    DocumentRevision.metadata_confidence,
+                    DocumentRevision.quant_tags,
+                ).where(DocumentRevision.id == revision_id)
+            )
+            .mappings()
+            .one()
+        )
+        promoted_rows = connection.execute(
+            update(Document)
+            .where(
+                Document.id == document_id,
+                ~newer_job_exists,
+            )
+            .values(
+                active_revision_id=revision_id,
+                title=revision_row["title"],
+                authors=revision_row["authors"],
+                abstract=revision_row["abstract"],
+                publication_year=revision_row["publication_year"],
+                source_type=revision_row["source_type"],
+                metadata_confidence=revision_row["metadata_confidence"],
+                quant_tags=revision_row["quant_tags"],
+                updated_at=now,
+            )
+        ).rowcount
+        if promoted_rows == 0:
+            connection.execute(
+                update(DocumentRevision)
+                .where(DocumentRevision.id == bindparam("b_revision_id"))
+                .values(
+                    status="ready",
+                    updated_at=bindparam("b_now"),
+                ),
+                {
+                    "revision_id": revision_id,
+                    "b_revision_id": revision_id,
+                    "now": now,
+                    "b_now": now,
+                },
+            )
+            return
+        connection.execute(
+            update(DocumentRevision)
+            .where(DocumentRevision.id == bindparam("b_revision_id"))
+            .values(
+                status="ready",
+                activated_at=bindparam("b_now"),
+                superseded_at=None,
+                updated_at=bindparam("b_now"),
+            ),
+            {
+                "revision_id": revision_id,
+                "b_revision_id": revision_id,
+                "now": now,
+                "b_now": now,
+            },
+        )
+        if previous_active_revision_id is not None and previous_active_revision_id != revision_id:
+            connection.execute(
+                update(DocumentRevision)
+                .where(DocumentRevision.id == bindparam("b_previous_revision_id"))
+                .values(
+                    superseded_at=bindparam("b_now"),
+                    updated_at=bindparam("b_now"),
+                ),
+                {
+                    "previous_revision_id": previous_active_revision_id,
+                    "b_previous_revision_id": previous_active_revision_id,
+                    "now": now,
+                    "b_now": now,
+                },
+            )
 
 
 class SyntheticIngestProcessor:
@@ -1350,7 +1569,7 @@ class SyntheticIngestProcessor:
     ) -> None:
         row = (
             connection.execute(
-                select(IngestJob.status)
+                select(IngestJob.status, IngestJob.revision_id)
                 .where(IngestJob.id == context.payload.ingest_job_id)
                 .with_for_update()
             )
@@ -1363,6 +1582,7 @@ class SyntheticIngestProcessor:
         if row["status"] in self.TERMINAL_STATUSES:
             return
 
+        revision_id = row["revision_id"]
         now = datetime.now(UTC)
         connection.execute(
             update(IngestJob)
@@ -1374,6 +1594,20 @@ class SyntheticIngestProcessor:
             {
                 "ingest_job_id": context.payload.ingest_job_id,
                 "b_ingest_job_id": context.payload.ingest_job_id,
+                "now": now,
+                "b_now": now,
+            },
+        )
+        connection.execute(
+            update(DocumentRevision)
+            .where(DocumentRevision.id == bindparam("b_revision_id"))
+            .values(
+                status="parsing",
+                updated_at=bindparam("b_now"),
+            ),
+            {
+                "revision_id": revision_id,
+                "b_revision_id": revision_id,
                 "now": now,
                 "b_now": now,
             },
@@ -1393,6 +1627,14 @@ class SyntheticIngestProcessor:
                 "now": now,
                 "b_now": now,
             },
+        )
+        DeterministicIngestProcessor._activate_revision_if_current(
+            self,  # type: ignore[arg-type]
+            connection,
+            document_id=context.payload.document_id,
+            revision_id=revision_id,
+            ingest_job_id=context.payload.ingest_job_id,
+            now=now,
         )
         connection.execute(
             update(Document)

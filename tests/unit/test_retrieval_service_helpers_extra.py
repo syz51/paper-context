@@ -363,6 +363,7 @@ def test_sparse_and_dense_candidate_loaders_cover_rows_and_empty_results() -> No
     passage_row = {
         "passage_id": uuid4(),
         "document_id": uuid4(),
+        "revision_id": uuid4(),
         "section_id": uuid4(),
         "chunk_ordinal": 1,
         "body_text": "Body",
@@ -870,11 +871,13 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
 
     run_id = uuid4()
     document_id = uuid4()
+    revision_id = uuid4()
     ingest_job_id = uuid4()
     indexer._upsert_build_run(
         connection,
         run_id=run_id,
         document_id=document_id,
+        revision_id=revision_id,
         ingest_job_id=ingest_job_id,
         parser_source="docling",
         created_at=datetime.now(UTC),
@@ -891,7 +894,7 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
     indexer._activate_build_run(
         connection,
         run_id=run_id,
-        document_id=document_id,
+        revision_id=revision_id,
         embedding_dimensions=1024,
         activated_at=datetime.now(UTC),
     )
@@ -900,6 +903,7 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
     passage_row = {
         "passage_id": uuid4(),
         "document_id": uuid4(),
+        "revision_id": revision_id,
         "section_id": uuid4(),
         "chunk_ordinal": 1,
         "body_text": "Body",
@@ -915,6 +919,7 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
     table_row = {
         "table_id": uuid4(),
         "document_id": uuid4(),
+        "revision_id": revision_id,
         "section_id": uuid4(),
         "caption": "Caption",
         "table_type": "lexical",
@@ -966,6 +971,7 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
     rebuilt_run_id = indexer.rebuild(
         connection,
         document_id=uuid4(),
+        revision_id=revision_id,
         ingest_job_id=uuid4(),
         parser_source="docling",
     )

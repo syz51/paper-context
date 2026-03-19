@@ -65,10 +65,15 @@ class PgVector(UserDefinedType):
 class RetrievalIndexRun(Base):
     __tablename__ = "retrieval_index_runs"
     __table_args__ = (
+        Index("ix_retrieval_index_runs_document_id", "document_id"),
         Index("ix_retrieval_index_runs_document_active_state", "document_id", "is_active"),
+        Index("ix_retrieval_index_runs_revision_id", "revision_id"),
+        Index("ix_retrieval_index_runs_revision_active_state", "revision_id", "is_active"),
+        Index("ix_retrieval_index_runs_document_version", "document_id", "index_version"),
+        Index("ix_retrieval_index_runs_revision_version", "revision_id", "index_version"),
         Index(
-            "ix_retrieval_index_runs_one_active_per_document",
-            "document_id",
+            "ix_retrieval_index_runs_one_active_per_revision",
+            "revision_id",
             unique=True,
             postgresql_where=text("is_active = true"),
         ),
@@ -78,6 +83,11 @@ class RetrievalIndexRun(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.id", ondelete="CASCADE"),
         nullable=False,
     )
     ingest_job_id: Mapped[uuid.UUID] = mapped_column(
@@ -128,7 +138,18 @@ class RetrievalPassageAsset(Base):
             "retrieval_index_run_id",
         ),
         Index(
+            "ix_retrieval_passage_assets_revision_run",
+            "revision_id",
+            "retrieval_index_run_id",
+        ),
+        Index(
             "ix_retrieval_passage_assets_publication_year_run",
+            "publication_year",
+            "retrieval_index_run_id",
+        ),
+        Index(
+            "ix_retrieval_passage_assets_revision_publication_year_run",
+            "revision_id",
             "publication_year",
             "retrieval_index_run_id",
         ),
@@ -154,6 +175,11 @@ class RetrievalPassageAsset(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.id", ondelete="CASCADE"),
         nullable=False,
     )
     passage_id: Mapped[uuid.UUID] = mapped_column(
@@ -191,7 +217,18 @@ class RetrievalTableAsset(Base):
             "retrieval_index_run_id",
         ),
         Index(
+            "ix_retrieval_table_assets_revision_run",
+            "revision_id",
+            "retrieval_index_run_id",
+        ),
+        Index(
             "ix_retrieval_table_assets_publication_year_run",
+            "publication_year",
+            "retrieval_index_run_id",
+        ),
+        Index(
+            "ix_retrieval_table_assets_revision_publication_year_run",
+            "revision_id",
             "publication_year",
             "retrieval_index_run_id",
         ),
@@ -211,6 +248,11 @@ class RetrievalTableAsset(Base):
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.id", ondelete="CASCADE"),
         nullable=False,
     )
     table_id: Mapped[uuid.UUID] = mapped_column(

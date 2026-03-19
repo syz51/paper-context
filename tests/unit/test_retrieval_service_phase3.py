@@ -186,6 +186,7 @@ def test_get_passage_context_returns_neighbors_and_warning() -> None:
         "chunk_ordinal": 1,
         "page_start": 1,
         "page_end": 1,
+        "revision_id": UUID("33333333-3333-3333-3333-333333333333"),
         "document_title": "Paper",
         "section_path": ["Methods"],
         "retrieval_index_run_id": UUID("55555555-5555-5555-5555-555555555555"),

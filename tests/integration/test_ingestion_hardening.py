@@ -23,7 +23,7 @@ from paper_context.ingestion.types import (
     ParserArtifact,
     ParserResult,
 )
-from paper_context.models import DocumentArtifact, IngestJob
+from paper_context.models import DocumentArtifact, DocumentRevision, IngestJob
 from paper_context.queue.contracts import IngestionQueue
 from paper_context.storage.local_fs import LocalFilesystemStorage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
@@ -80,7 +80,16 @@ class FailOnceArchiveQueue(IngestionQueue):
 
 
 class CrashAfterParserArtifactProcessor(DeterministicIngestProcessor):
-    def _normalize_document(self, connection, *, document_id, parsed_document, artifact_id):
+    def _normalize_document(
+        self,
+        connection,
+        *,
+        document_id,
+        revision_id,
+        parsed_document,
+        artifact_id,
+    ):
+        del connection, document_id, revision_id, parsed_document, artifact_id
         raise RuntimeError("crash after parser artifact write")
 
 
@@ -90,6 +99,7 @@ class CrashAfterNormalizationProcessor(DeterministicIngestProcessor):
         connection,
         *,
         document_id,
+        revision_id,
         title,
         authors,
         abstract,
@@ -99,6 +109,7 @@ class CrashAfterNormalizationProcessor(DeterministicIngestProcessor):
         del (
             connection,
             document_id,
+            revision_id,
             title,
             authors,
             abstract,
@@ -243,10 +254,31 @@ def _insert_superseding_job(
     )
 
     with engine.begin() as connection:
+        next_revision_number = connection.execute(
+            text(
+                """
+                SELECT COALESCE(MAX(revision_number), 0) + 1
+                FROM document_revisions
+                WHERE document_id = :document_id
+                """
+            ),
+            {"document_id": document_id},
+        ).scalar_one()
+        revision_id = uuid4()
+        connection.execute(
+            insert(DocumentRevision).values(
+                id=revision_id,
+                document_id=document_id,
+                revision_number=next_revision_number,
+                status="queued",
+                title="Newer upload",
+            )
+        )
         connection.execute(
             insert(IngestJob).values(
                 id=ingest_job_id,
                 document_id=document_id,
+                revision_id=revision_id,
                 source_artifact_id=None,
                 status="queued",
                 trigger="upload",
@@ -257,6 +289,7 @@ def _insert_superseding_job(
             insert(DocumentArtifact).values(
                 id=source_artifact_id,
                 document_id=document_id,
+                revision_id=revision_id,
                 ingest_job_id=ingest_job_id,
                 artifact_type="source_pdf",
                 parser="upload",
@@ -274,6 +307,21 @@ def _insert_superseding_job(
                 """
             ),
             {
+                "ingest_job_id": ingest_job_id,
+                "source_artifact_id": source_artifact_id,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE document_revisions
+                SET source_artifact_id = :source_artifact_id,
+                    ingest_job_id = :ingest_job_id
+                WHERE id = :revision_id
+                """
+            ),
+            {
+                "revision_id": revision_id,
                 "ingest_job_id": ingest_job_id,
                 "source_artifact_id": source_artifact_id,
             },

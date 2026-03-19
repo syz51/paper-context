@@ -150,6 +150,7 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         return {
             "id": ingest_job_id,
             "document_id": uuid4(),
+            "revision_id": uuid4(),
             "created_at": datetime.now(UTC),
             "status": "queued",
             "warnings": [],
@@ -164,7 +165,10 @@ class _RecordingProcessor(DeterministicIngestProcessor):
             {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
         )
 
-    def _reset_document_state(self, connection, *, document_id, ingest_job_id) -> None:
+    def _lock_revision(self, connection, revision_id) -> None:
+        return None
+
+    def _reset_revision_state(self, connection, *, revision_id, ingest_job_id) -> None:
         return None
 
     def _is_superseded(self, connection, *, ingest_job_id, document_id, created_at) -> bool:
@@ -173,10 +177,14 @@ class _RecordingProcessor(DeterministicIngestProcessor):
     def _persist_parser_artifact(self, connection, **kwargs):
         return uuid4()
 
-    def _mark_stage(self, connection, *, ingest_job_id, document_id, status, warnings) -> None:
+    def _mark_stage(
+        self, connection, *, ingest_job_id, document_id, revision_id, status, warnings
+    ) -> None:
         self.stage_calls.append((status, list(warnings)))
 
-    def _normalize_document(self, connection, *, document_id, parsed_document, artifact_id):
+    def _normalize_document(
+        self, connection, *, document_id, revision_id, parsed_document, artifact_id
+    ):
         return {"s1": uuid4()}
 
     def _apply_document_metadata(self, connection, **kwargs) -> None:
@@ -188,7 +196,7 @@ class _RecordingProcessor(DeterministicIngestProcessor):
     def _insert_passages(self, connection, **kwargs) -> None:
         return None
 
-    def _mark_ready(self, connection, *, ingest_job_id, document_id, warnings) -> None:
+    def _mark_ready(self, connection, *, ingest_job_id, document_id, revision_id, warnings) -> None:
         self.ready_warnings = list(warnings)
 
     def _mark_failed(
@@ -197,6 +205,7 @@ class _RecordingProcessor(DeterministicIngestProcessor):
         *,
         ingest_job_id,
         document_id,
+        revision_id,
         failure_code,
         failure_message,
         warnings,
@@ -225,7 +234,7 @@ def test_documents_api_service_stores_source_artifact_and_enqueues_job(tmp_path:
 
     assert response.status == "queued"
     storage.store_file.assert_called_once()
-    assert connection.execute.call_count == 4
+    assert connection.execute.call_count == 6
     queue.enqueue_ingest.assert_called_once()
 
 
@@ -237,6 +246,8 @@ def test_replace_document_supersedes_older_queued_jobs_before_enqueuing_new_job(
     update_result.rowcount = 1
     connection.execute.side_effect = [
         update_result,
+        MagicMock(),
+        MagicMock(),
         MagicMock(),
         MagicMock(),
         MagicMock(),
@@ -299,7 +310,16 @@ def test_documents_api_service_get_ingest_job_returns_schema() -> None:
 
 def test_deterministic_processor_archives_terminal_jobs_without_work() -> None:
     processor = _RecordingProcessor(primary_result=_make_parser_result())
-    processor._lock_ingest_job = MagicMock(return_value={"status": "ready", "warnings": []})  # type: ignore[method-assign]
+    processor._lock_ingest_job = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "status": "ready",
+            "warnings": [],
+            "document_id": uuid4(),
+            "revision_id": uuid4(),
+            "created_at": datetime.now(UTC),
+            "source_artifact_id": uuid4(),
+        }
+    )
     lease = MagicMock()
 
     processor.process(MagicMock(), _make_context(), lease)

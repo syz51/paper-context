@@ -16,6 +16,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from paper_context.models import (
     Document,
     DocumentArtifact,
+    DocumentRevision,
     DocumentSection,
     DocumentTable,
     IngestJob,
@@ -207,6 +208,9 @@ class DocumentsApiService:
         return self._row_to_document_result(row)
 
     def get_document_outline(self, document_id: uuid.UUID) -> DocumentOutlineResponse | None:
+        active_revision_id = (
+            select(Document.active_revision_id).where(Document.id == document_id).scalar_subquery()
+        )
         with self._engine.begin() as connection:
             document_row = (
                 connection.execute(self._document_title_statement(document_id=document_id))
@@ -229,7 +233,10 @@ class DocumentsApiService:
                         DocumentSection.page_start,
                         DocumentSection.page_end,
                     )
-                    .where(DocumentSection.document_id == document_id)
+                    .where(
+                        DocumentSection.document_id == document_id,
+                        DocumentSection.revision_id == active_revision_id,
+                    )
                     .order_by(DocumentSection.ordinal.asc().nullslast(), DocumentSection.id)
                 )
                 .mappings()
@@ -263,6 +270,9 @@ class DocumentsApiService:
         self,
         document_id: uuid.UUID,
     ) -> DocumentTablesResponse | None:
+        active_revision_id = (
+            select(Document.active_revision_id).where(Document.id == document_id).scalar_subquery()
+        )
         with self._engine.begin() as connection:
             document_row = (
                 connection.execute(self._document_title_statement(document_id=document_id))
@@ -274,7 +284,8 @@ class DocumentsApiService:
             rows = (
                 connection.execute(
                     self._document_table_projection_statement(
-                        DocumentTable.document_id == document_id
+                        DocumentTable.document_id == document_id,
+                        DocumentTable.revision_id == active_revision_id,
                     )
                 )
                 .mappings()
@@ -290,7 +301,13 @@ class DocumentsApiService:
         with self._engine.begin() as connection:
             row = (
                 connection.execute(
-                    self._document_table_projection_statement(DocumentTable.id == table_id)
+                    self._document_table_projection_statement(
+                        DocumentTable.id == table_id,
+                        DocumentTable.revision_id
+                        == select(Document.active_revision_id)
+                        .where(Document.id == DocumentTable.document_id)
+                        .scalar_subquery(),
+                    )
                 )
                 .mappings()
                 .one_or_none()
@@ -351,6 +368,7 @@ class DocumentsApiService:
         trace_headers: Mapping[str, str] | None,
         create_document_row: bool,
     ) -> DocumentUploadResponse:
+        revision_id = uuid.uuid4()
         ingest_job_id = uuid.uuid4()
         source_artifact_id = artifact_id(
             ingest_job_id=ingest_job_id,
@@ -374,6 +392,7 @@ class DocumentsApiService:
                             updated_at=now,
                         )
                     )
+                    revision_number = 1
                 else:
                     updated_rows = connection.execute(
                         update(Document)
@@ -381,7 +400,6 @@ class DocumentsApiService:
                         .values(
                             current_status="queued",
                             updated_at=now,
-                            title=func.coalesce(title, Document.title),
                         )
                     ).rowcount
                     if updated_rows == 0:
@@ -391,11 +409,38 @@ class DocumentsApiService:
                         document_id=document_id,
                         now=now,
                     )
+                    revision_number = self._next_revision_number(
+                        connection,
+                        document_id=document_id,
+                    )
+
+                connection.execute(
+                    insert(DocumentRevision).values(
+                        id=revision_id,
+                        document_id=document_id,
+                        revision_number=revision_number,
+                        title=title,
+                        authors=[],
+                        abstract=None,
+                        publication_year=None,
+                        source_type="upload",
+                        metadata_confidence=None,
+                        quant_tags={},
+                        status="queued",
+                        source_artifact_id=None,
+                        ingest_job_id=None,
+                        activated_at=None,
+                        superseded_at=None,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
 
                 connection.execute(
                     insert(IngestJob).values(
                         id=ingest_job_id,
                         document_id=document_id,
+                        revision_id=revision_id,
                         source_artifact_id=None,
                         status="queued",
                         trigger=trigger,
@@ -407,6 +452,7 @@ class DocumentsApiService:
                     insert(DocumentArtifact).values(
                         id=source_artifact_id,
                         document_id=document_id,
+                        revision_id=revision_id,
                         ingest_job_id=ingest_job_id,
                         artifact_type="source_pdf",
                         parser="upload",
@@ -420,6 +466,14 @@ class DocumentsApiService:
                     update(IngestJob)
                     .where(IngestJob.id == ingest_job_id)
                     .values(source_artifact_id=source_artifact_id)
+                )
+                connection.execute(
+                    update(DocumentRevision)
+                    .where(DocumentRevision.id == revision_id)
+                    .values(
+                        source_artifact_id=source_artifact_id,
+                        ingest_job_id=ingest_job_id,
+                    )
                 )
                 self._queue.enqueue_ingest(
                     connection,
@@ -436,6 +490,19 @@ class DocumentsApiService:
             ingest_job_id=ingest_job_id,
             status="queued",
         )
+
+    def _next_revision_number(
+        self,
+        connection: Connection,
+        *,
+        document_id: uuid.UUID,
+    ) -> int:
+        max_revision = connection.execute(
+            select(func.max(DocumentRevision.revision_number)).where(
+                DocumentRevision.document_id == document_id
+            )
+        ).scalar_one()
+        return int(max_revision or 0) + 1
 
     def _supersede_queued_jobs(
         self,
@@ -479,7 +546,7 @@ class DocumentsApiService:
                 RetrievalIndexRun.index_version.label("active_index_version"),
             )
             .where(
-                RetrievalIndexRun.document_id == Document.id,
+                RetrievalIndexRun.revision_id == Document.active_revision_id,
                 RetrievalIndexRun.status == "ready",
                 RetrievalIndexRun.is_active.is_(True),
             )

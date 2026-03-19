@@ -21,12 +21,33 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
         "metadata_confidence",
         "quant_tags",
         "current_status",
+        "active_revision_id",
+        "created_at",
+        "updated_at",
+    },
+    "document_revisions": {
+        "id",
+        "document_id",
+        "revision_number",
+        "status",
+        "title",
+        "authors",
+        "abstract",
+        "publication_year",
+        "source_type",
+        "metadata_confidence",
+        "quant_tags",
+        "source_artifact_id",
+        "ingest_job_id",
+        "activated_at",
+        "superseded_at",
         "created_at",
         "updated_at",
     },
     "document_artifacts": {
         "id",
         "document_id",
+        "revision_id",
         "ingest_job_id",
         "artifact_type",
         "parser",
@@ -38,6 +59,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
     "document_sections": {
         "id",
         "document_id",
+        "revision_id",
         "parent_section_id",
         "heading",
         "heading_path",
@@ -49,6 +71,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
     "document_passages": {
         "id",
         "document_id",
+        "revision_id",
         "section_id",
         "chunk_ordinal",
         "body_text",
@@ -63,6 +86,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
     "document_tables": {
         "id",
         "document_id",
+        "revision_id",
         "section_id",
         "caption",
         "table_type",
@@ -76,6 +100,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
     "document_references": {
         "id",
         "document_id",
+        "revision_id",
         "raw_citation",
         "normalized_title",
         "authors",
@@ -87,6 +112,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
     "ingest_jobs": {
         "id",
         "document_id",
+        "revision_id",
         "source_artifact_id",
         "status",
         "failure_code",
@@ -100,6 +126,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
     "retrieval_index_runs": {
         "id",
         "document_id",
+        "revision_id",
         "ingest_job_id",
         "index_version",
         "embedding_provider",
@@ -119,6 +146,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
         "id",
         "retrieval_index_run_id",
         "document_id",
+        "revision_id",
         "passage_id",
         "section_id",
         "publication_year",
@@ -131,6 +159,7 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
         "id",
         "retrieval_index_run_id",
         "document_id",
+        "revision_id",
         "table_id",
         "section_id",
         "publication_year",
@@ -142,24 +171,48 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
 
 EXPECTED_SCHEMA_INDEX_COLUMNS = {
     "ix_documents_current_status": ["current_status"],
+    "ix_documents_active_revision_id": ["active_revision_id"],
+    "ix_document_revisions_document_id": ["document_id"],
+    "ix_document_revisions_document_status": ["document_id", "status"],
     "ix_document_artifacts_document_id": ["document_id"],
+    "ix_document_artifacts_revision_id": ["revision_id"],
     "ix_document_artifacts_ingest_job_id": ["ingest_job_id"],
+    "ix_document_artifacts_revision_ingest_job_id": ["revision_id", "ingest_job_id"],
     "ix_document_sections_document_id": ["document_id"],
+    "ix_document_sections_revision_id": ["revision_id"],
+    "ix_document_sections_revision_artifact_id": ["revision_id", "artifact_id"],
     "ix_document_passages_document_id": ["document_id"],
+    "ix_document_passages_revision_id": ["revision_id"],
     "ix_document_passages_section_id": ["section_id"],
+    "ix_document_passages_revision_section_id": ["revision_id", "section_id"],
     "ix_document_tables_document_id": ["document_id"],
+    "ix_document_tables_revision_id": ["revision_id"],
     "ix_document_tables_section_id": ["section_id"],
+    "ix_document_tables_revision_section_id": ["revision_id", "section_id"],
     "ix_document_references_document_id": ["document_id"],
+    "ix_document_references_revision_id": ["revision_id"],
+    "ix_document_references_revision_artifact_id": ["revision_id", "artifact_id"],
     "ix_ingest_jobs_document_id": ["document_id"],
     "ix_ingest_jobs_document_created_at_id": ["document_id", "created_at", "id"],
+    "ix_ingest_jobs_revision_id": ["revision_id"],
+    "ix_ingest_jobs_revision_created_at_id": ["revision_id", "created_at", "id"],
     "ix_ingest_jobs_status": ["status"],
     "ix_retrieval_index_runs_document_id": ["document_id"],
     "ix_retrieval_index_runs_document_version": ["document_id", "index_version"],
     "ix_retrieval_index_runs_document_active_state": ["document_id", "is_active"],
-    "ix_retrieval_index_runs_one_active_per_document": ["document_id"],
+    "ix_retrieval_index_runs_revision_id": ["revision_id"],
+    "ix_retrieval_index_runs_revision_active_state": ["revision_id", "is_active"],
+    "ix_retrieval_index_runs_revision_version": ["revision_id", "index_version"],
+    "ix_retrieval_index_runs_one_active_per_revision": ["revision_id"],
     "ix_retrieval_passage_assets_retrieval_index_run_id": ["retrieval_index_run_id"],
     "ix_retrieval_passage_assets_document_run": ["document_id", "retrieval_index_run_id"],
+    "ix_retrieval_passage_assets_revision_run": ["revision_id", "retrieval_index_run_id"],
     "ix_retrieval_passage_assets_publication_year_run": [
+        "publication_year",
+        "retrieval_index_run_id",
+    ],
+    "ix_retrieval_passage_assets_revision_publication_year_run": [
+        "revision_id",
         "publication_year",
         "retrieval_index_run_id",
     ],
@@ -167,7 +220,13 @@ EXPECTED_SCHEMA_INDEX_COLUMNS = {
     "ix_retrieval_passage_assets_embedding": ["embedding"],
     "ix_retrieval_table_assets_retrieval_index_run_id": ["retrieval_index_run_id"],
     "ix_retrieval_table_assets_document_run": ["document_id", "retrieval_index_run_id"],
+    "ix_retrieval_table_assets_revision_run": ["revision_id", "retrieval_index_run_id"],
     "ix_retrieval_table_assets_publication_year_run": [
+        "publication_year",
+        "retrieval_index_run_id",
+    ],
+    "ix_retrieval_table_assets_revision_publication_year_run": [
+        "revision_id",
         "publication_year",
         "retrieval_index_run_id",
     ],
@@ -238,7 +297,7 @@ def test_alembic_upgrade_succeeds_on_fresh_database(
                         pg_get_expr(i.indpred, i.indrelid) AS predicate
                     FROM pg_class idx
                     JOIN pg_index i ON i.indexrelid = idx.oid
-                    WHERE idx.relname = 'ix_retrieval_index_runs_one_active_per_document'
+                    WHERE idx.relname = 'ix_retrieval_index_runs_one_active_per_revision'
                     """
                     )
                 )

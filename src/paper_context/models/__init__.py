@@ -4,6 +4,7 @@ from .documents import (
     DocumentArtifact,
     DocumentPassage,
     DocumentReference,
+    DocumentRevision,
     DocumentSection,
     DocumentTable,
 )
@@ -13,6 +14,7 @@ from .retrieval import RetrievalIndexRun, RetrievalPassageAsset, RetrievalTableA
 __all__ = [
     "Base",
     "Document",
+    "DocumentRevision",
     "DocumentArtifact",
     "DocumentSection",
     "DocumentPassage",

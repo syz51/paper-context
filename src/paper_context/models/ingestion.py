@@ -20,12 +20,26 @@ class IngestJob(Base):
             "created_at",
             "id",
         ),
+        Index(
+            "ix_ingest_jobs_revision_created_at_id",
+            "revision_id",
+            "created_at",
+            "id",
+        ),
+        Index("ix_ingest_jobs_document_id", "document_id"),
+        Index("ix_ingest_jobs_revision_id", "revision_id"),
+        Index("ix_ingest_jobs_status", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.id", ondelete="CASCADE"),
         nullable=False,
     )
     source_artifact_id: Mapped[uuid.UUID | None] = mapped_column(
