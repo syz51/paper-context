@@ -55,6 +55,13 @@ def test_local_filesystem_storage(tmp_path: Path) -> None:
     assert storage.resolve(artifact.storage_ref) == target
 
 
+def test_local_filesystem_storage_rejects_absolute_storage_refs(tmp_path: Path) -> None:
+    storage = LocalFilesystemStorage(tmp_path / "artifacts")
+
+    with pytest.raises(ValueError, match="escapes storage root"):
+        storage.resolve("/tmp/escape.bin")
+
+
 def test_make_engine_connects() -> None:
     engine = make_engine("sqlite+pysqlite:///:memory:")
     with engine.connect() as conn:

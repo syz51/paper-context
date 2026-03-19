@@ -136,3 +136,65 @@ def test_readiness_reflects_database_state(
         assert payload["queue_metrics"] is None
     assert payload["operation_timings"] == []
     assert payload["service"] == "app"
+
+
+def test_queue_metrics_returns_none_when_queue_lookup_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenContextManager:
+        def __enter__(self) -> None:
+            raise RuntimeError("database offline")
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            return False
+
+    monkeypatch.setattr(
+        health_module,
+        "get_engine",
+        lambda: SimpleNamespace(begin=lambda: BrokenContextManager()),
+    )
+
+    assert health_module._queue_metrics("document_ingest") is None
+
+
+def test_queue_metrics_returns_validated_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    scrape_time = datetime.now(UTC)
+
+    class WorkingContextManager:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            return False
+
+    class StubQueue:
+        def __init__(self, queue_name: str) -> None:
+            self.queue_name = queue_name
+
+        def queue_metrics(self, connection: object) -> SimpleNamespace:
+            del connection
+            return SimpleNamespace(
+                queue_name=self.queue_name,
+                queue_length=4,
+                queue_visible_length=3,
+                newest_msg_age_sec=5,
+                oldest_msg_age_sec=10,
+                total_messages=4,
+                scrape_time=scrape_time,
+            )
+
+    monkeypatch.setattr(
+        health_module,
+        "get_engine",
+        lambda: SimpleNamespace(begin=lambda: WorkingContextManager()),
+    )
+    monkeypatch.setattr(health_module, "IngestionQueue", StubQueue)
+
+    metrics = health_module._queue_metrics("document_ingest")
+
+    assert metrics is not None
+    assert metrics.queue_name == "document_ingest"
+    assert metrics.queue_visible_length == 3
+    assert metrics.scrape_time == scrape_time

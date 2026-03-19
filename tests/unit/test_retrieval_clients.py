@@ -73,6 +73,45 @@ def test_post_json_rejects_non_https_url() -> None:
     with pytest.raises(RetrievalError, match="unsupported provider endpoint scheme"):
         clients._post_json(url="http://example.com/api", api_key="secret", payload={})
 
+    with pytest.raises(RetrievalError, match="missing a hostname"):
+        clients._post_json(url="https:///api", api_key="secret", payload={})
+
+
+def test_post_json_preserves_query_string_in_request_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _FakeConnection:
+        def __init__(self, *, host: str, port: int | None, timeout: int) -> None:
+            del host, port, timeout
+
+        def request(
+            self,
+            method: str,
+            url: str,
+            body: bytes,
+            headers: dict[str, str],
+        ) -> None:
+            del method, body, headers
+            captured["url"] = url
+
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(b'{"ok": true}')
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(clients.http_client, "HTTPSConnection", _FakeConnection)
+
+    clients._post_json(
+        url="https://example.com/api?version=1",
+        api_key="secret",
+        payload={"query": "paper"},
+    )
+
+    assert captured["url"] == "/api?version=1"
+
 
 def test_post_json_wraps_http_and_url_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     class _ErrorResponseConnection:

@@ -19,11 +19,13 @@ class StorageLimitExceededError(ValueError):
 
 class StorageInterface(Protocol):
     @abstractmethod
-    def ensure_root(self) -> None:
+    def ensure_root(self) -> None:  # pragma: no cover - protocol stub
         return None
 
     @abstractmethod
-    def store_bytes(self, relative_path: str, content: bytes) -> StorageArtifact:
+    def store_bytes(
+        self, relative_path: str, content: bytes
+    ) -> StorageArtifact:  # pragma: no cover - protocol stub
         raise NotImplementedError
 
     @abstractmethod
@@ -34,13 +36,13 @@ class StorageInterface(Protocol):
         *,
         max_size_bytes: int | None = None,
         chunk_size: int = 1024 * 1024,
-    ) -> StorageArtifact:
+    ) -> StorageArtifact:  # pragma: no cover - protocol stub
         raise NotImplementedError
 
     @abstractmethod
-    def resolve(self, storage_ref: str) -> Path:
+    def resolve(self, storage_ref: str) -> Path:  # pragma: no cover - protocol stub
         raise NotImplementedError
 
     @abstractmethod
-    def delete(self, storage_ref: str) -> None:
+    def delete(self, storage_ref: str) -> None:  # pragma: no cover - protocol stub
         raise NotImplementedError

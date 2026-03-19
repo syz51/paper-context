@@ -1,22 +1,29 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from typing import cast
+from unittest.mock import ANY, MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
 
 from paper_context.ingestion.service import (
     DeterministicIngestProcessor,
+    IngestExecutionDeferred,
     IngestJobContext,
+    LeaseExtender,
     SyntheticIngestProcessor,
+    _accumulate_stage_timing,
+    _advisory_lock_keys,
     _chunk_paragraphs,
     _contextualize_text,
     _dedupe_warnings,
     _json_array,
+    _to_signed_int32,
     _token_count,
 )
 from paper_context.ingestion.types import (
@@ -263,6 +270,39 @@ def test_chunk_paragraphs_handles_empty_input_and_overlap() -> None:
     assert [[paragraph.text for paragraph in chunk] for chunk in chunks] == [
         ["one two three", "four five six"],
         ["four five six", "seven eight nine"],
+    ]
+
+
+def test_chunk_paragraphs_can_drop_full_overlap_when_target_reaches_chunk_start() -> None:
+    paragraphs = [
+        _make_paragraph(
+            "one two three",
+            page_start=1,
+            page_end=1,
+            charspan_start=0,
+            charspan_end=13,
+        ),
+        _make_paragraph(
+            "four five six",
+            page_start=1,
+            page_end=1,
+            charspan_start=14,
+            charspan_end=27,
+        ),
+        _make_paragraph(
+            "seven eight nine",
+            page_start=2,
+            page_end=2,
+            charspan_start=28,
+            charspan_end=44,
+        ),
+    ]
+
+    chunks = _chunk_paragraphs(paragraphs, min_tokens=6, max_tokens=6, overlap_fraction=1.0)
+
+    assert [[paragraph.text for paragraph in chunk] for chunk in chunks] == [
+        ["one two three", "four five six"],
+        ["seven eight nine"],
     ]
 
 
@@ -851,10 +891,26 @@ def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
         failure_code="pdfplumber_failed",
         failure_message="pdfplumber failed",
         warnings=["reduced_structure_confidence", "parser_fallback_used"],
+        stage_timings=ANY,
     )
+    assert processor._mark_failed.call_args.kwargs["stage_timings"]["parsing_seconds"] > 0
     primary_parser.parse.assert_called_once()
     fallback_parser.parse.assert_called_once()
     assert lease.extend.call_count == 2
+
+
+def test_process_raises_when_processing_lock_cannot_be_claimed() -> None:
+    processor, _, _, _, _ = _make_processor()
+    connection = MagicMock()
+    context = _make_context()
+    lease = MagicMock()
+    processor._try_claim_processing_lock.return_value = False  # type: ignore[union-attr]
+
+    with pytest.raises(IngestExecutionDeferred, match="already being processed"):
+        processor.process(connection, context, lease)
+
+    connection.begin.assert_not_called()
+    cast(MagicMock, processor._release_processing_lock).assert_not_called()
 
 
 def test_insert_passages_chunks_contextualizes_and_merges_provenance() -> None:
@@ -979,6 +1035,201 @@ def test_mark_helpers_issue_expected_updates() -> None:
     assert ready_params["warnings"] == ["ready"]
 
 
+def test_prepare_for_processing_marks_superseded_job_failed() -> None:
+    processor, _, _, _, _ = _make_processor()
+    connection = MagicMock()
+    ingest_job_id = uuid4()
+    document_id = uuid4()
+    revision_id = uuid4()
+    created_at = datetime.now(UTC)
+    processor._is_superseded.return_value = True  # type: ignore[union-attr]
+    processor._mark_failed = MagicMock()  # type: ignore[method-assign]
+    processor._load_ingest_job = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "id": ingest_job_id,
+            "document_id": document_id,
+            "revision_id": revision_id,
+            "created_at": created_at,
+            "status": "queued",
+            "warnings": ["parser_fallback_used"],
+            "source_artifact_id": uuid4(),
+        }
+    )
+
+    prepared = processor._prepare_for_processing(connection, ingest_job_id=ingest_job_id)
+
+    assert prepared is None
+    processor._mark_failed.assert_called_once_with(
+        connection,
+        ingest_job_id=ingest_job_id,
+        document_id=document_id,
+        revision_id=revision_id,
+        failure_code="superseded_by_newer_ingest_job",
+        failure_message="A newer ingest job superseded this run before processing began.",
+        warnings=["parser_fallback_used"],
+    )
+
+
+def test_processing_lock_helpers_and_transaction_cleanup_cover_edges() -> None:
+    processor, _, _, _, _ = _make_processor()
+    connection = MagicMock()
+    connection.execute.return_value.scalar_one.return_value = True
+    ingest_job_id = uuid4()
+    revision_id = uuid4()
+    processor._retrieval_indexer = MagicMock()  # type: ignore[method-assign]
+
+    assert (
+        DeterministicIngestProcessor._try_claim_processing_lock(
+            processor,
+            connection,
+            ingest_job_id=ingest_job_id,
+        )
+        is True
+    )
+    DeterministicIngestProcessor._release_processing_lock(
+        processor,
+        connection,
+        ingest_job_id=ingest_job_id,
+    )
+    DeterministicIngestProcessor._lock_revision(processor, connection, revision_id)
+    assert (
+        DeterministicIngestProcessor._load_source_artifact(
+            processor,
+            connection,
+            ingest_job_id=ingest_job_id,
+            source_artifact_id=None,
+        )
+        is None
+    )
+    DeterministicIngestProcessor._replace_index_run(
+        processor,
+        connection,
+        document_id=uuid4(),
+        revision_id=revision_id,
+        ingest_job_id=ingest_job_id,
+        parser_source="docling",
+    )
+
+    connection.in_transaction.return_value = True
+    processor._clear_implicit_transaction(connection)
+    connection.commit.assert_called_once()
+
+    connection.reset_mock()
+    connection.in_transaction.return_value = False
+    processor._clear_implicit_transaction(connection)
+    connection.commit.assert_not_called()
+    processor._retrieval_indexer.rebuild.assert_called_once()
+
+
+def test_sync_processing_warnings_handles_missing_terminal_and_superseded_jobs() -> None:
+    processor, _, _, _, _ = _make_processor()
+    connection = MagicMock()
+    ingest_job_id = uuid4()
+    document_id = uuid4()
+    revision_id = uuid4()
+    created_at = datetime.now(UTC)
+    processor._mark_failed = MagicMock()  # type: ignore[method-assign]
+
+    processor._load_ingest_job = MagicMock(return_value=None)  # type: ignore[method-assign]
+    with pytest.raises(LookupError, match="missing ingest job"):
+        processor._sync_processing_warnings(
+            connection,
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            created_at=created_at,
+            warnings=["late_warning"],
+        )
+
+    processor._load_ingest_job = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "revision_id": revision_id,
+            "status": "ready",
+            "warnings": ["existing_warning"],
+        }
+    )
+    assert (
+        processor._sync_processing_warnings(
+            connection,
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            created_at=created_at,
+            warnings=["late_warning"],
+        )
+        is None
+    )
+
+    processor._load_ingest_job = MagicMock(  # type: ignore[method-assign]
+        return_value={
+            "revision_id": revision_id,
+            "status": "parsing",
+            "warnings": ["existing_warning"],
+        }
+    )
+    processor._is_superseded.return_value = True  # type: ignore[union-attr]
+    assert (
+        processor._sync_processing_warnings(
+            connection,
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            created_at=created_at,
+            warnings=["late_warning"],
+        )
+        is None
+    )
+    processor._mark_failed.assert_called_once_with(
+        connection,
+        ingest_job_id=ingest_job_id,
+        document_id=document_id,
+        revision_id=revision_id,
+        failure_code="superseded_by_newer_ingest_job",
+        failure_message="A newer ingest job superseded this run before processing completed.",
+        warnings=["existing_warning", "late_warning"],
+    )
+
+
+def test_activate_revision_if_current_marks_revision_ready_without_promotion() -> None:
+    processor, _, _, _, _ = _make_processor()
+    connection = MagicMock()
+    document_id = uuid4()
+    revision_id = uuid4()
+    previous_revision_id = uuid4()
+    now = datetime.now(UTC)
+
+    previous_active_revision_result = MagicMock()
+    previous_active_revision_result.scalar_one.return_value = previous_revision_id
+    revision_row_result = MagicMock()
+    revision_row_result.mappings.return_value.one.return_value = {
+        "title": "Paper",
+        "authors": ["Ada"],
+        "abstract": "Abstract",
+        "publication_year": 2024,
+        "source_type": "pdf",
+        "metadata_confidence": 0.9,
+        "quant_tags": {"domain": "test"},
+    }
+    document_update_result = MagicMock()
+    document_update_result.rowcount = 0
+    revision_update_result = MagicMock()
+    connection.execute.side_effect = [
+        previous_active_revision_result,
+        revision_row_result,
+        document_update_result,
+        revision_update_result,
+    ]
+
+    processor._activate_revision_if_current(
+        connection,
+        document_id=document_id,
+        revision_id=revision_id,
+        ingest_job_id=uuid4(),
+        now=now,
+    )
+
+    fallback_update_params = connection.execute.call_args_list[3].args[1]
+    assert fallback_update_params["revision_id"] == revision_id
+    assert fallback_update_params["b_now"] == now
+
+
 def test_synthetic_processor_updates_non_terminal_job() -> None:
     processor = SyntheticIngestProcessor()
     connection = MagicMock()
@@ -1005,3 +1256,73 @@ def test_synthetic_processor_updates_non_terminal_job() -> None:
 
     assert connection.execute.call_count == 10
     lease.extend.assert_called_once()
+
+
+def test_synthetic_processor_marks_superseded_job_failed() -> None:
+    processor = SyntheticIngestProcessor()
+    connection = MagicMock()
+    revision_id = uuid4()
+    select_result = MagicMock()
+    select_result.mappings.return_value.one_or_none.return_value = {
+        "status": "queued",
+        "revision_id": revision_id,
+        "created_at": datetime.now(UTC),
+    }
+    update_results = iter([MagicMock() for _ in range(4)])
+
+    def _execute(*args, **kwargs):
+        del kwargs
+        statement = str(args[0]) if args else ""
+        if "SELECT" in statement.upper():
+            return select_result
+        return next(update_results)
+
+    connection.execute.side_effect = _execute
+    lease = MagicMock()
+    context = _make_context()
+
+    with patch.object(DeterministicIngestProcessor, "_is_superseded", return_value=True):
+        processor.process(connection, context, lease)
+
+    assert connection.execute.call_count == 4
+    failed_params = connection.execute.call_args_list[1].args[1]
+    revision_params = connection.execute.call_args_list[2].args[1]
+    assert failed_params["ingest_job_id"] == context.payload.ingest_job_id
+    assert revision_params["revision_id"] == revision_id
+    lease.extend.assert_not_called()
+
+
+def test_lease_extender_handles_signature_failure_and_helper_edges() -> None:
+    connection = MagicMock()
+    queue_adapter = MagicMock()
+    message = _make_message({"ingest_job_id": str(uuid4()), "document_id": str(uuid4())})
+
+    @contextmanager
+    def connection_factory():
+        yield connection
+
+    extender = LeaseExtender(
+        connection_factory=connection_factory,
+        queue_adapter=queue_adapter,
+        message=message,
+        default_vt_seconds=42,
+    )
+
+    with patch("paper_context.ingestion.service.signature", side_effect=TypeError):
+        with extender._open_connection() as opened_connection:
+            assert opened_connection is connection
+
+        extender.extend()
+
+    queue_adapter.extend_lease.assert_called_once_with(connection, message.msg_id, 42)
+
+    stage_timings: dict[str, float | int] = {}
+    _accumulate_stage_timing(stage_timings, "parsing_seconds", {})
+    _accumulate_stage_timing(stage_timings, "parsing_seconds", {"duration_seconds": 0.1})
+    _accumulate_stage_timing(stage_timings, "parsing_seconds", {"duration_seconds": 0.2})
+    assert stage_timings == {"parsing_seconds": 0.3}
+
+    advisory_key = UUID("ffffffff-0000-0000-0000-000080000001")
+    assert _advisory_lock_keys(advisory_key) == (-1, -2147483647)
+    assert _to_signed_int32(0x7FFFFFFF) == 0x7FFFFFFF
+    assert _to_signed_int32(0x80000000) == -2147483648

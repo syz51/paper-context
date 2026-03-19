@@ -42,7 +42,7 @@ class EmbeddingClient(Protocol):
         texts: list[str],
         *,
         input_type: EmbeddingInputType,
-    ) -> EmbeddingBatch:
+    ) -> EmbeddingBatch:  # pragma: no cover - protocol stub
         raise NotImplementedError
 
 
@@ -57,7 +57,7 @@ class RerankerClient(Protocol):
         query: str,
         documents: list[str],
         top_n: int | None = None,
-    ) -> list[RerankItem]:
+    ) -> list[RerankItem]:  # pragma: no cover - protocol stub
         raise NotImplementedError
 
 

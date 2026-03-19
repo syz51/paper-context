@@ -8,7 +8,9 @@ from .types import EnrichmentResult, ParsedDocument
 
 class MetadataEnricher(Protocol):
     @abstractmethod
-    def enrich(self, parsed_document: ParsedDocument) -> EnrichmentResult:
+    def enrich(
+        self, parsed_document: ParsedDocument
+    ) -> EnrichmentResult:  # pragma: no cover - protocol stub
         """Return any metadata improvements and warnings for the parsed document."""
         raise NotImplementedError
 

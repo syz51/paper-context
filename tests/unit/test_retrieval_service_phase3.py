@@ -7,9 +7,9 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from paper_context.pagination import decode_cursor
-from paper_context.retrieval.service import RetrievalService
-from paper_context.retrieval.types import PassageResult, TablePreview, TableResult
+from paper_context.pagination import decode_cursor, encode_cursor
+from paper_context.retrieval.service import RetrievalService, _ActiveRunSelection
+from paper_context.retrieval.types import PassageResult, RetrievalError, TablePreview, TableResult
 
 pytestmark = pytest.mark.unit
 
@@ -181,6 +181,16 @@ def test_get_table_returns_full_structured_payload() -> None:
     assert table.warnings == ("parser_fallback_used",)
 
 
+def test_get_table_returns_none_when_table_is_missing() -> None:
+    connection = MagicMock()
+    result = MagicMock()
+    result.mappings.return_value.one_or_none.return_value = None
+    connection.execute.return_value = result
+    service = _service(connection)
+
+    assert service.get_table(table_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")) is None
+
+
 def test_get_passage_context_returns_neighbors_and_warning() -> None:
     connection = MagicMock()
     first_result = MagicMock()
@@ -240,3 +250,121 @@ def test_get_passage_context_returns_neighbors_and_warning() -> None:
         UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
     ]
     assert context.warnings == ("parser_fallback_used", "parent_context_truncated")
+
+
+def test_get_passage_context_returns_none_when_target_or_selected_row_is_missing() -> None:
+    connection = MagicMock()
+    missing_target = MagicMock()
+    missing_target.mappings.return_value.one_or_none.return_value = None
+    connection.execute.return_value = missing_target
+    service = _service(connection)
+
+    assert (
+        service.get_passage_context(
+            passage_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            before=1,
+            after=1,
+        )
+        is None
+    )
+
+    selected_row = MagicMock()
+    selected_row.mappings.return_value.one_or_none.return_value = {
+        "passage_id": UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        "document_id": UUID("11111111-1111-1111-1111-111111111111"),
+        "section_id": UUID("22222222-2222-2222-2222-222222222222"),
+        "body_text": "selected",
+        "chunk_ordinal": 1,
+        "page_start": 1,
+        "page_end": 1,
+        "revision_id": UUID("33333333-3333-3333-3333-333333333333"),
+        "document_title": "Paper",
+        "section_path": ["Methods"],
+        "retrieval_index_run_id": UUID("55555555-5555-5555-5555-555555555555"),
+        "index_version": "mvp-v1",
+        "parser_source": "docling",
+        "warnings": [],
+    }
+    section_rows = MagicMock()
+    section_rows.mappings.return_value.all.return_value = [
+        {
+            "passage_id": UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            "body_text": "sibling",
+            "chunk_ordinal": 2,
+            "page_start": 1,
+            "page_end": 1,
+        }
+    ]
+    connection.execute.side_effect = [selected_row, section_rows]
+
+    assert (
+        service.get_passage_context(
+            passage_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            before=1,
+            after=1,
+        )
+        is None
+    )
+
+
+def test_paginate_ranked_results_rejects_bad_cursor_variants() -> None:
+    service = _service()
+    active_runs = _ActiveRunSelection(
+        run_ids=(UUID("44444444-4444-4444-4444-444444444444"),),
+        index_versions=("mvp-v1",),
+    )
+    results = (
+        _passage(
+            passage_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            score=2.0,
+            retrieval_index_run_id=UUID("44444444-4444-4444-4444-444444444444"),
+        ),
+    )
+
+    with pytest.raises(RetrievalError, match="cursor"):
+        service._paginate_ranked_results(
+            kind="passages",
+            results=results,
+            limit=1,
+            cursor="not-a-valid-cursor",
+            active_runs=active_runs,
+            fingerprint="fingerprint",
+        )
+
+    mismatched_cursor = encode_cursor(
+        {
+            "kind": "tables",
+            "fingerprint": "fingerprint",
+            "index_version": "mvp-v1",
+            "score": "2.0",
+            "entity_id": str(results[0].passage_id),
+        }
+    )
+    with pytest.raises(RetrievalError, match="cursor does not match request"):
+        service._paginate_ranked_results(
+            kind="passages",
+            results=results,
+            limit=1,
+            cursor=mismatched_cursor,
+            active_runs=active_runs,
+            fingerprint="fingerprint",
+        )
+
+    stale_cursor = encode_cursor(
+        {
+            "kind": "passages",
+            "fingerprint": "fingerprint",
+            "index_version": "mvp-v0",
+            "score": "2.0",
+            "entity_id": str(results[0].passage_id),
+        }
+    )
+    with pytest.raises(RetrievalError, match="index version is no longer active"):
+        service._paginate_ranked_results(
+            kind="passages",
+            results=results,
+            limit=1,
+            cursor=stale_cursor,
+            active_runs=active_runs,
+            fingerprint="fingerprint",
+        )

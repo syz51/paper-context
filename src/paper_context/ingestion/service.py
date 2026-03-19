@@ -150,7 +150,7 @@ class IngestProcessor(Protocol):
         connection: Connection,
         context: IngestJobContext,
         lease: LeaseExtender,
-    ) -> None:
+    ) -> None:  # pragma: no cover - protocol stub
         """Process an ingest job context while the lease remains granted."""
         pass
 

@@ -18,7 +18,9 @@ from paper_context.retrieval.service import (
     _dedupe_warnings,
     _json_dumps,
     _normalize_modes,
+    _PassageIndexRow,
     _retrieval_index_run_id,
+    _TableIndexRow,
     _vector_literal,
 )
 from paper_context.retrieval.types import (
@@ -438,6 +440,23 @@ def test_sparse_and_dense_candidate_loaders_cover_rows_and_empty_results() -> No
     assert sparse_tables[0].preview.headers == ("A", "2")
     assert sparse_tables[0].preview.rows == (("x", "1"), ("y", "2"))
 
+    unlimited_passages = service._load_sparse_passage_candidates(
+        _connection(_mock_result(rows=[passage_row])),
+        query="search",
+        retrieval_index_run_ids=(uuid4(),),
+        filtered_document_ids=None,
+        limit=None,
+    )
+    unlimited_tables = service._load_sparse_table_candidates(
+        _connection(_mock_result(rows=[table_row])),
+        query="search",
+        retrieval_index_run_ids=(uuid4(),),
+        filtered_document_ids=None,
+        limit=None,
+    )
+    assert len(unlimited_passages) == 1
+    assert len(unlimited_tables) == 1
+
     assert (
         service._load_dense_passage_candidates(
             MagicMock(),
@@ -495,6 +514,19 @@ def test_dense_loader_rejects_bad_embedding_dimensions() -> None:
             filtered_document_ids=None,
             limit=5,
         )
+
+
+def test_dense_loader_returns_empty_without_embedding_client() -> None:
+    assert (
+        _service(embedding_client=None)._load_dense_passage_candidates(
+            MagicMock(),
+            query="search",
+            retrieval_index_run_ids=(uuid4(),),
+            filtered_document_ids=None,
+            limit=5,
+        )
+        == []
+    )
 
 
 def test_fuse_candidates_and_rerank_helpers() -> None:
@@ -1050,3 +1082,224 @@ def test_indexer_rebuild_rejects_unexpected_embedding_dimensions() -> None:
     indexer._insert_passage_asset_batch.assert_not_called()
     indexer._insert_table_asset_batch.assert_not_called()
     indexer._activate_build_run.assert_not_called()
+
+
+def test_indexer_search_text_helpers_cover_optional_metadata_and_table_parts() -> None:
+    indexer = DocumentRetrievalIndexer(
+        index_version="mvp-v1",
+        chunking_version="chunk-v1",
+        embedding_model="embed-v1",
+        reranker_model="rank-v1",
+    )
+
+    minimal_passage_text = indexer._build_passage_search_text(
+        _PassageIndexRow(
+            passage_id=uuid4(),
+            document_id=uuid4(),
+            revision_id=uuid4(),
+            section_id=uuid4(),
+            chunk_ordinal=0,
+            body_text="Context only",
+            contextualized_text="Context only",
+            page_start=None,
+            page_end=None,
+            document_title="Paper",
+            authors=(),
+            abstract=None,
+            publication_year=None,
+            section_path=(),
+        )
+    )
+    assert minimal_passage_text == "Context only"
+
+    table_text = indexer._build_table_search_text(
+        _TableIndexRow(
+            table_id=uuid4(),
+            document_id=uuid4(),
+            revision_id=uuid4(),
+            section_id=uuid4(),
+            table_type=None,
+            page_start=None,
+            page_end=None,
+            publication_year=None,
+            document_title="Paper",
+            section_path=(),
+            caption=None,
+            headers=(),
+            rows=(),
+        )
+    )
+    assert table_text == "Document title: Paper\nSection path: Body"
+
+
+def test_ranked_result_loaders_cover_guard_clauses_and_missing_active_runs() -> None:
+    service = _service()
+    active_runs = _ActiveRunSelection(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+
+    assert service._load_ranked_passage_results(
+        MagicMock(),
+        query="   ",
+        limit=5,
+        filtered_document_ids=None,
+        active_runs=active_runs,
+        sparse_candidate_limit=5,
+        dense_candidate_limit=5,
+    ) == ([], 0, 0)
+    assert service._load_ranked_table_results(
+        MagicMock(),
+        query="query",
+        limit=5,
+        filtered_document_ids=(),
+        active_runs=active_runs,
+        sparse_candidate_limit=5,
+    ) == ([], 0)
+
+    empty_selection = _service(active_index_version=None)._resolve_active_run_selection(
+        _connection(_mock_result(rows=[])),
+        filtered_document_ids=None,
+    )
+    assert empty_selection == _ActiveRunSelection(run_ids=(), index_versions=())
+
+
+def test_page_index_version_uses_active_runs_or_result_fallback() -> None:
+    service = _service(active_index_version=None)
+    result = PassageResult(
+        passage_id=uuid4(),
+        document_id=uuid4(),
+        section_id=uuid4(),
+        document_title="Paper",
+        section_path=("Methods",),
+        text="Text",
+        score=1.0,
+        retrieval_modes=("sparse",),
+        page_start=1,
+        page_end=1,
+        index_version="mvp-v1",
+        retrieval_index_run_id=uuid4(),
+    )
+
+    assert (
+        service._page_index_version(
+            results=(result,),
+            active_runs=_ActiveRunSelection(run_ids=(uuid4(),), index_versions=("mvp-v1",)),
+        )
+        == "mvp-v1"
+    )
+    assert (
+        service._page_index_version(
+            results=(result,),
+            active_runs=_ActiveRunSelection(
+                run_ids=(uuid4(), uuid4()),
+                index_versions=("mvp-v1", "mvp-v2"),
+            ),
+        )
+        == "mvp-v1"
+    )
+    assert (
+        service._page_index_version(
+            results=(result,),
+            active_runs=_ActiveRunSelection(run_ids=(), index_versions=()),
+        )
+        == "mvp-v1"
+    )
+
+
+def test_parent_sections_cover_unselected_and_empty_section_paths() -> None:
+    service = _service()
+    populated_section_id = uuid4()
+    empty_section_id = uuid4()
+    document_id = uuid4()
+    table = TableResult(
+        table_id=uuid4(),
+        document_id=document_id,
+        section_id=populated_section_id,
+        document_title="Paper",
+        section_path=("Results",),
+        caption="Caption",
+        table_type="lexical",
+        preview=TablePreview(headers=("A",), rows=(("1",),), row_count=1),
+        score=1.0,
+        retrieval_modes=("sparse",),
+        page_start=1,
+        page_end=1,
+        index_version="mvp-v1",
+        retrieval_index_run_id=uuid4(),
+    )
+
+    parent_sections = service._load_parent_sections(
+        _connection(
+            _mock_result(
+                rows=[
+                    {
+                        "passage_id": uuid4(),
+                        "section_id": populated_section_id,
+                        "chunk_ordinal": 1,
+                        "body_text": "A",
+                        "page_start": 1,
+                        "page_end": 1,
+                        "document_id": document_id,
+                        "document_title": "Paper",
+                        "heading": "Results",
+                        "section_path": ["Results"],
+                        "section_page_start": 1,
+                        "section_page_end": 3,
+                    },
+                    {
+                        "passage_id": uuid4(),
+                        "section_id": populated_section_id,
+                        "chunk_ordinal": 2,
+                        "body_text": "B",
+                        "page_start": 2,
+                        "page_end": 2,
+                        "document_id": document_id,
+                        "document_title": "Paper",
+                        "heading": "Results",
+                        "section_path": ["Results"],
+                        "section_page_start": 1,
+                        "section_page_end": 3,
+                    },
+                    {
+                        "passage_id": uuid4(),
+                        "section_id": populated_section_id,
+                        "chunk_ordinal": 3,
+                        "body_text": "C",
+                        "page_start": 3,
+                        "page_end": 3,
+                        "document_id": document_id,
+                        "document_title": "Paper",
+                        "heading": "Results",
+                        "section_path": ["Results"],
+                        "section_page_start": 1,
+                        "section_page_end": 3,
+                    },
+                ]
+            )
+        ),
+        passages=(),
+        tables=(
+            table,
+            TableResult(
+                table_id=uuid4(),
+                document_id=document_id,
+                section_id=empty_section_id,
+                document_title="Paper",
+                section_path=("Appendix",),
+                caption="Missing",
+                table_type="lexical",
+                preview=TablePreview(headers=("A",), rows=(("1",),), row_count=1),
+                score=1.0,
+                retrieval_modes=("sparse",),
+                page_start=4,
+                page_end=4,
+                index_version="mvp-v1",
+                retrieval_index_run_id=uuid4(),
+            ),
+        ),
+    )
+
+    assert len(parent_sections) == 1
+    assert [passage.relationship for passage in parent_sections[0].supporting_passages] == [
+        "sibling",
+        "sibling",
+    ]
+    assert parent_sections[0].warnings == ("parent_context_truncated",)
