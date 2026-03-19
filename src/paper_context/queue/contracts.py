@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import text
+from sqlalchemy import select
 from sqlalchemy.engine import Connection
+
+from paper_context.models import IngestJob
 
 from .pgmq import PgmqAdapter, PgmqMessage, QueueMetrics
 
@@ -116,16 +118,7 @@ class IngestionQueue:
 
     def _ingest_job_is_terminal(self, conn: Connection, *, ingest_job_id: UUID) -> bool:
         row = (
-            conn.execute(
-                text(
-                    """
-                    SELECT status
-                    FROM ingest_jobs
-                    WHERE id = :ingest_job_id
-                    """
-                ),
-                {"ingest_job_id": ingest_job_id},
-            )
+            conn.execute(select(IngestJob.status).where(IngestJob.id == ingest_job_id))
             .mappings()
             .one_or_none()
         )

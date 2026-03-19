@@ -9,9 +9,35 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol, TypedDict, cast
 
-from sqlalchemy import text
+from sqlalchemy import (
+    String,
+    and_,
+    bindparam,
+    delete,
+    exists,
+    func,
+    insert,
+    or_,
+    select,
+    text,
+    update,
+)
+from sqlalchemy import cast as sa_cast
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection
+from sqlalchemy.orm import aliased
 
+from paper_context.models import (
+    Document,
+    DocumentArtifact,
+    DocumentPassage,
+    DocumentReference,
+    DocumentSection,
+    DocumentTable,
+    IngestJob,
+    RetrievalIndexRun,
+)
 from paper_context.queue.contracts import IngestionQueue, IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
 from paper_context.retrieval import DocumentRetrievalIndexer
@@ -24,6 +50,7 @@ from .types import EnrichmentResult, ParsedDocument, ParsedParagraph, ParsedSect
 
 
 class IngestJobRow(TypedDict):
+    id: uuid.UUID
     document_id: uuid.UUID
     created_at: datetime
     status: str
@@ -34,6 +61,7 @@ class IngestJobRow(TypedDict):
 class SourceArtifactRow(TypedDict):
     id: uuid.UUID
     storage_ref: str
+    checksum: str | None
 
 
 @dataclass(frozen=True)
@@ -549,41 +577,17 @@ class DeterministicIngestProcessor:
         *,
         for_update: bool = False,
     ) -> IngestJobRow | None:
-        base_query = """
-            SELECT
-                id,
-                document_id,
-                source_artifact_id,
-                created_at,
-                status,
-                COALESCE(warnings, '[]'::jsonb) AS warnings
-            FROM ingest_jobs
-            WHERE id = :ingest_job_id
-        """
-        query_text = (
-            """
-            SELECT
-                id,
-                document_id,
-                source_artifact_id,
-                created_at,
-                status,
-                COALESCE(warnings, '[]'::jsonb) AS warnings
-            FROM ingest_jobs
-            WHERE id = :ingest_job_id
-            FOR UPDATE
-            """
-            if for_update
-            else base_query
-        )
-        row = (
-            connection.execute(
-                text(query_text),
-                {"ingest_job_id": ingest_job_id},
-            )
-            .mappings()
-            .one_or_none()
-        )
+        statement = select(
+            IngestJob.id,
+            IngestJob.document_id,
+            IngestJob.source_artifact_id,
+            IngestJob.created_at,
+            IngestJob.status,
+            func.coalesce(IngestJob.warnings, sa_cast([], JSONB)).label("warnings"),
+        ).where(IngestJob.id == ingest_job_id)
+        if for_update:
+            statement = statement.with_for_update()
+        row = connection.execute(statement).mappings().one_or_none()
         if row is None:
             return None
         return cast(IngestJobRow, dict(row))
@@ -601,15 +605,7 @@ class DeterministicIngestProcessor:
 
     def _lock_document(self, connection: Connection, document_id: uuid.UUID) -> None:
         connection.execute(
-            text(
-                """
-                SELECT id
-                FROM documents
-                WHERE id = :document_id
-                FOR UPDATE
-                """
-            ),
-            {"document_id": document_id},
+            select(Document.id).where(Document.id == document_id).with_for_update()
         ).scalar_one()
 
     def _load_source_artifact(
@@ -623,19 +619,15 @@ class DeterministicIngestProcessor:
             return None
         row = (
             connection.execute(
-                text(
-                    """
-                    SELECT id, storage_ref, checksum
-                    FROM document_artifacts
-                    WHERE id = :source_artifact_id
-                      AND ingest_job_id = :ingest_job_id
-                      AND artifact_type = 'source_pdf'
-                    """
-                ),
-                {
-                    "source_artifact_id": source_artifact_id,
-                    "ingest_job_id": ingest_job_id,
-                },
+                select(
+                    DocumentArtifact.id,
+                    DocumentArtifact.storage_ref,
+                    DocumentArtifact.checksum,
+                ).where(
+                    DocumentArtifact.id == source_artifact_id,
+                    DocumentArtifact.ingest_job_id == ingest_job_id,
+                    DocumentArtifact.artifact_type == "source_pdf",
+                )
             )
             .mappings()
             .one_or_none()
@@ -651,39 +643,48 @@ class DeterministicIngestProcessor:
         document_id: uuid.UUID,
         ingest_job_id: uuid.UUID,
     ) -> None:
-        for statement in [
-            """
-            DELETE FROM document_passages
-            WHERE document_id = :document_id
-            """,
-            """
-            DELETE FROM document_tables
-            WHERE document_id = :document_id
-            """,
-            """
-            DELETE FROM document_references
-            WHERE document_id = :document_id
-            """,
-            """
-            DELETE FROM document_sections
-            WHERE document_id = :document_id
-            """,
-            "DELETE FROM retrieval_index_runs WHERE document_id = :document_id",
-            """
-            DELETE FROM document_artifacts
-            WHERE document_id = :document_id
-              AND artifact_type <> 'source_pdf'
-            """,
-            """
-            UPDATE document_artifacts
-            SET is_primary = false
-            WHERE document_id = :document_id
-            """,
-        ]:
-            connection.execute(
-                text(statement),
-                {"document_id": document_id, "ingest_job_id": ingest_job_id},
-            )
+        params = {"document_id": document_id, "ingest_job_id": ingest_job_id}
+        connection.execute(
+            delete(DocumentPassage).where(
+                DocumentPassage.document_id == bindparam("b_document_id")
+            ),
+            {**params, "b_document_id": document_id},
+        )
+        connection.execute(
+            delete(DocumentTable).where(DocumentTable.document_id == bindparam("b_document_id")),
+            {**params, "b_document_id": document_id},
+        )
+        connection.execute(
+            delete(DocumentReference).where(
+                DocumentReference.document_id == bindparam("b_document_id")
+            ),
+            {**params, "b_document_id": document_id},
+        )
+        connection.execute(
+            delete(DocumentSection).where(
+                DocumentSection.document_id == bindparam("b_document_id")
+            ),
+            {**params, "b_document_id": document_id},
+        )
+        connection.execute(
+            delete(RetrievalIndexRun).where(
+                RetrievalIndexRun.document_id == bindparam("b_document_id")
+            ),
+            {**params, "b_document_id": document_id},
+        )
+        connection.execute(
+            delete(DocumentArtifact).where(
+                DocumentArtifact.document_id == bindparam("b_document_id"),
+                DocumentArtifact.artifact_type != "source_pdf",
+            ),
+            {**params, "b_document_id": document_id},
+        )
+        connection.execute(
+            update(DocumentArtifact)
+            .where(DocumentArtifact.document_id == bindparam("b_document_id"))
+            .values(is_primary=False),
+            {**params, "b_document_id": document_id},
+        )
 
     def _parser_artifact_id(
         self,
@@ -741,44 +742,42 @@ class DeterministicIngestProcessor:
             ingest_job_id=ingest_job_id,
             artifact=staged_artifact.parser_result,
         )
+        statement = pg_insert(DocumentArtifact).values(
+            id=bindparam("b_id"),
+            document_id=bindparam("b_document_id"),
+            ingest_job_id=bindparam("b_ingest_job_id"),
+            artifact_type=bindparam("b_artifact_type"),
+            parser=bindparam("b_parser"),
+            storage_ref=bindparam("b_storage_ref"),
+            checksum=bindparam("b_checksum"),
+            is_primary=bindparam("b_is_primary"),
+        )
         connection.execute(
-            text(
-                """
-                INSERT INTO document_artifacts (
-                    id,
-                    document_id,
-                    ingest_job_id,
-                    artifact_type,
-                    parser,
-                    storage_ref,
-                    checksum,
-                    is_primary
-                )
-                VALUES (
-                    :id,
-                    :document_id,
-                    :ingest_job_id,
-                    :artifact_type,
-                    :parser,
-                    :storage_ref,
-                    :checksum,
-                    :is_primary
-                )
-                ON CONFLICT (id) DO UPDATE
-                SET storage_ref = EXCLUDED.storage_ref,
-                    checksum = EXCLUDED.checksum,
-                    is_primary = EXCLUDED.is_primary
-                """
+            statement.on_conflict_do_update(
+                index_elements=[DocumentArtifact.id],
+                set_={
+                    "storage_ref": statement.excluded.storage_ref,
+                    "checksum": statement.excluded.checksum,
+                    "is_primary": statement.excluded.is_primary,
+                },
             ),
             {
                 "id": parser_artifact_id,
+                "b_id": parser_artifact_id,
                 "document_id": document_id,
+                "b_document_id": document_id,
                 "ingest_job_id": ingest_job_id,
+                "b_ingest_job_id": ingest_job_id,
                 "artifact_type": staged_artifact.parser_result.artifact.artifact_type,
+                "b_artifact_type": staged_artifact.parser_result.artifact.artifact_type,
                 "parser": staged_artifact.parser_result.artifact.parser,
+                "b_parser": staged_artifact.parser_result.artifact.parser,
                 "storage_ref": staged_artifact.stored_artifact.storage_ref,
+                "b_storage_ref": staged_artifact.stored_artifact.storage_ref,
                 "checksum": staged_artifact.stored_artifact.checksum,
+                "b_checksum": staged_artifact.stored_artifact.checksum,
                 "is_primary": staged_artifact.is_primary,
+                "b_is_primary": staged_artifact.is_primary,
             },
         )
         return parser_artifact_id
@@ -833,126 +832,111 @@ class DeterministicIngestProcessor:
                 section_ids[section.parent_key] if section.parent_key is not None else None
             )
             connection.execute(
-                text(
-                    """
-                    INSERT INTO document_sections (
-                        id,
-                        document_id,
-                        parent_section_id,
-                        heading,
-                        heading_path,
-                        ordinal,
-                        page_start,
-                        page_end,
-                        artifact_id
-                    )
-                    VALUES (
-                        :id,
-                        :document_id,
-                        :parent_section_id,
-                        :heading,
-                        CAST(:heading_path AS jsonb),
-                        :ordinal,
-                        :page_start,
-                        :page_end,
-                        :artifact_id
-                    )
-                    """
+                insert(DocumentSection).values(
+                    id=bindparam("b_id"),
+                    document_id=bindparam("b_document_id"),
+                    parent_section_id=bindparam("b_parent_section_id"),
+                    heading=bindparam("b_heading"),
+                    heading_path=bindparam("b_heading_path", type_=JSONB),
+                    ordinal=bindparam("b_ordinal"),
+                    page_start=bindparam("b_page_start"),
+                    page_end=bindparam("b_page_end"),
+                    artifact_id=bindparam("b_artifact_id"),
                 ),
                 {
                     "id": section_id,
+                    "b_id": section_id,
                     "document_id": document_id,
+                    "b_document_id": document_id,
                     "parent_section_id": parent_section_id,
+                    "b_parent_section_id": parent_section_id,
                     "heading": section.heading,
-                    "heading_path": _json_array(section.heading_path),
+                    "b_heading": section.heading,
+                    "heading_path": section.heading_path,
+                    "b_heading_path": section.heading_path,
                     "ordinal": len(section_ids),
+                    "b_ordinal": len(section_ids),
                     "page_start": section.page_start,
+                    "b_page_start": section.page_start,
                     "page_end": section.page_end,
+                    "b_page_end": section.page_end,
                     "artifact_id": artifact_id,
+                    "b_artifact_id": artifact_id,
                 },
             )
 
         for table in parsed_document.tables:
+            table_row_id = uuid.uuid4()
             connection.execute(
-                text(
-                    """
-                    INSERT INTO document_tables (
-                        id,
-                        document_id,
-                        section_id,
-                        caption,
-                        table_type,
-                        headers_json,
-                        rows_json,
-                        page_start,
-                        page_end,
-                        artifact_id
-                    )
-                    VALUES (
-                        :id,
-                        :document_id,
-                        :section_id,
-                        :caption,
-                        'lexical',
-                        CAST(:headers_json AS jsonb),
-                        CAST(:rows_json AS jsonb),
-                        :page_start,
-                        :page_end,
-                        :artifact_id
-                    )
-                    """
+                insert(DocumentTable).values(
+                    id=bindparam("b_id"),
+                    document_id=bindparam("b_document_id"),
+                    section_id=bindparam("b_section_id"),
+                    caption=bindparam("b_caption"),
+                    table_type=bindparam("b_table_type"),
+                    headers_json=bindparam("b_headers_json", type_=JSONB),
+                    rows_json=bindparam("b_rows_json", type_=JSONB),
+                    page_start=bindparam("b_page_start"),
+                    page_end=bindparam("b_page_end"),
+                    artifact_id=bindparam("b_artifact_id"),
                 ),
                 {
-                    "id": uuid.uuid4(),
+                    "id": table_row_id,
+                    "b_id": table_row_id,
                     "document_id": document_id,
+                    "b_document_id": document_id,
                     "section_id": section_ids[table.section_key],
+                    "b_section_id": section_ids[table.section_key],
                     "caption": table.caption,
-                    "headers_json": _json_array(table.headers),
-                    "rows_json": _json_array(table.rows),
+                    "b_caption": table.caption,
+                    "table_type": "lexical",
+                    "b_table_type": "lexical",
+                    "headers_json": table.headers,
+                    "b_headers_json": table.headers,
+                    "rows_json": table.rows,
+                    "b_rows_json": table.rows,
                     "page_start": table.page_start,
+                    "b_page_start": table.page_start,
                     "page_end": table.page_end,
+                    "b_page_end": table.page_end,
                     "artifact_id": artifact_id,
+                    "b_artifact_id": artifact_id,
                 },
             )
 
         for reference in parsed_document.references:
+            reference_row_id = uuid.uuid4()
             connection.execute(
-                text(
-                    """
-                    INSERT INTO document_references (
-                        id,
-                        document_id,
-                        raw_citation,
-                        normalized_title,
-                        authors,
-                        publication_year,
-                        doi,
-                        source_confidence,
-                        artifact_id
-                    )
-                    VALUES (
-                        :id,
-                        :document_id,
-                        :raw_citation,
-                        :normalized_title,
-                        CAST(:authors AS jsonb),
-                        :publication_year,
-                        :doi,
-                        :source_confidence,
-                        :artifact_id
-                    )
-                    """
+                insert(DocumentReference).values(
+                    id=bindparam("b_id"),
+                    document_id=bindparam("b_document_id"),
+                    raw_citation=bindparam("b_raw_citation"),
+                    normalized_title=bindparam("b_normalized_title"),
+                    authors=bindparam("b_authors", type_=JSONB),
+                    publication_year=bindparam("b_publication_year"),
+                    doi=bindparam("b_doi"),
+                    source_confidence=bindparam("b_source_confidence"),
+                    artifact_id=bindparam("b_artifact_id"),
                 ),
                 {
-                    "id": uuid.uuid4(),
+                    "id": reference_row_id,
+                    "b_id": reference_row_id,
                     "document_id": document_id,
+                    "b_document_id": document_id,
                     "raw_citation": reference.raw_citation,
+                    "b_raw_citation": reference.raw_citation,
                     "normalized_title": reference.normalized_title,
-                    "authors": _json_array(reference.authors or []),
+                    "b_normalized_title": reference.normalized_title,
+                    "authors": reference.authors or [],
+                    "b_authors": reference.authors or [],
                     "publication_year": reference.publication_year,
+                    "b_publication_year": reference.publication_year,
                     "doi": reference.doi,
+                    "b_doi": reference.doi,
                     "source_confidence": reference.source_confidence,
+                    "b_source_confidence": reference.source_confidence,
                     "artifact_id": artifact_id,
+                    "b_artifact_id": artifact_id,
                 },
             )
 
@@ -969,27 +953,36 @@ class DeterministicIngestProcessor:
         publication_year: int | None,
         metadata_confidence: float | None,
     ) -> None:
+        now = datetime.now(UTC)
         connection.execute(
-            text(
-                """
-                UPDATE documents
-                SET title = COALESCE(:title, title),
-                    authors = CAST(:authors AS jsonb),
-                    abstract = COALESCE(:abstract, abstract),
-                    publication_year = COALESCE(:publication_year, publication_year),
-                    metadata_confidence = :metadata_confidence,
-                    updated_at = :now
-                WHERE id = :document_id
-                """
+            update(Document)
+            .where(Document.id == bindparam("b_document_id"))
+            .values(
+                title=func.coalesce(bindparam("b_title"), Document.title),
+                authors=bindparam("b_authors", type_=JSONB),
+                abstract=func.coalesce(bindparam("b_abstract"), Document.abstract),
+                publication_year=func.coalesce(
+                    bindparam("b_publication_year"),
+                    Document.publication_year,
+                ),
+                metadata_confidence=bindparam("b_metadata_confidence"),
+                updated_at=bindparam("b_now"),
             ),
             {
                 "document_id": document_id,
+                "b_document_id": document_id,
                 "title": title,
-                "authors": _json_array(authors),
+                "b_title": title,
+                "authors": authors,
+                "b_authors": authors,
                 "abstract": abstract,
+                "b_abstract": abstract,
                 "publication_year": publication_year,
+                "b_publication_year": publication_year,
                 "metadata_confidence": metadata_confidence,
-                "now": datetime.now(UTC),
+                "b_metadata_confidence": metadata_confidence,
+                "now": now,
+                "b_now": now,
             },
         )
 
@@ -1060,46 +1053,57 @@ class DeterministicIngestProcessor:
                 body_text = "\n\n".join(paragraph.text for paragraph in chunk)
                 token_count = _token_count(body_text)
                 contextualized_text = _contextualize_text(title, section.heading_path, body_text)
+                provenance_offsets = {
+                    "pages": [
+                        page
+                        for paragraph in chunk
+                        for page in (paragraph.provenance_offsets or {}).get("pages", [])
+                    ],
+                    "charspans": [
+                        charspan
+                        for paragraph in chunk
+                        for charspan in (paragraph.provenance_offsets or {}).get("charspans", [])
+                    ],
+                }
+                passage_row_id = uuid.uuid4()
                 connection.execute(
-                    text(
-                        """
-                        INSERT INTO document_passages (
-                            id,
-                            document_id,
-                            section_id,
-                            chunk_ordinal,
-                            body_text,
-                            contextualized_text,
-                            token_count,
-                            page_start,
-                            page_end,
-                            provenance_offsets,
-                            artifact_id
-                        )
-                        VALUES (
-                            :id,
-                            :document_id,
-                            :section_id,
-                            :chunk_ordinal,
-                            :body_text,
-                            :contextualized_text,
-                            :token_count,
-                            :page_start,
-                            :page_end,
-                            CAST(:provenance_offsets AS jsonb),
-                            :artifact_id
-                        )
-                        """
+                    insert(DocumentPassage).values(
+                        id=bindparam("b_id"),
+                        document_id=bindparam("b_document_id"),
+                        section_id=bindparam("b_section_id"),
+                        chunk_ordinal=bindparam("b_chunk_ordinal"),
+                        body_text=bindparam("b_body_text"),
+                        contextualized_text=bindparam("b_contextualized_text"),
+                        token_count=bindparam("b_token_count"),
+                        page_start=bindparam("b_page_start"),
+                        page_end=bindparam("b_page_end"),
+                        provenance_offsets=bindparam("b_provenance_offsets", type_=JSONB),
+                        artifact_id=bindparam("b_artifact_id"),
                     ),
                     {
-                        "id": uuid.uuid4(),
+                        "id": passage_row_id,
+                        "b_id": passage_row_id,
                         "document_id": document_id,
+                        "b_document_id": document_id,
                         "section_id": section_ids[section.key],
+                        "b_section_id": section_ids[section.key],
                         "chunk_ordinal": chunk_ordinal,
+                        "b_chunk_ordinal": chunk_ordinal,
                         "body_text": body_text,
+                        "b_body_text": body_text,
                         "contextualized_text": contextualized_text,
+                        "b_contextualized_text": contextualized_text,
                         "token_count": token_count,
+                        "b_token_count": token_count,
                         "page_start": min(
+                            (
+                                paragraph.page_start
+                                for paragraph in chunk
+                                if paragraph.page_start is not None
+                            ),
+                            default=None,
+                        ),
+                        "b_page_start": min(
                             (
                                 paragraph.page_start
                                 for paragraph in chunk
@@ -1115,25 +1119,18 @@ class DeterministicIngestProcessor:
                             ),
                             default=None,
                         ),
-                        "provenance_offsets": _json_array(
-                            {
-                                "pages": [
-                                    page
-                                    for paragraph in chunk
-                                    for page in (paragraph.provenance_offsets or {}).get(
-                                        "pages", []
-                                    )
-                                ],
-                                "charspans": [
-                                    charspan
-                                    for paragraph in chunk
-                                    for charspan in (paragraph.provenance_offsets or {}).get(
-                                        "charspans", []
-                                    )
-                                ],
-                            }
+                        "b_page_end": max(
+                            (
+                                paragraph.page_end
+                                for paragraph in chunk
+                                if paragraph.page_end is not None
+                            ),
+                            default=None,
                         ),
+                        "provenance_offsets": provenance_offsets,
+                        "b_provenance_offsets": provenance_offsets,
                         "artifact_id": artifact_id,
+                        "b_artifact_id": artifact_id,
                     },
                 )
 
@@ -1160,30 +1157,23 @@ class DeterministicIngestProcessor:
         document_id: uuid.UUID,
         created_at: datetime,
     ) -> bool:
+        newer_job = aliased(IngestJob)
         result = connection.execute(
-            text(
-                """
-                SELECT EXISTS(
-                    SELECT 1
-                    FROM ingest_jobs newer
-                    WHERE newer.document_id = :document_id
-                      AND newer.id <> :ingest_job_id
-                      AND (
-                          newer.created_at > :created_at
-                          OR (
-                              newer.created_at = :created_at
-                              AND newer.id::text > :ingest_job_id_text
-                          )
-                      )
+            select(
+                exists(
+                    select(1).where(
+                        newer_job.document_id == document_id,
+                        newer_job.id != ingest_job_id,
+                        or_(
+                            newer_job.created_at > created_at,
+                            and_(
+                                newer_job.created_at == created_at,
+                                sa_cast(newer_job.id, String) > str(ingest_job_id),
+                            ),
+                        ),
+                    )
                 )
-                """
-            ),
-            {
-                "document_id": document_id,
-                "ingest_job_id": ingest_job_id,
-                "created_at": created_at,
-                "ingest_job_id_text": str(ingest_job_id),
-            },
+            )
         )
         return bool(result.scalar_one())
 
@@ -1196,36 +1186,37 @@ class DeterministicIngestProcessor:
         status: str,
         now: datetime,
     ) -> None:
+        current_job = aliased(IngestJob)
+        newer_job = aliased(IngestJob)
+        newer_job_exists = exists(
+            select(1)
+            .select_from(current_job)
+            .join(
+                newer_job,
+                and_(
+                    newer_job.document_id == current_job.document_id,
+                    newer_job.id != current_job.id,
+                    or_(
+                        newer_job.created_at > current_job.created_at,
+                        and_(
+                            newer_job.created_at == current_job.created_at,
+                            sa_cast(newer_job.id, String) > sa_cast(current_job.id, String),
+                        ),
+                    ),
+                ),
+            )
+            .where(current_job.id == ingest_job_id)
+        )
         connection.execute(
-            text(
-                """
-                UPDATE documents
-                SET current_status = :status,
-                    updated_at = :now
-                WHERE id = :document_id
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM ingest_jobs current_job
-                      JOIN ingest_jobs newer
-                        ON newer.document_id = current_job.document_id
-                       AND newer.id <> current_job.id
-                       AND (
-                           newer.created_at > current_job.created_at
-                           OR (
-                               newer.created_at = current_job.created_at
-                               AND newer.id::text > current_job.id::text
-                           )
-                       )
-                      WHERE current_job.id = :ingest_job_id
-                  )
-                """
-            ),
-            {
-                "document_id": document_id,
-                "ingest_job_id": ingest_job_id,
-                "status": status,
-                "now": now,
-            },
+            update(Document)
+            .where(
+                Document.id == document_id,
+                ~newer_job_exists,
+            )
+            .values(
+                current_status=status,
+                updated_at=now,
+            )
         )
 
     def _mark_stage(
@@ -1239,23 +1230,25 @@ class DeterministicIngestProcessor:
     ) -> None:
         now = datetime.now(UTC)
         connection.execute(
-            text(
-                """
-                UPDATE ingest_jobs
-                SET status = :status,
-                    failure_code = NULL,
-                    failure_message = NULL,
-                    warnings = CAST(:warnings AS jsonb),
-                    started_at = COALESCE(started_at, :now),
-                    finished_at = NULL
-                WHERE id = :ingest_job_id
-                """
+            update(IngestJob)
+            .where(IngestJob.id == bindparam("b_ingest_job_id"))
+            .values(
+                status=bindparam("b_status"),
+                failure_code=None,
+                failure_message=None,
+                warnings=bindparam("b_warnings", type_=JSONB),
+                started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
+                finished_at=None,
             ),
             {
                 "ingest_job_id": ingest_job_id,
+                "b_ingest_job_id": ingest_job_id,
                 "status": status,
-                "warnings": _json_array(warnings),
+                "b_status": status,
+                "warnings": warnings,
+                "b_warnings": warnings,
                 "now": now,
+                "b_now": now,
             },
         )
         self._update_document_status_if_current(
@@ -1278,24 +1271,27 @@ class DeterministicIngestProcessor:
     ) -> None:
         now = datetime.now(UTC)
         connection.execute(
-            text(
-                """
-                UPDATE ingest_jobs
-                SET status = 'failed',
-                    failure_code = :failure_code,
-                    failure_message = :failure_message,
-                    warnings = CAST(:warnings AS jsonb),
-                    started_at = COALESCE(started_at, :now),
-                    finished_at = :now
-                WHERE id = :ingest_job_id
-                """
+            update(IngestJob)
+            .where(IngestJob.id == bindparam("b_ingest_job_id"))
+            .values(
+                status="failed",
+                failure_code=bindparam("b_failure_code"),
+                failure_message=bindparam("b_failure_message"),
+                warnings=bindparam("b_warnings", type_=JSONB),
+                started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
+                finished_at=bindparam("b_now"),
             ),
             {
                 "ingest_job_id": ingest_job_id,
+                "b_ingest_job_id": ingest_job_id,
                 "failure_code": failure_code,
+                "b_failure_code": failure_code,
                 "failure_message": failure_message,
-                "warnings": _json_array(_dedupe_warnings(warnings)),
+                "b_failure_message": failure_message,
+                "warnings": _dedupe_warnings(warnings),
+                "b_warnings": _dedupe_warnings(warnings),
                 "now": now,
+                "b_now": now,
             },
         )
         self._update_document_status_if_current(
@@ -1316,19 +1312,20 @@ class DeterministicIngestProcessor:
     ) -> None:
         now = datetime.now(UTC)
         connection.execute(
-            text(
-                """
-                UPDATE ingest_jobs
-                SET status = 'ready',
-                    warnings = CAST(:warnings AS jsonb),
-                    finished_at = :now
-                WHERE id = :ingest_job_id
-                """
+            update(IngestJob)
+            .where(IngestJob.id == bindparam("b_ingest_job_id"))
+            .values(
+                status="ready",
+                warnings=bindparam("b_warnings", type_=JSONB),
+                finished_at=bindparam("b_now"),
             ),
             {
                 "ingest_job_id": ingest_job_id,
-                "warnings": _json_array(_dedupe_warnings(warnings)),
+                "b_ingest_job_id": ingest_job_id,
+                "warnings": _dedupe_warnings(warnings),
+                "b_warnings": _dedupe_warnings(warnings),
                 "now": now,
+                "b_now": now,
             },
         )
         self._update_document_status_if_current(
@@ -1353,15 +1350,9 @@ class SyntheticIngestProcessor:
     ) -> None:
         row = (
             connection.execute(
-                text(
-                    """
-                SELECT status
-                FROM ingest_jobs
-                WHERE id = :ingest_job_id
-                FOR UPDATE
-                """
-                ),
-                {"ingest_job_id": context.payload.ingest_job_id},
+                select(IngestJob.status)
+                .where(IngestJob.id == context.payload.ingest_job_id)
+                .with_for_update()
             )
             .mappings()
             .one_or_none()
@@ -1374,39 +1365,48 @@ class SyntheticIngestProcessor:
 
         now = datetime.now(UTC)
         connection.execute(
-            text(
-                """
-                UPDATE ingest_jobs
-                SET status = 'parsing',
-                    started_at = COALESCE(started_at, :now)
-                WHERE id = :ingest_job_id
-                """
+            update(IngestJob)
+            .where(IngestJob.id == bindparam("b_ingest_job_id"))
+            .values(
+                status="parsing",
+                started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
             ),
-            {"ingest_job_id": context.payload.ingest_job_id, "now": now},
+            {
+                "ingest_job_id": context.payload.ingest_job_id,
+                "b_ingest_job_id": context.payload.ingest_job_id,
+                "now": now,
+                "b_now": now,
+            },
         )
         lease.extend()
         connection.execute(
-            text(
-                """
-                UPDATE ingest_jobs
-                SET status = 'ready',
-                    finished_at = :now,
-                    warnings = COALESCE(warnings, '[]'::jsonb)
-                WHERE id = :ingest_job_id
-                """
+            update(IngestJob)
+            .where(IngestJob.id == bindparam("b_ingest_job_id"))
+            .values(
+                status="ready",
+                finished_at=bindparam("b_now"),
+                warnings=func.coalesce(IngestJob.warnings, sa_cast([], JSONB)),
             ),
-            {"ingest_job_id": context.payload.ingest_job_id, "now": now},
+            {
+                "ingest_job_id": context.payload.ingest_job_id,
+                "b_ingest_job_id": context.payload.ingest_job_id,
+                "now": now,
+                "b_now": now,
+            },
         )
         connection.execute(
-            text(
-                """
-                UPDATE documents
-                SET current_status = 'ready',
-                    updated_at = :now
-                WHERE id = :document_id
-                """
+            update(Document)
+            .where(Document.id == bindparam("b_document_id"))
+            .values(
+                current_status="ready",
+                updated_at=bindparam("b_now"),
             ),
-            {"document_id": context.payload.document_id, "now": now},
+            {
+                "document_id": context.payload.document_id,
+                "b_document_id": context.payload.document_id,
+                "now": now,
+                "b_now": now,
+            },
         )
 
 

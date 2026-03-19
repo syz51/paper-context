@@ -148,6 +148,7 @@ class _RecordingProcessor(DeterministicIngestProcessor):
 
     def _lock_ingest_job(self, connection, ingest_job_id) -> IngestJobRow | None:
         return {
+            "id": ingest_job_id,
             "document_id": uuid4(),
             "created_at": datetime.now(UTC),
             "status": "queued",

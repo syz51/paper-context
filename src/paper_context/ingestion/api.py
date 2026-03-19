@@ -6,10 +6,21 @@ from datetime import UTC, datetime
 from tempfile import SpooledTemporaryFile
 from typing import Any, BinaryIO, TypeVar, cast
 
-from sqlalchemy import insert, text
-from sqlalchemy.engine import Engine
+from sqlalchemy import Text as SqlText
+from sqlalchemy import bindparam, func, insert, lateral, or_, select, true, update
+from sqlalchemy import cast as sa_cast
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.sql.elements import ColumnElement
 
-from paper_context.models import Document, DocumentArtifact, IngestJob
+from paper_context.models import (
+    Document,
+    DocumentArtifact,
+    DocumentSection,
+    DocumentTable,
+    IngestJob,
+    RetrievalIndexRun,
+)
 from paper_context.pagination import CursorError, decode_cursor, encode_cursor, fingerprint_payload
 from paper_context.queue.contracts import IngestionQueue
 from paper_context.schemas.api import (
@@ -127,37 +138,9 @@ class DocumentsApiService:
         )
 
     def list_documents(self, *, limit: int = 20, cursor: str | None = None) -> DocumentListResponse:
+        statement = self._document_projection_statement(include_updated_at=True)
         with self._engine.begin() as connection:
-            rows = (
-                connection.execute(
-                    text(
-                        """
-                        SELECT
-                            documents.id AS document_id,
-                            COALESCE(documents.title, 'Untitled document') AS title,
-                            COALESCE(documents.authors, '[]'::jsonb) AS authors,
-                            documents.publication_year,
-                            COALESCE(documents.quant_tags, '{{}}'::jsonb) AS quant_tags,
-                            documents.current_status,
-                            active_run.index_version AS active_index_version,
-                            documents.updated_at
-                        FROM documents
-                        LEFT JOIN LATERAL (
-                            SELECT runs.index_version
-                            FROM retrieval_index_runs runs
-                            WHERE runs.document_id = documents.id
-                              AND runs.status = 'ready'
-                              AND runs.is_active = true
-                            ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC, runs.id DESC
-                            LIMIT 1
-                        ) active_run ON true
-                        ORDER BY documents.updated_at DESC NULLS LAST, documents.id DESC
-                        """
-                    )
-                )
-                .mappings()
-                .all()
-            )
+            rows = connection.execute(statement).mappings().all()
         documents = [self._row_to_document_result(row) for row in rows]
         page, next_cursor = self._page_items(
             items=documents,
@@ -178,64 +161,27 @@ class DocumentsApiService:
     ) -> DocumentListResponse:
         filters = filters or RetrievalFiltersInput()
         stripped_query = query.strip()
-        params: dict[str, object] = {
-            "query": f"%{stripped_query}%" if stripped_query else None,
-            "apply_document_ids": bool(filters.document_ids),
-            "document_ids": list(filters.document_ids),
-            "apply_publication_years": bool(filters.publication_years),
-            "publication_years": list(filters.publication_years),
-        }
-
-        with self._engine.begin() as connection:
-            rows = (
-                connection.execute(
-                    text(
-                        """
-                        SELECT
-                            documents.id AS document_id,
-                            COALESCE(documents.title, 'Untitled document') AS title,
-                            COALESCE(documents.authors, '[]'::jsonb) AS authors,
-                            documents.publication_year,
-                            COALESCE(documents.quant_tags, '{{}}'::jsonb) AS quant_tags,
-                            documents.current_status,
-                            active_run.index_version AS active_index_version,
-                            documents.updated_at
-                        FROM documents
-                        LEFT JOIN LATERAL (
-                            SELECT runs.index_version
-                            FROM retrieval_index_runs runs
-                            WHERE runs.document_id = documents.id
-                              AND runs.status = 'ready'
-                              AND runs.is_active = true
-                            ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC, runs.id DESC
-                            LIMIT 1
-                        ) active_run ON true
-                        WHERE (
-                            :query IS NULL
-                            OR (
-                                COALESCE(documents.title, '') ILIKE :query
-                                OR COALESCE(documents.abstract, '') ILIKE :query
-                                OR COALESCE(documents.authors::text, '') ILIKE :query
-                            )
-                        )
-                          AND (
-                            :apply_document_ids = false
-                            OR documents.id = ANY(CAST(:document_ids AS uuid[]))
-                        )
-                          AND (
-                            :apply_publication_years = false
-                            OR documents.publication_year = ANY(
-                                CAST(:publication_years AS integer[])
-                            )
-                        )
-                        ORDER BY documents.updated_at DESC NULLS LAST, documents.id DESC
-                        """
-                    ),
-                    params,
+        predicates: list[ColumnElement[bool]] = []
+        if stripped_query:
+            pattern = f"%{stripped_query}%"
+            predicates.append(
+                or_(
+                    func.coalesce(Document.title, "").ilike(pattern),
+                    func.coalesce(Document.abstract, "").ilike(pattern),
+                    func.coalesce(sa_cast(Document.authors, SqlText), "").ilike(pattern),
                 )
-                .mappings()
-                .all()
             )
+        if filters.document_ids:
+            predicates.append(Document.id.in_(filters.document_ids))
+        if filters.publication_years:
+            predicates.append(Document.publication_year.in_(filters.publication_years))
+
+        statement = self._document_projection_statement(
+            *predicates,
+            include_updated_at=True,
+        )
+        with self._engine.begin() as connection:
+            rows = connection.execute(statement).mappings().all()
         documents = [self._row_to_document_result(row) for row in rows]
         page, next_cursor = self._page_items(
             items=documents,
@@ -253,37 +199,9 @@ class DocumentsApiService:
         return DocumentListResponse(documents=list(page), next_cursor=next_cursor)
 
     def get_document(self, document_id: uuid.UUID) -> DocumentResult | None:
+        statement = self._document_projection_statement(Document.id == document_id)
         with self._engine.begin() as connection:
-            row = (
-                connection.execute(
-                    text(
-                        """
-                        SELECT
-                            documents.id AS document_id,
-                            COALESCE(documents.title, 'Untitled document') AS title,
-                            COALESCE(documents.authors, '[]'::jsonb) AS authors,
-                            documents.publication_year,
-                            COALESCE(documents.quant_tags, '{}'::jsonb) AS quant_tags,
-                            documents.current_status,
-                            active_run.index_version AS active_index_version
-                        FROM documents
-                        LEFT JOIN LATERAL (
-                            SELECT runs.index_version
-                            FROM retrieval_index_runs runs
-                            WHERE runs.document_id = documents.id
-                              AND runs.status = 'ready'
-                              AND runs.is_active = true
-                            ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC, runs.id DESC
-                            LIMIT 1
-                        ) active_run ON true
-                        WHERE documents.id = :document_id
-                        """
-                    ),
-                    {"document_id": document_id},
-                )
-                .mappings()
-                .one_or_none()
-            )
+            row = connection.execute(statement).mappings().one_or_none()
         if row is None:
             return None
         return self._row_to_document_result(row)
@@ -291,16 +209,7 @@ class DocumentsApiService:
     def get_document_outline(self, document_id: uuid.UUID) -> DocumentOutlineResponse | None:
         with self._engine.begin() as connection:
             document_row = (
-                connection.execute(
-                    text(
-                        """
-                        SELECT id AS document_id, COALESCE(title, 'Untitled document') AS title
-                        FROM documents
-                        WHERE id = :document_id
-                        """
-                    ),
-                    {"document_id": document_id},
-                )
+                connection.execute(self._document_title_statement(document_id=document_id))
                 .mappings()
                 .one_or_none()
             )
@@ -308,22 +217,20 @@ class DocumentsApiService:
                 return None
             section_rows = (
                 connection.execute(
-                    text(
-                        """
-                        SELECT
-                            id AS section_id,
-                            parent_section_id,
-                            heading,
-                            COALESCE(heading_path, '[]'::jsonb) AS section_path,
-                            ordinal,
-                            page_start,
-                            page_end
-                        FROM document_sections
-                        WHERE document_id = :document_id
-                        ORDER BY ordinal NULLS LAST, id
-                        """
-                    ),
-                    {"document_id": document_id},
+                    select(
+                        DocumentSection.id.label("section_id"),
+                        DocumentSection.parent_section_id,
+                        DocumentSection.heading,
+                        func.coalesce(
+                            DocumentSection.heading_path,
+                            sa_cast([], JSONB),
+                        ).label("section_path"),
+                        DocumentSection.ordinal,
+                        DocumentSection.page_start,
+                        DocumentSection.page_end,
+                    )
+                    .where(DocumentSection.document_id == document_id)
+                    .order_by(DocumentSection.ordinal.asc().nullslast(), DocumentSection.id)
                 )
                 .mappings()
                 .all()
@@ -358,16 +265,7 @@ class DocumentsApiService:
     ) -> DocumentTablesResponse | None:
         with self._engine.begin() as connection:
             document_row = (
-                connection.execute(
-                    text(
-                        """
-                        SELECT id AS document_id, COALESCE(title, 'Untitled document') AS title
-                        FROM documents
-                        WHERE id = :document_id
-                        """
-                    ),
-                    {"document_id": document_id},
-                )
+                connection.execute(self._document_title_statement(document_id=document_id))
                 .mappings()
                 .one_or_none()
             )
@@ -375,31 +273,9 @@ class DocumentsApiService:
                 return None
             rows = (
                 connection.execute(
-                    text(
-                        """
-                        SELECT
-                            tables.id AS table_id,
-                            tables.document_id,
-                            tables.section_id,
-                            COALESCE(documents.title, 'Untitled document') AS document_title,
-                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
-                            tables.caption,
-                            tables.table_type,
-                            COALESCE(tables.headers_json, '[]'::jsonb) AS headers_json,
-                            COALESCE(tables.rows_json, '[]'::jsonb) AS rows_json,
-                            tables.page_start,
-                            tables.page_end,
-                            sections.ordinal AS section_ordinal
-                        FROM document_tables tables
-                        JOIN documents
-                            ON documents.id = tables.document_id
-                        JOIN document_sections sections
-                            ON sections.id = tables.section_id
-                        WHERE tables.document_id = :document_id
-                        ORDER BY sections.ordinal NULLS LAST, tables.id
-                        """
-                    ),
-                    {"document_id": document_id},
+                    self._document_table_projection_statement(
+                        DocumentTable.document_id == document_id
+                    )
                 )
                 .mappings()
                 .all()
@@ -414,29 +290,7 @@ class DocumentsApiService:
         with self._engine.begin() as connection:
             row = (
                 connection.execute(
-                    text(
-                        """
-                        SELECT
-                            tables.id AS table_id,
-                            tables.document_id,
-                            tables.section_id,
-                            COALESCE(documents.title, 'Untitled document') AS document_title,
-                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
-                            tables.caption,
-                            tables.table_type,
-                            COALESCE(tables.headers_json, '[]'::jsonb) AS headers_json,
-                            COALESCE(tables.rows_json, '[]'::jsonb) AS rows_json,
-                            tables.page_start,
-                            tables.page_end
-                        FROM document_tables tables
-                        JOIN documents
-                            ON documents.id = tables.document_id
-                        JOIN document_sections sections
-                            ON sections.id = tables.section_id
-                        WHERE tables.id = :table_id
-                        """
-                    ),
-                    {"table_id": table_id},
+                    self._document_table_projection_statement(DocumentTable.id == table_id)
                 )
                 .mappings()
                 .one_or_none()
@@ -467,23 +321,17 @@ class DocumentsApiService:
         with self._engine.begin() as connection:
             row = (
                 connection.execute(
-                    text(
-                        """
-                        SELECT
-                            id,
-                            document_id,
-                            status,
-                            failure_code,
-                            failure_message,
-                            COALESCE(warnings, '[]'::jsonb) AS warnings,
-                            started_at,
-                            finished_at,
-                            trigger
-                        FROM ingest_jobs
-                        WHERE id = :ingest_job_id
-                        """
-                    ),
-                    {"ingest_job_id": ingest_job_id},
+                    select(
+                        IngestJob.id,
+                        IngestJob.document_id,
+                        IngestJob.status,
+                        IngestJob.failure_code,
+                        IngestJob.failure_message,
+                        func.coalesce(IngestJob.warnings, sa_cast([], JSONB)).label("warnings"),
+                        IngestJob.started_at,
+                        IngestJob.finished_at,
+                        IngestJob.trigger,
+                    ).where(IngestJob.id == ingest_job_id)
                 )
                 .mappings()
                 .one_or_none()
@@ -528,20 +376,13 @@ class DocumentsApiService:
                     )
                 else:
                     updated_rows = connection.execute(
-                        text(
-                            """
-                            UPDATE documents
-                            SET current_status = 'queued',
-                                updated_at = :updated_at,
-                                title = COALESCE(:title, title)
-                            WHERE id = :document_id
-                            """
-                        ),
-                        {
-                            "document_id": document_id,
-                            "updated_at": now,
-                            "title": title,
-                        },
+                        update(Document)
+                        .where(Document.id == document_id)
+                        .values(
+                            current_status="queued",
+                            updated_at=now,
+                            title=func.coalesce(title, Document.title),
+                        )
                     ).rowcount
                     if updated_rows == 0:
                         raise DocumentNotFoundError("document not found")
@@ -576,17 +417,9 @@ class DocumentsApiService:
                     )
                 )
                 connection.execute(
-                    text(
-                        """
-                        UPDATE ingest_jobs
-                        SET source_artifact_id = :source_artifact_id
-                        WHERE id = :ingest_job_id
-                        """
-                    ),
-                    {
-                        "ingest_job_id": ingest_job_id,
-                        "source_artifact_id": source_artifact_id,
-                    },
+                    update(IngestJob)
+                    .where(IngestJob.id == ingest_job_id)
+                    .values(source_artifact_id=source_artifact_id)
                 )
                 self._queue.enqueue_ingest(
                     connection,
@@ -606,31 +439,111 @@ class DocumentsApiService:
 
     def _supersede_queued_jobs(
         self,
-        connection,
+        connection: Connection,
         *,
         document_id: uuid.UUID,
         now: datetime,
     ) -> None:
         connection.execute(
-            text(
-                """
-                UPDATE ingest_jobs
-                SET status = 'failed',
-                    failure_code = :failure_code,
-                    failure_message = :failure_message,
-                    started_at = COALESCE(started_at, :now),
-                    finished_at = :now
-                WHERE document_id = :document_id
-                  AND status = 'queued'
-                """
+            update(IngestJob)
+            .where(
+                IngestJob.document_id == bindparam("b_document_id"),
+                IngestJob.status == "queued",
+            )
+            .values(
+                status="failed",
+                failure_code=bindparam("b_failure_code"),
+                failure_message=bindparam("b_failure_message"),
+                started_at=func.coalesce(IngestJob.started_at, bindparam("b_now")),
+                finished_at=bindparam("b_now"),
             ),
             {
                 "document_id": document_id,
+                "b_document_id": document_id,
                 "failure_code": _SUPERSEDED_FAILURE_CODE,
+                "b_failure_code": _SUPERSEDED_FAILURE_CODE,
                 "failure_message": _SUPERSEDED_FAILURE_MESSAGE,
+                "b_failure_message": _SUPERSEDED_FAILURE_MESSAGE,
                 "now": now,
+                "b_now": now,
             },
         )
+
+    def _document_projection_statement(
+        self,
+        *predicates: ColumnElement[bool],
+        include_updated_at: bool = False,
+    ):
+        active_run = lateral(
+            select(
+                RetrievalIndexRun.index_version.label("active_index_version"),
+            )
+            .where(
+                RetrievalIndexRun.document_id == Document.id,
+                RetrievalIndexRun.status == "ready",
+                RetrievalIndexRun.is_active.is_(True),
+            )
+            .order_by(
+                func.coalesce(
+                    RetrievalIndexRun.activated_at,
+                    RetrievalIndexRun.created_at,
+                ).desc(),
+                RetrievalIndexRun.id.desc(),
+            )
+            .limit(1)
+        ).alias("active_run")
+        columns = [
+            Document.id.label("document_id"),
+            func.coalesce(Document.title, "Untitled document").label("title"),
+            func.coalesce(Document.authors, sa_cast([], JSONB)).label("authors"),
+            Document.publication_year,
+            func.coalesce(Document.quant_tags, sa_cast({}, JSONB)).label("quant_tags"),
+            Document.current_status,
+            active_run.c.active_index_version,
+        ]
+        if include_updated_at:
+            columns.append(Document.updated_at)
+        statement = (
+            select(*columns)
+            .select_from(Document)
+            .outerjoin(active_run, true())
+            .order_by(Document.updated_at.desc().nullslast(), Document.id.desc())
+        )
+        for predicate in predicates:
+            statement = statement.where(predicate)
+        return statement
+
+    def _document_title_statement(self, *, document_id: uuid.UUID):
+        return select(
+            Document.id.label("document_id"),
+            func.coalesce(Document.title, "Untitled document").label("title"),
+        ).where(Document.id == document_id)
+
+    def _document_table_projection_statement(self, *predicates: ColumnElement[bool]):
+        statement = (
+            select(
+                DocumentTable.id.label("table_id"),
+                DocumentTable.document_id,
+                DocumentTable.section_id,
+                func.coalesce(Document.title, "Untitled document").label("document_title"),
+                func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                    "section_path"
+                ),
+                DocumentTable.caption,
+                DocumentTable.table_type,
+                func.coalesce(DocumentTable.headers_json, sa_cast([], JSONB)).label("headers_json"),
+                func.coalesce(DocumentTable.rows_json, sa_cast([], JSONB)).label("rows_json"),
+                DocumentTable.page_start,
+                DocumentTable.page_end,
+                DocumentSection.ordinal.label("section_ordinal"),
+            )
+            .select_from(DocumentTable)
+            .join(Document, Document.id == DocumentTable.document_id)
+            .join(DocumentSection, DocumentSection.id == DocumentTable.section_id)
+        )
+        for predicate in predicates:
+            statement = statement.where(predicate)
+        return statement.order_by(DocumentSection.ordinal.asc().nullslast(), DocumentTable.id)
 
     def _page_items(
         self,

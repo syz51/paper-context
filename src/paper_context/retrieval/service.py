@@ -9,9 +9,23 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 
+from sqlalchemy import and_, bindparam, delete, func, insert, or_, select, update
+from sqlalchemy import cast as sa_cast
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Connection
 from sqlalchemy.sql import text
 
+from paper_context.models import (
+    Document,
+    DocumentPassage,
+    DocumentSection,
+    DocumentTable,
+    IngestJob,
+    RetrievalIndexRun,
+    RetrievalPassageAsset,
+    RetrievalTableAsset,
+)
 from paper_context.pagination import CursorError, decode_cursor, encode_cursor, fingerprint_payload
 
 from .clients import (
@@ -250,68 +264,62 @@ class DocumentRetrievalIndexer:
         parser_source: str,
         created_at: datetime,
     ) -> None:
+        statement = pg_insert(RetrievalIndexRun).values(
+            id=bindparam("b_id"),
+            document_id=bindparam("b_document_id"),
+            ingest_job_id=bindparam("b_ingest_job_id"),
+            index_version=bindparam("b_index_version"),
+            embedding_provider=bindparam("b_embedding_provider"),
+            embedding_model=bindparam("b_embedding_model"),
+            embedding_dimensions=None,
+            reranker_provider=bindparam("b_reranker_provider"),
+            reranker_model=bindparam("b_reranker_model"),
+            chunking_version=bindparam("b_chunking_version"),
+            parser_source=bindparam("b_parser_source"),
+            status="building",
+            is_active=False,
+            activated_at=None,
+            created_at=bindparam("b_created_at"),
+        )
         connection.execute(
-            text(
-                """
-                INSERT INTO retrieval_index_runs (
-                    id,
-                    document_id,
-                    ingest_job_id,
-                    index_version,
-                    embedding_provider,
-                    embedding_model,
-                    embedding_dimensions,
-                    reranker_provider,
-                    reranker_model,
-                    chunking_version,
-                    parser_source,
-                    status,
-                    is_active,
-                    activated_at,
-                    created_at
-                )
-                VALUES (
-                    :id,
-                    :document_id,
-                    :ingest_job_id,
-                    :index_version,
-                    :embedding_provider,
-                    :embedding_model,
-                    NULL,
-                    :reranker_provider,
-                    :reranker_model,
-                    :chunking_version,
-                    :parser_source,
-                    'building',
-                    false,
-                    NULL,
-                    :created_at
-                )
-                ON CONFLICT (id) DO UPDATE
-                SET index_version = EXCLUDED.index_version,
-                    embedding_provider = EXCLUDED.embedding_provider,
-                    embedding_model = EXCLUDED.embedding_model,
-                    reranker_provider = EXCLUDED.reranker_provider,
-                    reranker_model = EXCLUDED.reranker_model,
-                    chunking_version = EXCLUDED.chunking_version,
-                    parser_source = EXCLUDED.parser_source,
-                    status = 'building',
-                    is_active = false,
-                    activated_at = NULL
-                """
+            statement.on_conflict_do_update(
+                index_elements=[RetrievalIndexRun.id],
+                set_={
+                    "index_version": statement.excluded.index_version,
+                    "embedding_provider": statement.excluded.embedding_provider,
+                    "embedding_model": statement.excluded.embedding_model,
+                    "reranker_provider": statement.excluded.reranker_provider,
+                    "reranker_model": statement.excluded.reranker_model,
+                    "chunking_version": statement.excluded.chunking_version,
+                    "parser_source": statement.excluded.parser_source,
+                    "status": "building",
+                    "is_active": False,
+                    "activated_at": None,
+                },
             ),
             {
                 "id": run_id,
+                "b_id": run_id,
                 "document_id": document_id,
+                "b_document_id": document_id,
                 "ingest_job_id": ingest_job_id,
+                "b_ingest_job_id": ingest_job_id,
                 "index_version": self.index_version,
+                "b_index_version": self.index_version,
                 "embedding_provider": self.embedding_client.provider,
+                "b_embedding_provider": self.embedding_client.provider,
                 "embedding_model": self.embedding_client.model,
+                "b_embedding_model": self.embedding_client.model,
                 "reranker_provider": self.reranker_client.provider,
+                "b_reranker_provider": self.reranker_client.provider,
                 "reranker_model": self.reranker_client.model,
+                "b_reranker_model": self.reranker_client.model,
                 "chunking_version": self.chunking_version,
+                "b_chunking_version": self.chunking_version,
                 "parser_source": parser_source,
+                "b_parser_source": parser_source,
                 "created_at": created_at,
+                "b_created_at": created_at,
             },
         )
 
@@ -322,22 +330,12 @@ class DocumentRetrievalIndexer:
         run_id: uuid.UUID,
     ) -> None:
         connection.execute(
-            text(
-                """
-                DELETE FROM retrieval_passage_assets
-                WHERE retrieval_index_run_id = :retrieval_index_run_id
-                """
-            ),
-            {"retrieval_index_run_id": run_id},
+            delete(RetrievalPassageAsset).where(
+                RetrievalPassageAsset.retrieval_index_run_id == run_id
+            )
         )
         connection.execute(
-            text(
-                """
-                DELETE FROM retrieval_table_assets
-                WHERE retrieval_index_run_id = :retrieval_index_run_id
-                """
-            ),
-            {"retrieval_index_run_id": run_id},
+            delete(RetrievalTableAsset).where(RetrievalTableAsset.retrieval_index_run_id == run_id)
         )
 
     def _activate_build_run(
@@ -350,36 +348,23 @@ class DocumentRetrievalIndexer:
         activated_at: datetime,
     ) -> None:
         connection.execute(
-            text(
-                """
-                UPDATE retrieval_index_runs
-                SET is_active = false,
-                    deactivated_at = :deactivated_at
-                WHERE document_id = :document_id
-                """
-            ),
-            {
-                "document_id": document_id,
-                "deactivated_at": activated_at,
-            },
+            update(RetrievalIndexRun)
+            .where(RetrievalIndexRun.document_id == document_id)
+            .values(
+                is_active=False,
+                deactivated_at=activated_at,
+            )
         )
         connection.execute(
-            text(
-                """
-                UPDATE retrieval_index_runs
-                SET embedding_dimensions = :embedding_dimensions,
-                    status = 'ready',
-                    is_active = true,
-                    activated_at = :activated_at,
-                    deactivated_at = NULL
-                WHERE id = :retrieval_index_run_id
-                """
-            ),
-            {
-                "retrieval_index_run_id": run_id,
-                "embedding_dimensions": embedding_dimensions,
-                "activated_at": activated_at,
-            },
+            update(RetrievalIndexRun)
+            .where(RetrievalIndexRun.id == run_id)
+            .values(
+                embedding_dimensions=embedding_dimensions,
+                status="ready",
+                is_active=True,
+                activated_at=activated_at,
+                deactivated_at=None,
+            )
         )
 
     def _iter_passage_row_batches(
@@ -393,36 +378,34 @@ class DocumentRetrievalIndexer:
         while True:
             rows = (
                 connection.execute(
-                    text(
-                        """
-                    SELECT
-                        passages.id AS passage_id,
-                        passages.document_id,
-                        passages.section_id,
-                        passages.chunk_ordinal,
-                        passages.body_text,
-                        passages.contextualized_text,
-                        passages.page_start,
-                        passages.page_end,
-                        COALESCE(documents.title, 'Untitled document') AS document_title,
-                        COALESCE(documents.authors, '[]'::jsonb) AS authors,
-                        documents.abstract,
-                        documents.publication_year,
-                        COALESCE(sections.heading_path, '[]'::jsonb) AS section_path
-                    FROM document_passages passages
-                    JOIN documents ON documents.id = passages.document_id
-                    JOIN document_sections sections ON sections.id = passages.section_id
-                    WHERE passages.document_id = :document_id
-                    ORDER BY sections.ordinal, passages.chunk_ordinal, passages.id
-                    LIMIT :batch_size
-                    OFFSET :offset
-                    """
-                    ),
-                    {
-                        "document_id": document_id,
-                        "batch_size": batch_size,
-                        "offset": offset,
-                    },
+                    select(
+                        DocumentPassage.id.label("passage_id"),
+                        DocumentPassage.document_id,
+                        DocumentPassage.section_id,
+                        DocumentPassage.chunk_ordinal,
+                        DocumentPassage.body_text,
+                        DocumentPassage.contextualized_text,
+                        DocumentPassage.page_start,
+                        DocumentPassage.page_end,
+                        func.coalesce(Document.title, "Untitled document").label("document_title"),
+                        func.coalesce(Document.authors, sa_cast([], JSONB)).label("authors"),
+                        Document.abstract,
+                        Document.publication_year,
+                        func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                            "section_path"
+                        ),
+                    )
+                    .select_from(DocumentPassage)
+                    .join(Document, Document.id == DocumentPassage.document_id)
+                    .join(DocumentSection, DocumentSection.id == DocumentPassage.section_id)
+                    .where(DocumentPassage.document_id == document_id)
+                    .order_by(
+                        DocumentSection.ordinal,
+                        DocumentPassage.chunk_ordinal,
+                        DocumentPassage.id,
+                    )
+                    .limit(batch_size)
+                    .offset(offset)
                 )
                 .mappings()
                 .all()
@@ -443,35 +426,33 @@ class DocumentRetrievalIndexer:
         while True:
             rows = (
                 connection.execute(
-                    text(
-                        """
-                    SELECT
-                        tables.id AS table_id,
-                        tables.document_id,
-                        tables.section_id,
-                        tables.caption,
-                        tables.table_type,
-                        COALESCE(tables.headers_json, '[]'::jsonb) AS headers_json,
-                        COALESCE(tables.rows_json, '[]'::jsonb) AS rows_json,
-                        tables.page_start,
-                        tables.page_end,
-                        COALESCE(documents.title, 'Untitled document') AS document_title,
-                        documents.publication_year,
-                        COALESCE(sections.heading_path, '[]'::jsonb) AS section_path
-                    FROM document_tables tables
-                    JOIN documents ON documents.id = tables.document_id
-                    JOIN document_sections sections ON sections.id = tables.section_id
-                    WHERE tables.document_id = :document_id
-                    ORDER BY sections.ordinal, tables.id
-                    LIMIT :batch_size
-                    OFFSET :offset
-                    """
-                    ),
-                    {
-                        "document_id": document_id,
-                        "batch_size": batch_size,
-                        "offset": offset,
-                    },
+                    select(
+                        DocumentTable.id.label("table_id"),
+                        DocumentTable.document_id,
+                        DocumentTable.section_id,
+                        DocumentTable.caption,
+                        DocumentTable.table_type,
+                        func.coalesce(DocumentTable.headers_json, sa_cast([], JSONB)).label(
+                            "headers_json"
+                        ),
+                        func.coalesce(DocumentTable.rows_json, sa_cast([], JSONB)).label(
+                            "rows_json"
+                        ),
+                        DocumentTable.page_start,
+                        DocumentTable.page_end,
+                        func.coalesce(Document.title, "Untitled document").label("document_title"),
+                        Document.publication_year,
+                        func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                            "section_path"
+                        ),
+                    )
+                    .select_from(DocumentTable)
+                    .join(Document, Document.id == DocumentTable.document_id)
+                    .join(DocumentSection, DocumentSection.id == DocumentTable.section_id)
+                    .where(DocumentTable.document_id == document_id)
+                    .order_by(DocumentSection.ordinal, DocumentTable.id)
+                    .limit(batch_size)
+                    .offset(offset)
                 )
                 .mappings()
                 .all()
@@ -490,49 +471,48 @@ class DocumentRetrievalIndexer:
         embeddings: tuple[tuple[float, ...], ...],
         created_at: datetime,
     ) -> None:
-        connection.execute(
-            text(
-                """
-                INSERT INTO retrieval_passage_assets (
-                    id,
-                    retrieval_index_run_id,
-                    passage_id,
-                    document_id,
-                    section_id,
-                    publication_year,
-                    search_text,
-                    search_tsvector,
-                    embedding,
-                    created_at
-                )
-                VALUES (
-                    :id,
-                    :retrieval_index_run_id,
-                    :passage_id,
-                    :document_id,
-                    :section_id,
-                    :publication_year,
-                    :search_text,
-                    to_tsvector('english', :search_text),
-                    CAST(:embedding AS vector),
-                    :created_at
-                )
-                """
-            ),
-            [
+        statement = insert(RetrievalPassageAsset).values(
+            id=bindparam("b_id"),
+            retrieval_index_run_id=bindparam("b_retrieval_index_run_id"),
+            passage_id=bindparam("b_passage_id"),
+            document_id=bindparam("b_document_id"),
+            section_id=bindparam("b_section_id"),
+            publication_year=bindparam("b_publication_year"),
+            search_text=bindparam("b_search_text"),
+            search_tsvector=func.to_tsvector("english", bindparam("b_search_text")),
+            embedding=bindparam("b_embedding"),
+            created_at=bindparam("b_created_at"),
+        )
+        payloads: list[dict[str, object]] = []
+        for row, embedding in zip(rows, embeddings, strict=True):
+            asset_id = uuid.uuid4()
+            search_text = self._build_passage_search_text(row)
+            embedding_literal = _vector_literal(embedding)
+            payloads.append(
                 {
-                    "id": uuid.uuid4(),
+                    "id": asset_id,
+                    "b_id": asset_id,
                     "retrieval_index_run_id": run_id,
+                    "b_retrieval_index_run_id": run_id,
                     "passage_id": row.passage_id,
+                    "b_passage_id": row.passage_id,
                     "document_id": row.document_id,
+                    "b_document_id": row.document_id,
                     "section_id": row.section_id,
+                    "b_section_id": row.section_id,
                     "publication_year": row.publication_year,
-                    "search_text": self._build_passage_search_text(row),
-                    "embedding": _vector_literal(embedding),
+                    "b_publication_year": row.publication_year,
+                    "search_text": search_text,
+                    "b_search_text": search_text,
+                    "embedding": embedding_literal,
+                    "b_embedding": embedding_literal,
                     "created_at": created_at,
+                    "b_created_at": created_at,
                 }
-                for row, embedding in zip(rows, embeddings, strict=True)
-            ],
+            )
+        connection.execute(
+            statement,
+            payloads,
         )
 
     def _insert_table_asset_batch(
@@ -543,46 +523,44 @@ class DocumentRetrievalIndexer:
         rows: list[_TableIndexRow],
         created_at: datetime,
     ) -> None:
-        connection.execute(
-            text(
-                """
-                INSERT INTO retrieval_table_assets (
-                    id,
-                    retrieval_index_run_id,
-                    table_id,
-                    document_id,
-                    section_id,
-                    publication_year,
-                    search_text,
-                    search_tsvector,
-                    created_at
-                )
-                VALUES (
-                    :id,
-                    :retrieval_index_run_id,
-                    :table_id,
-                    :document_id,
-                    :section_id,
-                    :publication_year,
-                    :search_text,
-                    to_tsvector('english', :search_text),
-                    :created_at
-                )
-                """
-            ),
-            [
+        statement = insert(RetrievalTableAsset).values(
+            id=bindparam("b_id"),
+            retrieval_index_run_id=bindparam("b_retrieval_index_run_id"),
+            table_id=bindparam("b_table_id"),
+            document_id=bindparam("b_document_id"),
+            section_id=bindparam("b_section_id"),
+            publication_year=bindparam("b_publication_year"),
+            search_text=bindparam("b_search_text"),
+            search_tsvector=func.to_tsvector("english", bindparam("b_search_text")),
+            created_at=bindparam("b_created_at"),
+        )
+        payloads: list[dict[str, object]] = []
+        for row in rows:
+            asset_id = uuid.uuid4()
+            search_text = self._build_table_search_text(row)
+            payloads.append(
                 {
-                    "id": uuid.uuid4(),
+                    "id": asset_id,
+                    "b_id": asset_id,
                     "retrieval_index_run_id": run_id,
+                    "b_retrieval_index_run_id": run_id,
                     "table_id": row.table_id,
+                    "b_table_id": row.table_id,
                     "document_id": row.document_id,
+                    "b_document_id": row.document_id,
                     "section_id": row.section_id,
+                    "b_section_id": row.section_id,
                     "publication_year": row.publication_year,
-                    "search_text": self._build_table_search_text(row),
+                    "b_publication_year": row.publication_year,
+                    "search_text": search_text,
+                    "b_search_text": search_text,
                     "created_at": created_at,
+                    "b_created_at": created_at,
                 }
-                for row in rows
-            ],
+            )
+        connection.execute(
+            statement,
+            payloads,
         )
 
     def _row_to_passage_index_row(self, row: Any) -> _PassageIndexRow:
@@ -922,52 +900,56 @@ class RetrievalService:
         )
 
     def get_table(self, *, table_id: uuid.UUID) -> TableDetailResult | None:
-        params: dict[str, object] = {
-            "table_id": table_id,
-            "index_version": self._active_index_version,
-        }
+        run_join_conditions = [
+            RetrievalIndexRun.document_id == DocumentTable.document_id,
+            RetrievalIndexRun.status == "ready",
+            RetrievalIndexRun.is_active.is_(True),
+        ]
+        if self._active_index_version is not None:
+            run_join_conditions.append(
+                RetrievalIndexRun.index_version == self._active_index_version
+            )
         with self._connection() as connection:
             row = (
                 connection.execute(
-                    text(
-                        """
-                        SELECT
-                            tables.id AS table_id,
-                            tables.document_id,
-                            tables.section_id,
-                            COALESCE(documents.title, 'Untitled document') AS document_title,
-                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
-                            tables.caption,
-                            tables.table_type,
-                            COALESCE(tables.headers_json, '[]'::jsonb) AS headers_json,
-                            COALESCE(tables.rows_json, '[]'::jsonb) AS rows_json,
-                            tables.page_start,
-                            tables.page_end,
-                            runs.id AS retrieval_index_run_id,
-                            runs.index_version,
-                            runs.parser_source,
-                            COALESCE(jobs.warnings, '[]'::jsonb) AS warnings
-                        FROM document_tables tables
-                        JOIN documents
-                          ON documents.id = tables.document_id
-                        JOIN document_sections sections
-                          ON sections.id = tables.section_id
-                        LEFT JOIN retrieval_index_runs runs
-                          ON runs.document_id = tables.document_id
-                         AND runs.status = 'ready'
-                         AND runs.is_active = true
-                         AND (
-                             CAST(:index_version AS text) IS NULL
-                             OR runs.index_version = CAST(:index_version AS text)
-                         )
-                        LEFT JOIN ingest_jobs jobs
-                          ON jobs.id = runs.ingest_job_id
-                        WHERE tables.id = :table_id
-                        ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC NULLS LAST
-                        LIMIT 1
-                        """
-                    ),
-                    params,
+                    select(
+                        DocumentTable.id.label("table_id"),
+                        DocumentTable.document_id,
+                        DocumentTable.section_id,
+                        func.coalesce(Document.title, "Untitled document").label("document_title"),
+                        func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                            "section_path"
+                        ),
+                        DocumentTable.caption,
+                        DocumentTable.table_type,
+                        func.coalesce(DocumentTable.headers_json, sa_cast([], JSONB)).label(
+                            "headers_json"
+                        ),
+                        func.coalesce(DocumentTable.rows_json, sa_cast([], JSONB)).label(
+                            "rows_json"
+                        ),
+                        DocumentTable.page_start,
+                        DocumentTable.page_end,
+                        RetrievalIndexRun.id.label("retrieval_index_run_id"),
+                        RetrievalIndexRun.index_version,
+                        RetrievalIndexRun.parser_source,
+                        func.coalesce(IngestJob.warnings, sa_cast([], JSONB)).label("warnings"),
+                    )
+                    .select_from(DocumentTable)
+                    .join(Document, Document.id == DocumentTable.document_id)
+                    .join(DocumentSection, DocumentSection.id == DocumentTable.section_id)
+                    .outerjoin(RetrievalIndexRun, and_(*run_join_conditions))
+                    .outerjoin(IngestJob, IngestJob.id == RetrievalIndexRun.ingest_job_id)
+                    .where(DocumentTable.id == table_id)
+                    .order_by(
+                        func.coalesce(
+                            RetrievalIndexRun.activated_at,
+                            RetrievalIndexRun.created_at,
+                        )
+                        .desc()
+                        .nullslast()
+                    )
+                    .limit(1)
                 )
                 .mappings()
                 .one_or_none()
@@ -1007,50 +989,50 @@ class RetrievalService:
     ) -> PassageContextResult | None:
         before = max(0, before)
         after = max(0, after)
-        params: dict[str, object] = {
-            "passage_id": passage_id,
-            "index_version": self._active_index_version,
-        }
+        run_join_conditions = [
+            RetrievalIndexRun.document_id == DocumentPassage.document_id,
+            RetrievalIndexRun.status == "ready",
+            RetrievalIndexRun.is_active.is_(True),
+        ]
+        if self._active_index_version is not None:
+            run_join_conditions.append(
+                RetrievalIndexRun.index_version == self._active_index_version
+            )
         with self._connection() as connection:
             row = (
                 connection.execute(
-                    text(
-                        """
-                        SELECT
-                            passages.id AS passage_id,
-                            passages.document_id,
-                            passages.section_id,
-                            passages.body_text,
-                            passages.chunk_ordinal,
-                            passages.page_start,
-                            passages.page_end,
-                            COALESCE(documents.title, 'Untitled document') AS document_title,
-                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
-                            runs.id AS retrieval_index_run_id,
-                            runs.index_version,
-                            runs.parser_source,
-                            COALESCE(jobs.warnings, '[]'::jsonb) AS warnings
-                        FROM document_passages passages
-                        JOIN document_sections sections
-                          ON sections.id = passages.section_id
-                        JOIN documents
-                          ON documents.id = passages.document_id
-                        LEFT JOIN retrieval_index_runs runs
-                          ON runs.document_id = passages.document_id
-                         AND runs.status = 'ready'
-                         AND runs.is_active = true
-                         AND (
-                             CAST(:index_version AS text) IS NULL
-                             OR runs.index_version = CAST(:index_version AS text)
-                         )
-                        LEFT JOIN ingest_jobs jobs
-                          ON jobs.id = runs.ingest_job_id
-                        WHERE passages.id = :passage_id
-                        ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC NULLS LAST
-                        LIMIT 1
-                        """
-                    ),
-                    params,
+                    select(
+                        DocumentPassage.id.label("passage_id"),
+                        DocumentPassage.document_id,
+                        DocumentPassage.section_id,
+                        DocumentPassage.body_text,
+                        DocumentPassage.chunk_ordinal,
+                        DocumentPassage.page_start,
+                        DocumentPassage.page_end,
+                        func.coalesce(Document.title, "Untitled document").label("document_title"),
+                        func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                            "section_path"
+                        ),
+                        RetrievalIndexRun.id.label("retrieval_index_run_id"),
+                        RetrievalIndexRun.index_version,
+                        RetrievalIndexRun.parser_source,
+                        func.coalesce(IngestJob.warnings, sa_cast([], JSONB)).label("warnings"),
+                    )
+                    .select_from(DocumentPassage)
+                    .join(DocumentSection, DocumentSection.id == DocumentPassage.section_id)
+                    .join(Document, Document.id == DocumentPassage.document_id)
+                    .outerjoin(RetrievalIndexRun, and_(*run_join_conditions))
+                    .outerjoin(IngestJob, IngestJob.id == RetrievalIndexRun.ingest_job_id)
+                    .where(DocumentPassage.id == passage_id)
+                    .order_by(
+                        func.coalesce(
+                            RetrievalIndexRun.activated_at,
+                            RetrievalIndexRun.created_at,
+                        )
+                        .desc()
+                        .nullslast()
+                    )
+                    .limit(1)
                 )
                 .mappings()
                 .one_or_none()
@@ -1060,20 +1042,15 @@ class RetrievalService:
 
             section_rows = (
                 connection.execute(
-                    text(
-                        """
-                        SELECT
-                            passages.id AS passage_id,
-                            passages.body_text,
-                            passages.chunk_ordinal,
-                            passages.page_start,
-                            passages.page_end
-                        FROM document_passages passages
-                        WHERE passages.section_id = :section_id
-                        ORDER BY passages.chunk_ordinal, passages.id
-                        """
-                    ),
-                    {"section_id": row["section_id"]},
+                    select(
+                        DocumentPassage.id.label("passage_id"),
+                        DocumentPassage.body_text,
+                        DocumentPassage.chunk_ordinal,
+                        DocumentPassage.page_start,
+                        DocumentPassage.page_end,
+                    )
+                    .where(DocumentPassage.section_id == row["section_id"])
+                    .order_by(DocumentPassage.chunk_ordinal, DocumentPassage.id)
                 )
                 .mappings()
                 .all()
@@ -1237,32 +1214,32 @@ class RetrievalService:
             )
             index_versions = (self._active_index_version,) if run_ids else ()
             return _ActiveRunSelection(run_ids=run_ids, index_versions=index_versions)
-        params: dict[str, object] = {
+        params = {
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
         }
-        rows = (
-            connection.execute(
-                text(
-                    """
-            SELECT runs.id, runs.index_version
-            FROM retrieval_index_runs runs
-            WHERE runs.status = 'ready'
-              AND runs.is_active = true
-              AND (
-                  :apply_document_filter = false
-                  OR runs.document_id = ANY(CAST(:document_ids AS uuid[]))
-              )
-            ORDER BY
-                COALESCE(runs.activated_at, runs.created_at) DESC,
-                runs.id
-                    """
-                ),
-                params,
+        statement = (
+            select(
+                RetrievalIndexRun.id,
+                RetrievalIndexRun.index_version,
             )
-            .mappings()
-            .all()
+            .where(
+                RetrievalIndexRun.status == "ready",
+                RetrievalIndexRun.is_active.is_(True),
+                or_(
+                    bindparam("apply_document_filter") == False,  # noqa: E712
+                    RetrievalIndexRun.document_id.in_(bindparam("document_ids", expanding=True)),
+                ),
+            )
+            .order_by(
+                func.coalesce(
+                    RetrievalIndexRun.activated_at,
+                    RetrievalIndexRun.created_at,
+                ).desc(),
+                RetrievalIndexRun.id,
+            )
         )
+        rows = connection.execute(statement, params).mappings().all()
         run_ids = tuple(cast(uuid.UUID, row["id"]) for row in rows)
         index_versions = tuple(dict.fromkeys(cast(str, row["index_version"]) for row in rows))
         return _ActiveRunSelection(run_ids=run_ids, index_versions=index_versions)
@@ -1275,36 +1252,27 @@ class RetrievalService:
     ) -> tuple[uuid.UUID, ...] | None:
         if not filters.document_ids and not filters.publication_years:
             return None
-
-        params: dict[str, object] = {
+        params = {
             "apply_document_ids": bool(filters.document_ids),
             "document_ids": list(filters.document_ids),
             "apply_publication_years": bool(filters.publication_years),
             "publication_years": list(filters.publication_years),
         }
-
-        rows = (
-            connection.execute(
-                text(
-                    """
-                    SELECT documents.id
-                    FROM documents
-                    WHERE (
-                        :apply_document_ids = false
-                        OR documents.id = ANY(CAST(:document_ids AS uuid[]))
-                    )
-                      AND (
-                        :apply_publication_years = false
-                        OR documents.publication_year = ANY(CAST(:publication_years AS integer[]))
-                    )
-                    ORDER BY documents.id
-                    """
+        statement = (
+            select(Document.id)
+            .where(
+                or_(
+                    bindparam("apply_document_ids") == False,  # noqa: E712
+                    Document.id.in_(bindparam("document_ids", expanding=True)),
                 ),
-                params,
+                or_(
+                    bindparam("apply_publication_years") == False,  # noqa: E712
+                    Document.publication_year.in_(bindparam("publication_years", expanding=True)),
+                ),
             )
-            .scalars()
-            .all()
+            .order_by(Document.id)
         )
+        rows = connection.execute(statement, params).scalars().all()
         return tuple(cast(list[uuid.UUID], rows))
 
     def _resolve_active_run_ids(
@@ -1314,32 +1282,31 @@ class RetrievalService:
         index_version: str,
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
     ) -> tuple[uuid.UUID, ...]:
-        params: dict[str, object] = {
+        params = {
             "index_version": index_version,
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
         }
-        rows = (
-            connection.execute(
-                text(
-                    """
-                    SELECT id
-                    FROM retrieval_index_runs
-                    WHERE status = 'ready'
-                      AND is_active = true
-                      AND index_version = :index_version
-                      AND (
-                          :apply_document_filter = false
-                          OR document_id = ANY(CAST(:document_ids AS uuid[]))
-                      )
-                    ORDER BY COALESCE(activated_at, created_at) DESC, id
-                    """
+        statement = (
+            select(RetrievalIndexRun.id)
+            .where(
+                RetrievalIndexRun.status == "ready",
+                RetrievalIndexRun.is_active.is_(True),
+                RetrievalIndexRun.index_version == bindparam("index_version"),
+                or_(
+                    bindparam("apply_document_filter") == False,  # noqa: E712
+                    RetrievalIndexRun.document_id.in_(bindparam("document_ids", expanding=True)),
                 ),
-                params,
             )
-            .scalars()
-            .all()
+            .order_by(
+                func.coalesce(
+                    RetrievalIndexRun.activated_at,
+                    RetrievalIndexRun.created_at,
+                ).desc(),
+                RetrievalIndexRun.id,
+            )
         )
+        rows = connection.execute(statement, params).scalars().all()
         return tuple(cast(list[uuid.UUID], rows))
 
     def _load_sparse_passage_candidates(
@@ -1754,31 +1721,31 @@ class RetrievalService:
             return ()
         rows = (
             connection.execute(
-                text(
-                    """
-                    SELECT
-                        passages.id AS passage_id,
-                        passages.section_id,
-                        passages.chunk_ordinal,
-                        passages.body_text,
-                        passages.page_start,
-                        passages.page_end,
-                        sections.document_id,
-                        COALESCE(documents.title, 'Untitled document') AS document_title,
-                        sections.heading,
-                        COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
-                        sections.page_start AS section_page_start,
-                        sections.page_end AS section_page_end
-                    FROM document_passages passages
-                    JOIN document_sections sections
-                        ON sections.id = passages.section_id
-                    JOIN documents
-                        ON documents.id = sections.document_id
-                    WHERE passages.section_id = ANY(CAST(:section_ids AS uuid[]))
-                    ORDER BY passages.section_id, passages.chunk_ordinal, passages.id
-                    """
-                ),
-                {"section_ids": list(section_ids)},
+                select(
+                    DocumentPassage.id.label("passage_id"),
+                    DocumentPassage.section_id,
+                    DocumentPassage.chunk_ordinal,
+                    DocumentPassage.body_text,
+                    DocumentPassage.page_start,
+                    DocumentPassage.page_end,
+                    DocumentSection.document_id,
+                    func.coalesce(Document.title, "Untitled document").label("document_title"),
+                    DocumentSection.heading,
+                    func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                        "section_path"
+                    ),
+                    DocumentSection.page_start.label("section_page_start"),
+                    DocumentSection.page_end.label("section_page_end"),
+                )
+                .select_from(DocumentPassage)
+                .join(DocumentSection, DocumentSection.id == DocumentPassage.section_id)
+                .join(Document, Document.id == DocumentSection.document_id)
+                .where(DocumentPassage.section_id.in_(section_ids))
+                .order_by(
+                    DocumentPassage.section_id,
+                    DocumentPassage.chunk_ordinal,
+                    DocumentPassage.id,
+                )
             )
             .mappings()
             .all()
@@ -1852,21 +1819,16 @@ class RetrievalService:
             return ()
         rows = (
             connection.execute(
-                text(
-                    """
-                    SELECT
-                        id,
-                        COALESCE(title, 'Untitled document') AS title,
-                        COALESCE(authors, '[]'::jsonb) AS authors,
-                        publication_year,
-                        COALESCE(quant_tags, '{}'::jsonb) AS quant_tags,
-                        current_status
-                    FROM documents
-                    WHERE id = ANY(CAST(:document_ids AS uuid[]))
-                    ORDER BY id
-                    """
-                ),
-                {"document_ids": list(document_ids)},
+                select(
+                    Document.id,
+                    func.coalesce(Document.title, "Untitled document").label("title"),
+                    func.coalesce(Document.authors, sa_cast([], JSONB)).label("authors"),
+                    Document.publication_year,
+                    func.coalesce(Document.quant_tags, sa_cast({}, JSONB)).label("quant_tags"),
+                    Document.current_status,
+                )
+                .where(Document.id.in_(document_ids))
+                .order_by(Document.id)
             )
             .mappings()
             .all()

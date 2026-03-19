@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -317,7 +316,8 @@ def test_reset_document_state_executes_all_cleanup_statements() -> None:
 
     assert connection.execute.call_count == 7
     for call in connection.execute.call_args_list:
-        assert call.args[1] == {"document_id": document_id, "ingest_job_id": ingest_job_id}
+        assert call.args[1]["document_id"] == document_id
+        assert call.args[1]["ingest_job_id"] == ingest_job_id
 
 
 def test_persist_parser_artifact_stores_bytes_and_records_row() -> None:
@@ -856,7 +856,7 @@ def test_insert_passages_chunks_contextualizes_and_merges_provenance() -> None:
     assert first_params["section_id"] == section_id
     assert first_params["chunk_ordinal"] == 1
     assert first_params["body_text"] == "one two three\n\nfour five six"
-    assert json.loads(first_params["provenance_offsets"]) == {
+    assert first_params["provenance_offsets"] == {
         "pages": [1, 1],
         "charspans": [[0, 13], [14, 27]],
     }
@@ -902,11 +902,11 @@ def test_mark_helpers_issue_expected_updates() -> None:
     ready_params = connection.execute.call_args_list[4].args[1]
 
     assert stage_params["status"] == "parsing"
-    assert json.loads(stage_params["warnings"]) == ["a", "a"]
+    assert stage_params["warnings"] == ["a", "a"]
     assert failed_params["failure_code"] == "parse_failed"
     assert failed_params["failure_message"] == "Parser failed"
-    assert json.loads(failed_params["warnings"]) == ["existing", "new"]
-    assert json.loads(ready_params["warnings"]) == ["ready"]
+    assert failed_params["warnings"] == ["existing", "new"]
+    assert ready_params["warnings"] == ["ready"]
 
 
 def test_synthetic_processor_updates_non_terminal_job() -> None:

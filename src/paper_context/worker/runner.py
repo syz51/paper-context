@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import select
 
 from paper_context.config import get_settings
 from paper_context.db.engine import get_engine
@@ -13,6 +13,7 @@ from paper_context.ingestion.enrichment import NullMetadataEnricher
 from paper_context.ingestion.parser_isolation import ParserIsolationConfig, build_pdf_parser
 from paper_context.ingestion.queue import IngestionQueueService
 from paper_context.ingestion.service import DeterministicIngestProcessor, SyntheticIngestProcessor
+from paper_context.models import IngestJob
 from paper_context.queue.contracts import IngestionQueue
 from paper_context.retrieval import (
     DeterministicEmbeddingClient,
@@ -148,14 +149,11 @@ def run_synthetic_job_verification() -> dict[str, Any]:
     with engine.begin() as connection:
         ingest_job = (
             connection.execute(
-                text(
-                    """
-                SELECT status, started_at, finished_at
-                FROM ingest_jobs
-                WHERE id = :ingest_job_id
-                """
-                ),
-                {"ingest_job_id": ingest_job_id},
+                select(
+                    IngestJob.status,
+                    IngestJob.started_at,
+                    IngestJob.finished_at,
+                ).where(IngestJob.id == ingest_job_id)
             )
             .mappings()
             .one()

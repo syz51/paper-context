@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from alembic.config import Config
+from psycopg import sql
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
@@ -81,10 +82,6 @@ def _with_database_url_env(database_url: str, callback: Callable[[], None]) -> N
             os.environ.pop("PAPER_CONTEXT_DATABASE__URL", None)
         else:
             os.environ["PAPER_CONTEXT_DATABASE__URL"] = previous
-
-
-def _quoted_identifier(identifier: str) -> str:
-    return identifier.replace('"', '""')
 
 
 @contextmanager
@@ -196,16 +193,24 @@ def postgres_test_database_url(postgres_server_url: str) -> Iterator[str]:
         pool_pre_ping=True,
     )
 
-    quoted_name = _quoted_identifier(database_name)
     with admin_engine.connect() as connection:
-        connection.exec_driver_sql(f'DROP DATABASE IF EXISTS "{quoted_name}" WITH (FORCE)')
-        connection.exec_driver_sql(f'CREATE DATABASE "{quoted_name}"')
+        driver_connection = connection.connection.driver_connection
+        drop_statement = sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
+            sql.Identifier(database_name)
+        )
+        create_statement = sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name))
+        connection.exec_driver_sql(drop_statement.as_string(driver_connection))
+        connection.exec_driver_sql(create_statement.as_string(driver_connection))
 
     try:
         yield server_url.set(database=database_name).render_as_string(hide_password=False)
     finally:
         with admin_engine.connect() as connection:
-            connection.exec_driver_sql(f'DROP DATABASE IF EXISTS "{quoted_name}" WITH (FORCE)')
+            driver_connection = connection.connection.driver_connection
+            drop_statement = sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
+                sql.Identifier(database_name)
+            )
+            connection.exec_driver_sql(drop_statement.as_string(driver_connection))
         admin_engine.dispose()
 
 
