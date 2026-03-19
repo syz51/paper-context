@@ -15,6 +15,7 @@ Use uv for python
 
 ## Change Triggers
 
+- Whenever you write code, make sure it's covered by tests.
 - Keep schema-shape changes synchronized across SQLAlchemy models, Alembic migrations, API or Pydantic schemas, and contract golden files.
 - If you change API responses or status payloads, update the golden files under `tests/contract/golden/`.
 - If you change ingest stages, warnings, parser fallback behavior, or job state transitions, update both focused unit tests and Postgres-backed integration tests.

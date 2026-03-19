@@ -10,6 +10,7 @@ import pytest
 
 from paper_context.ingestion.queue import IngestionQueueService
 from paper_context.ingestion.service import (
+    DeterministicIngestProcessor,
     IngestJobContext,
     LeaseExtender,
     SyntheticIngestProcessor,
@@ -175,11 +176,12 @@ def test_ingestion_queue_service_enqueues_document_with_trace_headers() -> None:
     engine.begin.return_value = ctx
     adapter = MagicMock()
     document_id = uuid4()
+    revision_id = uuid4()
     ingest_job_id = uuid4()
 
     with patch(
         "paper_context.ingestion.queue.uuid.uuid4",
-        side_effect=[document_id, ingest_job_id],
+        side_effect=[document_id, revision_id, ingest_job_id],
     ):
         service = IngestionQueueService(engine, adapter)
         returned_document_id, returned_ingest_job_id = service.enqueue_document(
@@ -239,19 +241,44 @@ def test_synthetic_processor_raises_when_job_missing() -> None:
 def test_synthetic_processor_updates_non_terminal_job() -> None:
     processor = SyntheticIngestProcessor()
     connection = MagicMock()
+    revision_id = uuid4()
     select_result = MagicMock()
-    select_result.mappings.return_value.one_or_none.return_value = {"status": "queued"}
-    connection.execute.side_effect = [select_result, MagicMock(), MagicMock(), MagicMock()]
+    select_result.mappings.return_value.one_or_none.return_value = {
+        "status": "queued",
+        "revision_id": revision_id,
+    }
+    connection.execute.side_effect = [
+        select_result,
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+        MagicMock(),
+    ]
     lease = MagicMock()
     context = _make_context()
 
-    processor.process(connection, context, lease)
+    with patch.object(
+        DeterministicIngestProcessor,
+        "_activate_revision_if_current",
+        autospec=True,
+    ) as activate_revision:
+        processor.process(connection, context, lease)
 
-    assert connection.execute.call_count == 4
+    assert connection.execute.call_count == 5
     lease.extend.assert_called_once()
     parsing_args = connection.execute.call_args_list[1][0][1]
     assert parsing_args["ingest_job_id"] == context.payload.ingest_job_id
-    ready_args = connection.execute.call_args_list[2][0][1]
+    revision_args = connection.execute.call_args_list[2][0][1]
+    assert revision_args["revision_id"] == revision_id
+    ready_args = connection.execute.call_args_list[3][0][1]
     assert ready_args["ingest_job_id"] == context.payload.ingest_job_id
-    document_args = connection.execute.call_args_list[3][0][1]
+    activate_revision.assert_called_once_with(
+        processor,
+        connection,
+        document_id=context.payload.document_id,
+        revision_id=revision_id,
+        ingest_job_id=context.payload.ingest_job_id,
+        now=activate_revision.call_args.kwargs["now"],
+    )
+    document_args = connection.execute.call_args_list[4][0][1]
     assert document_args["document_id"] == context.payload.document_id
