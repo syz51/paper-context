@@ -2124,6 +2124,220 @@ def test_phase3_retrieval_helpers_support_cursor_table_detail_and_passage_contex
     assert context.warnings == ("parser_fallback_used",)
 
 
+def test_search_passages_page_reaches_results_beyond_sparse_candidate_cap(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    total_passages = retrieval_service_module.PASSAGE_SPARSE_CANDIDATES + 15
+    expected_passage_ids = tuple(UUID(int=index + 1) for index in range(total_passages))
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Deep pagination passages",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Body",
+                heading_path=["Body"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for index, passage_id in enumerate(expected_passage_ids, start=1):
+            connection.execute(
+                insert(DocumentPassage).values(
+                    id=passage_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    chunk_ordinal=index,
+                    body_text=f"Pagination passage {index}",
+                    contextualized_text=f"Pagination passage {index}",
+                    token_count=3,
+                    page_start=1,
+                    page_end=1,
+                    provenance_offsets={"pages": [1], "charspans": [[0, 10]]},
+                    artifact_id=None,
+                )
+            )
+            _insert_passage_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                passage_id=passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text="deep pagination keyword",
+                embedding=_vector_string(0),
+            )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+    )
+
+    seen_passage_ids: list[UUID] = []
+    cursor: str | None = None
+    while True:
+        page = service.search_passages_page(
+            query="deep pagination keyword",
+            limit=7,
+            cursor=cursor,
+        )
+        seen_passage_ids.extend(item.passage_id for item in page.items)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    assert tuple(seen_passage_ids) == expected_passage_ids
+    assert len(seen_passage_ids) == total_passages
+
+
+def test_search_tables_page_reaches_results_beyond_sparse_candidate_cap(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    total_tables = retrieval_service_module.TABLE_SPARSE_CANDIDATES + 7
+    expected_table_ids = tuple(UUID(int=10_000 + index) for index in range(total_tables))
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Deep pagination tables",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Tables",
+                heading_path=["Tables"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for index, table_id in enumerate(expected_table_ids, start=1):
+            connection.execute(
+                insert(DocumentTable).values(
+                    id=table_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    caption=f"Pagination table {index}",
+                    table_type="lexical",
+                    headers_json=["A"],
+                    rows_json=[[str(index)]],
+                    page_start=1,
+                    page_end=1,
+                    artifact_id=None,
+                )
+            )
+            _insert_table_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                table_id=table_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text="deep table pagination keyword",
+            )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+    )
+
+    seen_table_ids: list[UUID] = []
+    cursor: str | None = None
+    while True:
+        page = service.search_tables_page(
+            query="deep table pagination keyword",
+            limit=4,
+            cursor=cursor,
+        )
+        seen_table_ids.extend(item.table_id for item in page.items)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    assert tuple(seen_table_ids) == expected_table_ids
+    assert len(seen_table_ids) == total_tables
+
+
 def test_detail_helpers_require_active_retrieval_provenance(
     migrated_postgres_engine,
 ) -> None:

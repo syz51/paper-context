@@ -939,6 +939,7 @@ class RetrievalService:
                     query=query,
                     filters=filters,
                     limit=None,
+                    exhaustive=True,
                     filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
                 )
@@ -989,6 +990,7 @@ class RetrievalService:
                     query=query,
                     filters=filters,
                     limit=None,
+                    exhaustive=True,
                     filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
                 )
@@ -1039,6 +1041,7 @@ class RetrievalService:
                     query=query,
                     filters=filters,
                     limit=None,
+                    exhaustive=True,
                     filtered_document_ids=filtered_document_ids,
                     active_runs=active_runs,
                 )
@@ -1366,6 +1369,7 @@ class RetrievalService:
         query: str,
         filters: RetrievalFilters,
         limit: int | None,
+        exhaustive: bool = False,
         filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
         active_runs: _ActiveRunSelection | None = None,
     ) -> list[PassageResult]:
@@ -1390,14 +1394,14 @@ class RetrievalService:
             query=query,
             retrieval_index_run_ids=active_runs.run_ids,
             filtered_document_ids=filtered_document_ids,
-            limit=PASSAGE_SPARSE_CANDIDATES,
+            limit=None if exhaustive else PASSAGE_SPARSE_CANDIDATES,
         )
         dense_candidates = self._load_dense_passage_candidates(
             connection,
             query=query,
             retrieval_index_run_ids=active_runs.run_ids,
             filtered_document_ids=filtered_document_ids,
-            limit=PASSAGE_DENSE_CANDIDATES,
+            limit=None if exhaustive else PASSAGE_DENSE_CANDIDATES,
         )
         fused = self._fuse_candidates(
             sparse_candidates,
@@ -1414,6 +1418,7 @@ class RetrievalService:
         query: str,
         filters: RetrievalFilters,
         limit: int | None,
+        exhaustive: bool = False,
         filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
         active_runs: _ActiveRunSelection | None = None,
     ) -> list[TableResult]:
@@ -1438,7 +1443,7 @@ class RetrievalService:
             query=query,
             retrieval_index_run_ids=active_runs.run_ids,
             filtered_document_ids=filtered_document_ids,
-            limit=TABLE_SPARSE_CANDIDATES,
+            limit=None if exhaustive else TABLE_SPARSE_CANDIDATES,
         )
         fused = self._fuse_candidates(
             sparse_candidates,
@@ -1598,15 +1603,18 @@ class RetrievalService:
         query: str,
         retrieval_index_run_ids: tuple[uuid.UUID, ...],
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
-        limit: int,
+        limit: int | None,
     ) -> list[_Candidate]:
         params: dict[str, object] = {
             "query": query,
             "retrieval_index_run_ids": list(retrieval_index_run_ids),
-            "candidate_limit": limit,
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
         }
+        limit_sql = ""
+        if limit is not None:
+            params["candidate_limit"] = limit
+            limit_sql = "\n                LIMIT :candidate_limit"
         query_sql = """
             WITH candidate_assets AS (
                 SELECT
@@ -1625,7 +1633,9 @@ class RetrievalService:
                       OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
                   )
                 ORDER BY rank_score DESC, assets.passage_id
-                LIMIT :candidate_limit
+            """
+        query_sql += limit_sql
+        query_sql += """
             )
             SELECT
                 passages.id AS passage_id,
@@ -1685,7 +1695,7 @@ class RetrievalService:
         query: str,
         retrieval_index_run_ids: tuple[uuid.UUID, ...],
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
-        limit: int,
+        limit: int | None,
     ) -> list[_Candidate]:
         if self._embedding_client is None:
             return []
@@ -1700,10 +1710,13 @@ class RetrievalService:
         params: dict[str, object] = {
             "query_embedding": _vector_literal(batch.embeddings[0]),
             "retrieval_index_run_ids": list(retrieval_index_run_ids),
-            "candidate_limit": limit,
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
         }
+        limit_sql = ""
+        if limit is not None:
+            params["candidate_limit"] = limit
+            limit_sql = "\n                LIMIT :candidate_limit"
         query_sql = """
             WITH candidate_assets AS (
                 SELECT
@@ -1719,7 +1732,9 @@ class RetrievalService:
                       OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
                   )
                 ORDER BY assets.embedding <=> CAST(:query_embedding AS vector), assets.passage_id
-                LIMIT :candidate_limit
+            """
+        query_sql += limit_sql
+        query_sql += """
             )
             SELECT
                 passages.id AS passage_id,
@@ -1779,15 +1794,18 @@ class RetrievalService:
         query: str,
         retrieval_index_run_ids: tuple[uuid.UUID, ...],
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
-        limit: int,
+        limit: int | None,
     ) -> list[_Candidate]:
         params: dict[str, object] = {
             "query": query,
             "retrieval_index_run_ids": list(retrieval_index_run_ids),
-            "candidate_limit": limit,
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
         }
+        limit_sql = ""
+        if limit is not None:
+            params["candidate_limit"] = limit
+            limit_sql = "\n                LIMIT :candidate_limit"
         query_sql = """
             WITH candidate_assets AS (
                 SELECT
@@ -1807,7 +1825,9 @@ class RetrievalService:
                       OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
                   )
                 ORDER BY rank_score DESC, assets.table_id
-                LIMIT :candidate_limit
+            """
+        query_sql += limit_sql
+        query_sql += """
             )
             SELECT
                 tables.id AS table_id,
