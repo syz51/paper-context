@@ -66,8 +66,8 @@ def test_search_passages_page_returns_cursor_bound_to_index_version() -> None:
         score=1.0,
         retrieval_index_run_id=UUID("44444444-4444-4444-4444-444444444444"),
     )
-    service._search_passages_with_connection = MagicMock(  # type: ignore[method-assign]
-        return_value=[passage_a, passage_b, passage_c]
+    service._load_ranked_passage_results = MagicMock(  # type: ignore[method-assign]
+        return_value=([passage_a, passage_b, passage_c], 0, 0)
     )
 
     first_page = service.search_passages_page(query="alpha", limit=2)
@@ -84,8 +84,7 @@ def test_search_passages_page_returns_cursor_bound_to_index_version() -> None:
     assert decode_cursor(first_page.next_cursor)["kind"] == "passages"
     assert [item.passage_id for item in second_page.items] == [passage_c.passage_id]
     assert all(
-        call.kwargs["limit"] is None
-        for call in service._search_passages_with_connection.call_args_list
+        call.kwargs["limit"] is None for call in service._load_ranked_passage_results.call_args_list
     )
 
 
@@ -131,8 +130,8 @@ def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
         parser_source="docling",
         warnings=(),
     )
-    service._search_tables_with_connection = MagicMock(  # type: ignore[method-assign]
-        return_value=[table_a, table_b]
+    service._load_ranked_table_results = MagicMock(  # type: ignore[method-assign]
+        return_value=([table_a, table_b], 0)
     )
 
     first_page = service.search_tables_page(query="beta", limit=1)
@@ -145,8 +144,7 @@ def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
     assert [item.table_id for item in second_page.items] == [table_b.table_id]
     assert first_page.items[0].preview.headers == ("A",)
     assert all(
-        call.kwargs["limit"] is None
-        for call in service._search_tables_with_connection.call_args_list
+        call.kwargs["limit"] is None for call in service._load_ranked_table_results.call_args_list
     )
 
 

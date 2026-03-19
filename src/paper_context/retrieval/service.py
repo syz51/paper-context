@@ -933,27 +933,15 @@ class RetrievalService:
                 connection,
                 filtered_document_ids=filtered_document_ids,
             )
-            results = tuple(
-                self._search_passages_with_connection(
-                    connection,
-                    query=query,
-                    filters=filters,
-                    limit=None,
-                    exhaustive=True,
-                    filtered_document_ids=filtered_document_ids,
-                    active_runs=active_runs,
-                )
-            )
-            return cast(
-                SearchPage[PassageResult],
-                self._paginate_ranked_results(
-                    kind="passages",
-                    results=results,
-                    limit=limit,
-                    cursor=cursor,
-                    active_runs=active_runs,
-                    fingerprint=fingerprint,
-                ),
+            return self._search_passages_page_with_connection(
+                connection,
+                query=query,
+                filters=filters,
+                cursor=cursor,
+                limit=limit,
+                filtered_document_ids=filtered_document_ids,
+                active_runs=active_runs,
+                fingerprint=fingerprint,
             )
 
     def search_tables_page(
@@ -984,27 +972,15 @@ class RetrievalService:
                 connection,
                 filtered_document_ids=filtered_document_ids,
             )
-            results = tuple(
-                self._search_tables_with_connection(
-                    connection,
-                    query=query,
-                    filters=filters,
-                    limit=None,
-                    exhaustive=True,
-                    filtered_document_ids=filtered_document_ids,
-                    active_runs=active_runs,
-                )
-            )
-            return cast(
-                SearchPage[TableResult],
-                self._paginate_ranked_results(
-                    kind="tables",
-                    results=results,
-                    limit=limit,
-                    cursor=cursor,
-                    active_runs=active_runs,
-                    fingerprint=fingerprint,
-                ),
+            return self._search_tables_page_with_connection(
+                connection,
+                query=query,
+                filters=filters,
+                cursor=cursor,
+                limit=limit,
+                filtered_document_ids=filtered_document_ids,
+                active_runs=active_runs,
+                fingerprint=fingerprint,
             )
 
     def build_context_pack(
@@ -1035,27 +1011,15 @@ class RetrievalService:
                 connection,
                 filtered_document_ids=filtered_document_ids,
             )
-            all_passages = tuple(
-                self._search_passages_with_connection(
-                    connection,
-                    query=query,
-                    filters=filters,
-                    limit=None,
-                    exhaustive=True,
-                    filtered_document_ids=filtered_document_ids,
-                    active_runs=active_runs,
-                )
-            )
-            passage_page = cast(
-                SearchPage[PassageResult],
-                self._paginate_ranked_results(
-                    kind="context_pack",
-                    results=all_passages,
-                    limit=limit,
-                    cursor=cursor,
-                    active_runs=active_runs,
-                    fingerprint=fingerprint,
-                ),
+            passage_page = self._search_passages_page_with_connection(
+                connection,
+                query=query,
+                filters=filters,
+                cursor=cursor,
+                limit=limit,
+                filtered_document_ids=filtered_document_ids,
+                active_runs=active_runs,
+                fingerprint=fingerprint,
             )
             passages = passage_page.items
             pack_document_ids = tuple(dict.fromkeys(result.document_id for result in passages))
@@ -1369,7 +1333,6 @@ class RetrievalService:
         query: str,
         filters: RetrievalFilters,
         limit: int | None,
-        exhaustive: bool = False,
         filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
         active_runs: _ActiveRunSelection | None = None,
     ) -> list[PassageResult]:
@@ -1389,27 +1352,16 @@ class RetrievalService:
             )
         if not active_runs.run_ids:
             return []
-        sparse_candidates = self._load_sparse_passage_candidates(
+        results, _, _ = self._load_ranked_passage_results(
             connection,
             query=query,
-            retrieval_index_run_ids=active_runs.run_ids,
+            limit=limit,
             filtered_document_ids=filtered_document_ids,
-            limit=None if exhaustive else PASSAGE_SPARSE_CANDIDATES,
+            active_runs=active_runs,
+            sparse_candidate_limit=PASSAGE_SPARSE_CANDIDATES,
+            dense_candidate_limit=PASSAGE_DENSE_CANDIDATES,
         )
-        dense_candidates = self._load_dense_passage_candidates(
-            connection,
-            query=query,
-            retrieval_index_run_ids=active_runs.run_ids,
-            filtered_document_ids=filtered_document_ids,
-            limit=None if exhaustive else PASSAGE_DENSE_CANDIDATES,
-        )
-        fused = self._fuse_candidates(
-            sparse_candidates,
-            dense_candidates,
-            fused_limit=None if limit is None else PASSAGE_FUSED_CANDIDATES,
-        )
-        reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
-        return [self._candidate_to_passage_result(candidate) for candidate in reranked]
+        return results
 
     def _search_tables_with_connection(
         self,
@@ -1418,7 +1370,6 @@ class RetrievalService:
         query: str,
         filters: RetrievalFilters,
         limit: int | None,
-        exhaustive: bool = False,
         filtered_document_ids: tuple[uuid.UUID, ...] | None = None,
         active_runs: _ActiveRunSelection | None = None,
     ) -> list[TableResult]:
@@ -1438,12 +1389,179 @@ class RetrievalService:
             )
         if not active_runs.run_ids:
             return []
+        results, _ = self._load_ranked_table_results(
+            connection,
+            query=query,
+            limit=limit,
+            filtered_document_ids=filtered_document_ids,
+            active_runs=active_runs,
+            sparse_candidate_limit=TABLE_SPARSE_CANDIDATES,
+        )
+        return results
+
+    def _search_passages_page_with_connection(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        filters: RetrievalFilters,
+        cursor: str | None,
+        limit: int,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        active_runs: _ActiveRunSelection,
+        fingerprint: str,
+    ) -> SearchPage[PassageResult]:
+        sparse_limit = PASSAGE_SPARSE_CANDIDATES
+        dense_limit = PASSAGE_DENSE_CANDIDATES
+        previous_signature: tuple[tuple[str, ...], str | None] | None = None
+        while True:
+            results, sparse_count, dense_count = self._load_ranked_passage_results(
+                connection,
+                query=query,
+                limit=None,
+                filtered_document_ids=filtered_document_ids,
+                active_runs=active_runs,
+                sparse_candidate_limit=sparse_limit,
+                dense_candidate_limit=dense_limit,
+            )
+            page = cast(
+                SearchPage[PassageResult],
+                self._paginate_ranked_results(
+                    kind="passages",
+                    results=tuple(results),
+                    limit=limit,
+                    cursor=cursor,
+                    active_runs=active_runs,
+                    fingerprint=fingerprint,
+                ),
+            )
+            signature = (
+                tuple(self._result_identity(item) for item in page.items),
+                page.next_cursor,
+            )
+            sparse_exhausted = sparse_count < sparse_limit
+            dense_exhausted = self._embedding_client is None or dense_count < dense_limit
+            if sparse_exhausted and dense_exhausted:
+                return page
+            if (
+                page.next_cursor is not None
+                and len(page.items) == limit
+                and signature == previous_signature
+            ):
+                return page
+            previous_signature = signature
+            if not sparse_exhausted:
+                sparse_limit *= 2
+            if self._embedding_client is not None and not dense_exhausted:
+                dense_limit *= 2
+
+    def _search_tables_page_with_connection(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        filters: RetrievalFilters,
+        cursor: str | None,
+        limit: int,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        active_runs: _ActiveRunSelection,
+        fingerprint: str,
+    ) -> SearchPage[TableResult]:
+        sparse_limit = TABLE_SPARSE_CANDIDATES
+        previous_signature: tuple[tuple[str, ...], str | None] | None = None
+        while True:
+            results, sparse_count = self._load_ranked_table_results(
+                connection,
+                query=query,
+                limit=None,
+                filtered_document_ids=filtered_document_ids,
+                active_runs=active_runs,
+                sparse_candidate_limit=sparse_limit,
+            )
+            page = cast(
+                SearchPage[TableResult],
+                self._paginate_ranked_results(
+                    kind="tables",
+                    results=tuple(results),
+                    limit=limit,
+                    cursor=cursor,
+                    active_runs=active_runs,
+                    fingerprint=fingerprint,
+                ),
+            )
+            signature = (
+                tuple(self._result_identity(item) for item in page.items),
+                page.next_cursor,
+            )
+            sparse_exhausted = sparse_count < sparse_limit
+            if sparse_exhausted:
+                return page
+            if (
+                page.next_cursor is not None
+                and len(page.items) == limit
+                and signature == previous_signature
+            ):
+                return page
+            previous_signature = signature
+            sparse_limit *= 2
+
+    def _load_ranked_passage_results(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        limit: int | None,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        active_runs: _ActiveRunSelection,
+        sparse_candidate_limit: int | None,
+        dense_candidate_limit: int | None,
+    ) -> tuple[list[PassageResult], int, int]:
+        if not query.strip() or filtered_document_ids == () or not active_runs.run_ids:
+            return [], 0, 0
+        sparse_candidates = self._load_sparse_passage_candidates(
+            connection,
+            query=query,
+            retrieval_index_run_ids=active_runs.run_ids,
+            filtered_document_ids=filtered_document_ids,
+            limit=sparse_candidate_limit,
+        )
+        dense_candidates = self._load_dense_passage_candidates(
+            connection,
+            query=query,
+            retrieval_index_run_ids=active_runs.run_ids,
+            filtered_document_ids=filtered_document_ids,
+            limit=dense_candidate_limit,
+        )
+        fused = self._fuse_candidates(
+            sparse_candidates,
+            dense_candidates,
+            fused_limit=None if limit is None else PASSAGE_FUSED_CANDIDATES,
+        )
+        reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
+        return (
+            [self._candidate_to_passage_result(candidate) for candidate in reranked],
+            len(sparse_candidates),
+            len(dense_candidates),
+        )
+
+    def _load_ranked_table_results(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        limit: int | None,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        active_runs: _ActiveRunSelection,
+        sparse_candidate_limit: int | None,
+    ) -> tuple[list[TableResult], int]:
+        if not query.strip() or filtered_document_ids == () or not active_runs.run_ids:
+            return [], 0
         sparse_candidates = self._load_sparse_table_candidates(
             connection,
             query=query,
             retrieval_index_run_ids=active_runs.run_ids,
             filtered_document_ids=filtered_document_ids,
-            limit=None if exhaustive else TABLE_SPARSE_CANDIDATES,
+            limit=sparse_candidate_limit,
         )
         fused = self._fuse_candidates(
             sparse_candidates,
@@ -1451,7 +1569,10 @@ class RetrievalService:
             fused_limit=None if limit is None else TABLE_FUSED_CANDIDATES,
         )
         reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
-        return [self._candidate_to_table_result(candidate) for candidate in reranked]
+        return (
+            [self._candidate_to_table_result(candidate) for candidate in reranked],
+            len(sparse_candidates),
+        )
 
     def _resolve_active_run_selection(
         self,
