@@ -177,34 +177,20 @@ class DocumentsApiService:
         cursor: str | None = None,
     ) -> DocumentListResponse:
         filters = filters or RetrievalFiltersInput()
-        clauses = ["1 = 1"]
-        params: dict[str, object] = {}
         stripped_query = query.strip()
-        if stripped_query:
-            clauses.append(
-                """
-                (
-                    COALESCE(documents.title, '') ILIKE :query
-                    OR COALESCE(documents.abstract, '') ILIKE :query
-                    OR COALESCE(documents.authors::text, '') ILIKE :query
-                )
-                """
-            )
-            params["query"] = f"%{stripped_query}%"
-        if filters.document_ids:
-            clauses.append("documents.id = ANY(CAST(:document_ids AS uuid[]))")
-            params["document_ids"] = list(filters.document_ids)
-        if filters.publication_years:
-            clauses.append(
-                "documents.publication_year = ANY(CAST(:publication_years AS integer[]))"
-            )
-            params["publication_years"] = filters.publication_years
+        params: dict[str, object] = {
+            "query": f"%{stripped_query}%" if stripped_query else None,
+            "apply_document_ids": bool(filters.document_ids),
+            "document_ids": list(filters.document_ids),
+            "apply_publication_years": bool(filters.publication_years),
+            "publication_years": list(filters.publication_years),
+        }
 
         with self._engine.begin() as connection:
             rows = (
                 connection.execute(
                     text(
-                        f"""
+                        """
                         SELECT
                             documents.id AS document_id,
                             COALESCE(documents.title, 'Untitled document') AS title,
@@ -224,9 +210,26 @@ class DocumentsApiService:
                             ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC, runs.id DESC
                             LIMIT 1
                         ) active_run ON true
-                        WHERE {" AND ".join(clauses)}
+                        WHERE (
+                            :query IS NULL
+                            OR (
+                                COALESCE(documents.title, '') ILIKE :query
+                                OR COALESCE(documents.abstract, '') ILIKE :query
+                                OR COALESCE(documents.authors::text, '') ILIKE :query
+                            )
+                        )
+                          AND (
+                            :apply_document_ids = false
+                            OR documents.id = ANY(CAST(:document_ids AS uuid[]))
+                        )
+                          AND (
+                            :apply_publication_years = false
+                            OR documents.publication_year = ANY(
+                                CAST(:publication_years AS integer[])
+                            )
+                        )
                         ORDER BY documents.updated_at DESC NULLS LAST, documents.id DESC
-                        """  # nosec B608
+                        """
                     ),
                     params,
                 )

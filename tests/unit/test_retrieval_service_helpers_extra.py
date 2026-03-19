@@ -314,7 +314,8 @@ def test_resolve_active_run_selection_fixed_version_and_query_branch() -> None:
     assert selection.run_ids == tuple(row["id"] for row in rows)
     assert selection.index_versions == ("mvp-v2", "mvp-v1")
     assert query_connection.execute.call_args.args[1] == {
-        "document_ids": [filtered_document_ids[0]]
+        "apply_document_filter": True,
+        "document_ids": [filtered_document_ids[0]],
     }
 
 
@@ -340,6 +341,7 @@ def test_resolve_filtered_document_ids_and_active_run_ids() -> None:
 
     assert len(active) == 2
     assert active_connection.execute.call_args.args[1] == {
+        "apply_document_filter": True,
         "index_version": "mvp-v1",
         "document_ids": [document_ids[0], document_ids[1]],
     }

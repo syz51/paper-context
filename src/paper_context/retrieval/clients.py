@@ -4,8 +4,8 @@ import json
 import math
 from dataclasses import dataclass
 from hashlib import blake2b
-from urllib import error, request
-from urllib.parse import urlparse
+from http import client as http_client
+from urllib.parse import urlsplit
 
 from .types import EmbeddingBatch, EmbeddingInputType, RerankItem, RetrievalError
 
@@ -16,28 +16,45 @@ def _post_json(
     api_key: str,
     payload: dict[str, object],
 ) -> dict[str, object]:
-    parsed_url = urlparse(url)
+    parsed_url = urlsplit(url)
     if parsed_url.scheme != "https":
         raise RetrievalError(f"unsupported provider endpoint scheme: {parsed_url.scheme!r}")
+    if parsed_url.hostname is None:
+        raise RetrievalError("provider endpoint is missing a hostname")
     body = json.dumps(payload).encode("utf-8")
-    http_request = request.Request(
-        url,
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
+    request_path = parsed_url.path or "/"
+    if parsed_url.query:
+        request_path = f"{request_path}?{parsed_url.query}"
+    connection = http_client.HTTPSConnection(
+        host=parsed_url.hostname,
+        port=parsed_url.port,
+        timeout=30,
     )
     try:
-        with request.urlopen(http_request, timeout=30) as response:  # nosec B310
-            return json.loads(response.read().decode("utf-8"))
-    except error.HTTPError as exc:  # pragma: no cover - exercised only with live providers
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RetrievalError(f"provider request failed with {exc.code}: {detail}") from exc
-    except error.URLError as exc:  # pragma: no cover - exercised only with live providers
-        raise RetrievalError(f"provider request failed: {exc.reason}") from exc
+        connection.request(
+            "POST",
+            request_path,
+            body=body,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        response_payload = response.read().decode("utf-8", errors="replace")
+    except OSError as exc:  # pragma: no cover - exercised only with live providers
+        raise RetrievalError(f"provider request failed: {exc}") from exc
+    except (
+        http_client.HTTPException
+    ) as exc:  # pragma: no cover - exercised only with live providers
+        raise RetrievalError(f"provider request failed: {exc}") from exc
+    finally:
+        connection.close()
+
+    if response.status >= 400:
+        raise RetrievalError(f"provider request failed with {response.status}: {response_payload}")
+    return json.loads(response_payload)
 
 
 def _normalize_embeddings(raw_embeddings: list[object]) -> tuple[tuple[float, ...], ...]:

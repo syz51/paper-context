@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import io
-from email.message import Message
-from urllib import error, request
+from typing import cast
 
 import pytest
 
@@ -13,28 +11,42 @@ pytestmark = pytest.mark.unit
 
 
 class _FakeResponse:
-    def __init__(self, payload: bytes) -> None:
+    def __init__(self, payload: bytes, *, status: int = 200) -> None:
         self._payload = payload
+        self.status = status
 
     def read(self) -> bytes:
         return self._payload
-
-    def __enter__(self) -> _FakeResponse:
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return False
 
 
 def test_post_json_builds_https_request(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
-    def fake_urlopen(http_request: request.Request, timeout: int) -> _FakeResponse:
-        captured["request"] = http_request
-        captured["timeout"] = timeout
-        return _FakeResponse(b'{"ok": true}')
+    class _FakeConnection:
+        def __init__(self, *, host: str, port: int | None, timeout: int) -> None:
+            captured["host"] = host
+            captured["port"] = port
+            captured["timeout"] = timeout
 
-    monkeypatch.setattr(clients.request, "urlopen", fake_urlopen)
+        def request(
+            self,
+            method: str,
+            url: str,
+            body: bytes,
+            headers: dict[str, str],
+        ) -> None:
+            captured["method"] = method
+            captured["url"] = url
+            captured["body"] = body
+            captured["headers"] = headers
+
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(b'{"ok": true}')
+
+        def close(self) -> None:
+            captured["closed"] = True
+
+    monkeypatch.setattr(clients.http_client, "HTTPSConnection", _FakeConnection)
 
     result = clients._post_json(
         url="https://example.com/api",
@@ -42,15 +54,18 @@ def test_post_json_builds_https_request(monkeypatch: pytest.MonkeyPatch) -> None
         payload={"query": "paper"},
     )
 
-    http_request = captured["request"]
-    assert isinstance(http_request, request.Request)
     assert captured["timeout"] == 30
-    assert http_request.full_url == "https://example.com/api"
-    assert http_request.data == b'{"query": "paper"}'
-    assert http_request.get_method() == "POST"
-    headers = {key.lower(): value for key, value in http_request.header_items()}
+    assert captured["host"] == "example.com"
+    assert captured["port"] is None
+    assert captured["method"] == "POST"
+    assert captured["url"] == "/api"
+    assert captured["body"] == b'{"query": "paper"}'
+    headers = {
+        key.lower(): value for key, value in cast(dict[str, str], captured["headers"]).items()
+    }
     assert headers["authorization"] == "Bearer secret"
     assert headers["content-type"] == "application/json"
+    assert captured["closed"] is True
     assert result == {"ok": True}
 
 
@@ -60,24 +75,46 @@ def test_post_json_rejects_non_https_url() -> None:
 
 
 def test_post_json_wraps_http_and_url_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    def raise_http_error(http_request: request.Request, timeout: int) -> None:
-        raise error.HTTPError(
-            url=http_request.full_url,
-            code=429,
-            msg="too many requests",
-            hdrs=Message(),
-            fp=io.BytesIO(b"slow down"),
-        )
+    class _ErrorResponseConnection:
+        def request(
+            self,
+            method: str,
+            url: str,
+            body: bytes,
+            headers: dict[str, str],
+        ) -> None:
+            del method, url, body, headers
 
-    monkeypatch.setattr(clients.request, "urlopen", raise_http_error)
+        def getresponse(self) -> _FakeResponse:
+            return _FakeResponse(b"slow down", status=429)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        clients.http_client, "HTTPSConnection", lambda **kwargs: _ErrorResponseConnection()
+    )
 
     with pytest.raises(RetrievalError, match="provider request failed with 429: slow down"):
         clients._post_json(url="https://example.com/api", api_key="secret", payload={})
 
-    def raise_url_error(http_request: request.Request, timeout: int) -> None:
-        raise error.URLError("offline")
+    class _OfflineConnection:
+        def request(
+            self,
+            method: str,
+            url: str,
+            body: bytes,
+            headers: dict[str, str],
+        ) -> None:
+            del method, url, body, headers
+            raise OSError("offline")
 
-    monkeypatch.setattr(clients.request, "urlopen", raise_url_error)
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        clients.http_client, "HTTPSConnection", lambda **kwargs: _OfflineConnection()
+    )
 
     with pytest.raises(RetrievalError, match="provider request failed: offline"):
         clients._post_json(url="https://example.com/api", api_key="secret", payload={})

@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from paper_context.config import AppSettings, get_settings
-from paper_context.config.settings import DatabaseSettings
+from paper_context.config.settings import DatabaseSettings, RuntimeSettings
 from paper_context.db import engine as db_engine
 from paper_context.db.engine import (
     database_is_ready,
@@ -30,6 +30,10 @@ def test_get_settings_is_cached() -> None:
     second = get_settings()
     assert first is second
     assert first.queue.name == "document_ingest"
+
+
+def test_runtime_settings_default_to_local_bind_when_env_is_ignored() -> None:
+    assert RuntimeSettings().app_host == "127.0.0.1"
 
 
 def test_configure_logging_sets_level() -> None:

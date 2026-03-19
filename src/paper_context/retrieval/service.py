@@ -922,16 +922,15 @@ class RetrievalService:
         )
 
     def get_table(self, *, table_id: uuid.UUID) -> TableDetailResult | None:
-        index_version_clause = ""
-        params: dict[str, object] = {"table_id": table_id}
-        if self._active_index_version is not None:
-            index_version_clause = "AND runs.index_version = :index_version"
-            params["index_version"] = self._active_index_version
+        params: dict[str, object] = {
+            "table_id": table_id,
+            "index_version": self._active_index_version,
+        }
         with self._connection() as connection:
             row = (
                 connection.execute(
                     text(
-                        f"""
+                        """
                         SELECT
                             tables.id AS table_id,
                             tables.document_id,
@@ -957,13 +956,16 @@ class RetrievalService:
                           ON runs.document_id = tables.document_id
                          AND runs.status = 'ready'
                          AND runs.is_active = true
-                         {index_version_clause}
+                         AND (
+                             CAST(:index_version AS text) IS NULL
+                             OR runs.index_version = CAST(:index_version AS text)
+                         )
                         LEFT JOIN ingest_jobs jobs
                           ON jobs.id = runs.ingest_job_id
                         WHERE tables.id = :table_id
                         ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC NULLS LAST
                         LIMIT 1
-                        """  # nosec B608
+                        """
                     ),
                     params,
                 )
@@ -1005,16 +1007,15 @@ class RetrievalService:
     ) -> PassageContextResult | None:
         before = max(0, before)
         after = max(0, after)
-        index_version_clause = ""
-        params: dict[str, object] = {"passage_id": passage_id}
-        if self._active_index_version is not None:
-            index_version_clause = "AND runs.index_version = :index_version"
-            params["index_version"] = self._active_index_version
+        params: dict[str, object] = {
+            "passage_id": passage_id,
+            "index_version": self._active_index_version,
+        }
         with self._connection() as connection:
             row = (
                 connection.execute(
                     text(
-                        f"""
+                        """
                         SELECT
                             passages.id AS passage_id,
                             passages.document_id,
@@ -1038,13 +1039,16 @@ class RetrievalService:
                           ON runs.document_id = passages.document_id
                          AND runs.status = 'ready'
                          AND runs.is_active = true
-                         {index_version_clause}
+                         AND (
+                             CAST(:index_version AS text) IS NULL
+                             OR runs.index_version = CAST(:index_version AS text)
+                         )
                         LEFT JOIN ingest_jobs jobs
                           ON jobs.id = runs.ingest_job_id
                         WHERE passages.id = :passage_id
                         ORDER BY COALESCE(runs.activated_at, runs.created_at) DESC NULLS LAST
                         LIMIT 1
-                        """  # nosec B608
+                        """
                     ),
                     params,
                 )
@@ -1233,24 +1237,27 @@ class RetrievalService:
             )
             index_versions = (self._active_index_version,) if run_ids else ()
             return _ActiveRunSelection(run_ids=run_ids, index_versions=index_versions)
-        query_sql = """
+        params: dict[str, object] = {
+            "apply_document_filter": filtered_document_ids is not None,
+            "document_ids": list(filtered_document_ids or ()),
+        }
+        rows = (
+            connection.execute(
+                text(
+                    """
             SELECT runs.id, runs.index_version
             FROM retrieval_index_runs runs
             WHERE runs.status = 'ready'
               AND runs.is_active = true
-              {document_filter_sql}
+              AND (
+                  :apply_document_filter = false
+                  OR runs.document_id = ANY(CAST(:document_ids AS uuid[]))
+              )
             ORDER BY
                 COALESCE(runs.activated_at, runs.created_at) DESC,
                 runs.id
-            """
-        document_filter_sql = ""
-        params: dict[str, object] = {}
-        if filtered_document_ids is not None:
-            document_filter_sql = "AND runs.document_id = ANY(CAST(:document_ids AS uuid[]))"
-            params["document_ids"] = list(filtered_document_ids)
-        rows = (
-            connection.execute(
-                text(query_sql.format(document_filter_sql=document_filter_sql)),
+                    """
+                ),
                 params,
             )
             .mappings()
@@ -1269,26 +1276,29 @@ class RetrievalService:
         if not filters.document_ids and not filters.publication_years:
             return None
 
-        clauses = ["1 = 1"]
-        params: dict[str, object] = {}
-        if filters.document_ids:
-            clauses.append("documents.id = ANY(CAST(:document_ids AS uuid[]))")
-            params["document_ids"] = list(filters.document_ids)
-        if filters.publication_years:
-            clauses.append(
-                "documents.publication_year = ANY(CAST(:publication_years AS integer[]))"
-            )
-            params["publication_years"] = list(filters.publication_years)
+        params: dict[str, object] = {
+            "apply_document_ids": bool(filters.document_ids),
+            "document_ids": list(filters.document_ids),
+            "apply_publication_years": bool(filters.publication_years),
+            "publication_years": list(filters.publication_years),
+        }
 
         rows = (
             connection.execute(
                 text(
-                    f"""
+                    """
                     SELECT documents.id
                     FROM documents
-                    WHERE {" AND ".join(clauses)}
+                    WHERE (
+                        :apply_document_ids = false
+                        OR documents.id = ANY(CAST(:document_ids AS uuid[]))
+                    )
+                      AND (
+                        :apply_publication_years = false
+                        OR documents.publication_year = ANY(CAST(:publication_years AS integer[]))
+                    )
                     ORDER BY documents.id
-                    """  # nosec B608
+                    """
                 ),
                 params,
             )
@@ -1304,25 +1314,26 @@ class RetrievalService:
         index_version: str,
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
     ) -> tuple[uuid.UUID, ...]:
-        document_filter_sql = ""
         params: dict[str, object] = {
             "index_version": index_version,
+            "apply_document_filter": filtered_document_ids is not None,
+            "document_ids": list(filtered_document_ids or ()),
         }
-        if filtered_document_ids is not None:
-            document_filter_sql = "AND document_id = ANY(CAST(:document_ids AS uuid[]))"
-            params["document_ids"] = list(filtered_document_ids)
         rows = (
             connection.execute(
                 text(
-                    f"""
+                    """
                     SELECT id
                     FROM retrieval_index_runs
                     WHERE status = 'ready'
                       AND is_active = true
                       AND index_version = :index_version
-                      {document_filter_sql}
+                      AND (
+                          :apply_document_filter = false
+                          OR document_id = ANY(CAST(:document_ids AS uuid[]))
+                      )
                     ORDER BY COALESCE(activated_at, created_at) DESC, id
-                    """  # nosec B608
+                    """
                 ),
                 params,
             )
@@ -1340,16 +1351,14 @@ class RetrievalService:
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         limit: int,
     ) -> list[_Candidate]:
-        document_filter_sql = ""
         params: dict[str, object] = {
             "query": query,
             "retrieval_index_run_ids": list(retrieval_index_run_ids),
             "candidate_limit": limit,
+            "apply_document_filter": filtered_document_ids is not None,
+            "document_ids": list(filtered_document_ids or ()),
         }
-        if filtered_document_ids is not None:
-            document_filter_sql = "AND assets.document_id = ANY(CAST(:document_ids AS uuid[]))"
-            params["document_ids"] = list(filtered_document_ids)
-        query_sql = f"""
+        query_sql = """
             WITH candidate_assets AS (
                 SELECT
                     assets.id,
@@ -1362,7 +1371,10 @@ class RetrievalService:
                 FROM retrieval_passage_assets assets
                 WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
                   AND assets.search_tsvector @@ websearch_to_tsquery('english', :query)
-                  {document_filter_sql}
+                  AND (
+                      :apply_document_filter = false
+                      OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
+                  )
                 ORDER BY rank_score DESC, assets.passage_id
                 LIMIT :candidate_limit
             )
@@ -1396,7 +1408,7 @@ class RetrievalService:
             JOIN ingest_jobs jobs
                 ON jobs.id = runs.ingest_job_id
             ORDER BY candidate_assets.rank_score DESC, passages.id
-            """  # nosec B608
+            """
         rows = (
             connection.execute(
                 text(query_sql),
@@ -1426,16 +1438,14 @@ class RetrievalService:
                 "query embedding dimension mismatch: "
                 f"expected {EMBEDDING_DIMENSIONS}, got {batch.dimensions}"
             )
-        document_filter_sql = ""
         params: dict[str, object] = {
             "query_embedding": _vector_literal(batch.embeddings[0]),
             "retrieval_index_run_ids": list(retrieval_index_run_ids),
             "candidate_limit": limit,
+            "apply_document_filter": filtered_document_ids is not None,
+            "document_ids": list(filtered_document_ids or ()),
         }
-        if filtered_document_ids is not None:
-            document_filter_sql = "AND assets.document_id = ANY(CAST(:document_ids AS uuid[]))"
-            params["document_ids"] = list(filtered_document_ids)
-        query_sql = f"""
+        query_sql = """
             WITH candidate_assets AS (
                 SELECT
                     assets.id,
@@ -1445,7 +1455,10 @@ class RetrievalService:
                 FROM retrieval_passage_assets assets
                 WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
                   AND assets.embedding IS NOT NULL
-                  {document_filter_sql}
+                  AND (
+                      :apply_document_filter = false
+                      OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
+                  )
                 ORDER BY assets.embedding <=> CAST(:query_embedding AS vector), assets.passage_id
                 LIMIT :candidate_limit
             )
@@ -1479,7 +1492,7 @@ class RetrievalService:
             JOIN ingest_jobs jobs
                 ON jobs.id = runs.ingest_job_id
             ORDER BY assets.embedding <=> CAST(:query_embedding AS vector), passages.id
-            """  # nosec B608
+            """
         rows = (
             connection.execute(
                 text(query_sql),
@@ -1499,16 +1512,14 @@ class RetrievalService:
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         limit: int,
     ) -> list[_Candidate]:
-        document_filter_sql = ""
         params: dict[str, object] = {
             "query": query,
             "retrieval_index_run_ids": list(retrieval_index_run_ids),
             "candidate_limit": limit,
+            "apply_document_filter": filtered_document_ids is not None,
+            "document_ids": list(filtered_document_ids or ()),
         }
-        if filtered_document_ids is not None:
-            document_filter_sql = "AND assets.document_id = ANY(CAST(:document_ids AS uuid[]))"
-            params["document_ids"] = list(filtered_document_ids)
-        query_sql = f"""
+        query_sql = """
             WITH candidate_assets AS (
                 SELECT
                     assets.id,
@@ -1522,7 +1533,10 @@ class RetrievalService:
                 FROM retrieval_table_assets assets
                 WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
                   AND assets.search_tsvector @@ websearch_to_tsquery('english', :query)
-                  {document_filter_sql}
+                  AND (
+                      :apply_document_filter = false
+                      OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
+                  )
                 ORDER BY rank_score DESC, assets.table_id
                 LIMIT :candidate_limit
             )
@@ -1558,7 +1572,7 @@ class RetrievalService:
             JOIN ingest_jobs jobs
                 ON jobs.id = runs.ingest_job_id
             ORDER BY candidate_assets.rank_score DESC, tables.id
-            """  # nosec B608
+            """
         rows = (
             connection.execute(
                 text(query_sql),

@@ -549,23 +549,36 @@ class DeterministicIngestProcessor:
         *,
         for_update: bool = False,
     ) -> IngestJobRow | None:
-        for_update_sql = "FOR UPDATE" if for_update else ""
+        base_query = """
+            SELECT
+                id,
+                document_id,
+                source_artifact_id,
+                created_at,
+                status,
+                COALESCE(warnings, '[]'::jsonb) AS warnings
+            FROM ingest_jobs
+            WHERE id = :ingest_job_id
+        """
+        query_text = (
+            """
+            SELECT
+                id,
+                document_id,
+                source_artifact_id,
+                created_at,
+                status,
+                COALESCE(warnings, '[]'::jsonb) AS warnings
+            FROM ingest_jobs
+            WHERE id = :ingest_job_id
+            FOR UPDATE
+            """
+            if for_update
+            else base_query
+        )
         row = (
             connection.execute(
-                text(
-                    f"""
-                    SELECT
-                        id,
-                        document_id,
-                        source_artifact_id,
-                        created_at,
-                        status,
-                        COALESCE(warnings, '[]'::jsonb) AS warnings
-                    FROM ingest_jobs
-                    WHERE id = :ingest_job_id
-                    {for_update_sql}
-                    """  # nosec B608
-                ),
+                text(query_text),
                 {"ingest_job_id": ingest_job_id},
             )
             .mappings()
