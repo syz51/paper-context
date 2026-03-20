@@ -36,6 +36,8 @@ Behavior:
 - dense search runs over passage embeddings in `retrieval_passage_assets`
 - final results return canonical `body_text`, not contextualized text
 - pagination is cursor-based and tied to query, filters, and index version
+- exact page retrieval certifies the fused shortlist needed for the requested cursor window before reranking
+- exact page retrieval advances sparse and dense candidate streams incrementally instead of refetching widened prefixes
 
 ## Table Retrieval
 
@@ -54,10 +56,13 @@ Behavior:
 - dense search uses table embeddings in `retrieval_table_assets`
 - result previews are bounded row samples, not the full table body
 - `get_table` is the follow-up call for full structured rows
+- exact page retrieval uses the same shortlist certification and incremental candidate expansion rules as passages
 
 ## Fusion And Reranking
 
 Sparse and dense candidates are fused and deduplicated before reranking. Result provenance preserves whether an item matched through sparse, dense, or both modes.
+
+For exact paginated search, the service first certifies the fused shortlist required for the current cursor offset and page size, then reranks that shortlist once. This keeps the default path exact without reranking every widened prefix.
 
 Default model settings:
 
@@ -74,6 +79,7 @@ Rules:
 
 - results in one response must not mix index versions
 - result cursors are bound to the index version that produced them
+- paginated cursors are opaque and carry the next absolute offset for exact replay of the requested window
 - a revision can have multiple historical runs, but one active run
 - changing model or chunking policy requires a new run and versioned activation
 

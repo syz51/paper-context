@@ -24,6 +24,7 @@ The MVP implementation is complete enough to shift the roadmap from phase delive
 - table queries return structured table hits when relevant
 - context packs remain bounded and provenance-rich
 - one result page or pack never mixes index versions
+- exact paginated retrieval certifies and reranks only the shortlist needed for the requested page window
 
 ### Interface stability
 
@@ -50,6 +51,7 @@ The next tranche of work is not “build the MVP.” It is tightening the implem
 - improve observability around queue lag, ingest timings, and retrieval timings
 - harden self-hosted deployment defaults and runbook guidance
 - expand regression coverage around revision retention and replacement edge cases
+- keep deep-pagination and shortlist-certification regressions covered as retrieval evolves
 - tighten documentation and operator workflows for recovery and troubleshooting
 
 ## Still Intentionally Minimal

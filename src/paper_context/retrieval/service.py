@@ -4,7 +4,7 @@ import json
 import logging
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -282,6 +282,17 @@ class _Candidate:
 class _ActiveRunSelection:
     run_ids: tuple[uuid.UUID, ...]
     index_versions: tuple[str, ...]
+
+
+@dataclass
+class _CandidateExpansionState:
+    candidates: dict[uuid.UUID, _Candidate] = field(default_factory=dict)
+    sparse_count: int = 0
+    dense_count: int = 0
+    sparse_exhausted: bool = False
+    dense_exhausted: bool = False
+    sparse_entities: set[uuid.UUID] = field(default_factory=set)
+    dense_entities: set[uuid.UUID] = field(default_factory=set)
 
 
 class DocumentRetrievalIndexer:
@@ -1434,6 +1445,24 @@ class RetrievalService:
             limit = max(limit, result_limit * 8)
         return limit
 
+    def _candidate_window_sql(
+        self,
+        *,
+        params: dict[str, object],
+        limit: int | None,
+        offset: int,
+    ) -> str:
+        clauses: list[str] = []
+        if limit is not None:
+            params["candidate_limit"] = limit
+            clauses.append("LIMIT :candidate_limit")
+        if offset > 0:
+            params["candidate_offset"] = offset
+            clauses.append("OFFSET :candidate_offset")
+        if not clauses:
+            return ""
+        return "\n                " + "\n                ".join(clauses)
+
     def _search_passages_with_connection(
         self,
         connection: Connection,
@@ -1538,6 +1567,112 @@ class RetrievalService:
         active_runs: _ActiveRunSelection,
         fingerprint: str,
     ) -> SearchPage[PassageResult]:
+        cursor_offset = self._page_cursor_offset(
+            cursor=cursor,
+            kind="passages",
+            fingerprint=fingerprint,
+        )
+        if cursor is not None and cursor_offset is None:
+            return self._search_passages_page_legacy_with_connection(
+                connection,
+                query=query,
+                filters=filters,
+                cursor=cursor,
+                limit=limit,
+                filtered_document_ids=filtered_document_ids,
+                active_runs=active_runs,
+                fingerprint=fingerprint,
+            )
+        candidates = self._load_certified_page_candidates(
+            connection,
+            query=query,
+            limit=limit,
+            cursor_offset=cursor_offset or 0,
+            filtered_document_ids=filtered_document_ids,
+            active_runs=active_runs,
+            sparse_base_limit=PASSAGE_SPARSE_CANDIDATES,
+            dense_base_limit=PASSAGE_DENSE_CANDIDATES,
+            load_sparse_candidates=self._load_sparse_passage_candidates,
+            load_dense_candidates=self._load_dense_passage_candidates,
+        )
+        results = tuple(self._candidate_to_passage_result(candidate) for candidate in candidates)
+        return cast(
+            SearchPage[PassageResult],
+            self._paginate_ranked_results(
+                kind="passages",
+                results=results,
+                limit=limit,
+                cursor=cursor,
+                active_runs=active_runs,
+                fingerprint=fingerprint,
+            ),
+        )
+
+    def _search_tables_page_with_connection(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        filters: RetrievalFilters,
+        cursor: str | None,
+        limit: int,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        active_runs: _ActiveRunSelection,
+        fingerprint: str,
+    ) -> SearchPage[TableResult]:
+        cursor_offset = self._page_cursor_offset(
+            cursor=cursor,
+            kind="tables",
+            fingerprint=fingerprint,
+        )
+        if cursor is not None and cursor_offset is None:
+            return self._search_tables_page_legacy_with_connection(
+                connection,
+                query=query,
+                filters=filters,
+                cursor=cursor,
+                limit=limit,
+                filtered_document_ids=filtered_document_ids,
+                active_runs=active_runs,
+                fingerprint=fingerprint,
+            )
+        candidates = self._load_certified_page_candidates(
+            connection,
+            query=query,
+            limit=limit,
+            cursor_offset=cursor_offset or 0,
+            filtered_document_ids=filtered_document_ids,
+            active_runs=active_runs,
+            sparse_base_limit=TABLE_SPARSE_CANDIDATES,
+            dense_base_limit=TABLE_DENSE_CANDIDATES,
+            load_sparse_candidates=self._load_sparse_table_candidates,
+            load_dense_candidates=self._load_dense_table_candidates,
+        )
+        results = tuple(self._candidate_to_table_result(candidate) for candidate in candidates)
+        return cast(
+            SearchPage[TableResult],
+            self._paginate_ranked_results(
+                kind="tables",
+                results=results,
+                limit=limit,
+                cursor=cursor,
+                active_runs=active_runs,
+                fingerprint=fingerprint,
+            ),
+        )
+
+    def _search_passages_page_legacy_with_connection(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        filters: RetrievalFilters,
+        cursor: str | None,
+        limit: int,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        active_runs: _ActiveRunSelection,
+        fingerprint: str,
+    ) -> SearchPage[PassageResult]:
         sparse_limit = self._initial_sparse_candidate_limit(
             base_limit=PASSAGE_SPARSE_CANDIDATES,
             result_limit=limit,
@@ -1589,7 +1724,7 @@ class RetrievalService:
             if self._embedding_client is not None and not dense_exhausted:
                 dense_limit *= 2
 
-    def _search_tables_page_with_connection(
+    def _search_tables_page_legacy_with_connection(
         self,
         connection: Connection,
         *,
@@ -1729,6 +1864,185 @@ class RetrievalService:
             len(sparse_candidates),
             len(dense_candidates),
         )
+
+    def _load_certified_page_candidates(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        limit: int,
+        cursor_offset: int,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        active_runs: _ActiveRunSelection,
+        sparse_base_limit: int,
+        dense_base_limit: int,
+        load_sparse_candidates: Callable[..., list[_Candidate]],
+        load_dense_candidates: Callable[..., list[_Candidate]],
+    ) -> list[_Candidate]:
+        if not query.strip() or filtered_document_ids == () or not active_runs.run_ids:
+            return []
+        target_count = max(0, cursor_offset + limit) + 1
+        sparse_batch_limit = self._initial_sparse_candidate_limit(
+            base_limit=sparse_base_limit,
+            result_limit=limit,
+        )
+        dense_batch_limit = self._initial_dense_candidate_limit(
+            base_limit=dense_base_limit,
+            result_limit=limit,
+            filtered_document_ids=filtered_document_ids,
+        )
+        state = _CandidateExpansionState(dense_exhausted=self._embedding_client is None)
+        while True:
+            if not state.sparse_exhausted:
+                state.sparse_exhausted = self._expand_candidate_stream(
+                    connection,
+                    query=query,
+                    active_runs=active_runs,
+                    filtered_document_ids=filtered_document_ids,
+                    state=state,
+                    mode="sparse",
+                    batch_limit=sparse_batch_limit,
+                    loader=load_sparse_candidates,
+                )
+                if not state.sparse_exhausted:
+                    sparse_batch_limit *= 2
+            if not state.dense_exhausted:
+                state.dense_exhausted = self._expand_candidate_stream(
+                    connection,
+                    query=query,
+                    active_runs=active_runs,
+                    filtered_document_ids=filtered_document_ids,
+                    state=state,
+                    mode="dense",
+                    batch_limit=dense_batch_limit,
+                    loader=load_dense_candidates,
+                )
+                if not state.dense_exhausted:
+                    dense_batch_limit *= 2
+            shortlist = self._certify_fused_shortlist(state=state, target_count=target_count)
+            if shortlist is not None:
+                return self._rerank_candidates(query=query, candidates=shortlist, limit=None)
+            if state.sparse_exhausted and state.dense_exhausted:
+                return self._rerank_candidates(
+                    query=query,
+                    candidates=self._ordered_fused_candidates(state.candidates.values()),
+                    limit=None,
+                )
+
+    def _expand_candidate_stream(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        active_runs: _ActiveRunSelection,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        state: _CandidateExpansionState,
+        mode: Literal["sparse", "dense"],
+        batch_limit: int,
+        loader: Callable[..., list[_Candidate]],
+    ) -> bool:
+        offset = state.sparse_count if mode == "sparse" else state.dense_count
+        batch = loader(
+            connection,
+            query=query,
+            retrieval_index_run_ids=active_runs.run_ids,
+            filtered_document_ids=filtered_document_ids,
+            limit=batch_limit,
+            offset=offset,
+        )
+        self._merge_candidate_batch(
+            state=state,
+            mode=mode,
+            offset=offset,
+            batch=batch,
+        )
+        returned = len(batch)
+        if mode == "sparse":
+            state.sparse_count += returned
+        else:
+            state.dense_count += returned
+        return returned < batch_limit
+
+    def _merge_candidate_batch(
+        self,
+        *,
+        state: _CandidateExpansionState,
+        mode: Literal["sparse", "dense"],
+        offset: int,
+        batch: list[_Candidate],
+    ) -> None:
+        seen_entities = state.sparse_entities if mode == "sparse" else state.dense_entities
+        for rank, candidate in enumerate(batch, start=offset + 1):
+            stored = state.candidates.get(candidate.entity_id)
+            if stored is None:
+                candidate.retrieval_modes = set()
+                candidate.fused_score = 0.0
+                candidate.score = 0.0
+                state.candidates[candidate.entity_id] = candidate
+                stored = candidate
+            if candidate.entity_id in seen_entities:
+                continue
+            seen_entities.add(candidate.entity_id)
+            stored.retrieval_modes.add(mode)
+            stored.fused_score += self._rrf_rank_score(rank)
+
+    def _certify_fused_shortlist(
+        self,
+        *,
+        state: _CandidateExpansionState,
+        target_count: int,
+    ) -> list[_Candidate] | None:
+        if target_count <= 0:
+            return []
+        ordered = self._ordered_fused_candidates(state.candidates.values())
+        if state.sparse_exhausted and state.dense_exhausted:
+            return ordered[:target_count]
+        if len(ordered) < target_count:
+            return None
+        shortlist = ordered[:target_count]
+        boundary_score = shortlist[-1].fused_score
+        if self._unseen_fused_score_upper_bound(state=state) >= boundary_score:
+            return None
+        for candidate in ordered[target_count:]:
+            if self._candidate_fused_score_upper_bound(candidate=candidate, state=state) >= (
+                boundary_score
+            ):
+                return None
+        return shortlist
+
+    def _ordered_fused_candidates(self, candidates: Iterable[_Candidate]) -> list[_Candidate]:
+        return sorted(
+            candidates,
+            key=lambda candidate: (-candidate.fused_score, str(candidate.entity_id)),
+        )
+
+    def _candidate_fused_score_upper_bound(
+        self,
+        *,
+        candidate: _Candidate,
+        state: _CandidateExpansionState,
+    ) -> float:
+        upper_bound = candidate.fused_score
+        if not state.sparse_exhausted and "sparse" not in candidate.retrieval_modes:
+            upper_bound += self._rrf_rank_score(state.sparse_count + 1)
+        if not state.dense_exhausted and "dense" not in candidate.retrieval_modes:
+            upper_bound += self._rrf_rank_score(state.dense_count + 1)
+        return upper_bound
+
+    def _unseen_fused_score_upper_bound(
+        self,
+        *,
+        state: _CandidateExpansionState,
+    ) -> float:
+        upper_bound = 0.0
+        if not state.sparse_exhausted:
+            upper_bound += self._rrf_rank_score(state.sparse_count + 1)
+        if not state.dense_exhausted:
+            upper_bound += self._rrf_rank_score(state.dense_count + 1)
+        return upper_bound
+
+    def _rrf_rank_score(self, rank: int) -> float:
+        return 1 / (RRF_K + rank)
 
     def _resolve_active_run_selection(
         self,
@@ -1923,6 +2237,7 @@ class RetrievalService:
         retrieval_index_run_ids: tuple[uuid.UUID, ...],
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         limit: int | None,
+        offset: int = 0,
     ) -> list[_Candidate]:
         params: dict[str, object] = {
             "query": query,
@@ -1930,10 +2245,7 @@ class RetrievalService:
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
         }
-        limit_sql = ""
-        if limit is not None:
-            params["candidate_limit"] = limit
-            limit_sql = "\n                LIMIT :candidate_limit"
+        limit_sql = self._candidate_window_sql(params=params, limit=limit, offset=offset)
         query_sql = """
             WITH candidate_assets AS (
                 SELECT
@@ -2015,6 +2327,7 @@ class RetrievalService:
         retrieval_index_run_ids: tuple[uuid.UUID, ...],
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         limit: int | None,
+        offset: int = 0,
     ) -> list[_Candidate]:
         if self._embedding_client is None:
             return []
@@ -2037,10 +2350,9 @@ class RetrievalService:
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
             "candidate_limit": limit,
+            "candidate_offset": offset,
         }
-        limit_sql = ""
-        if limit is not None:
-            limit_sql = "\n                LIMIT :candidate_limit"
+        limit_sql = self._candidate_window_sql(params=params, limit=limit, offset=offset)
         self._configure_dense_vector_search(
             connection,
             candidate_limit=limit,
@@ -2184,6 +2496,7 @@ class RetrievalService:
                             ON jobs.id = runs.ingest_job_id
                         ORDER BY filtered_assets.dense_score DESC, passages.id
                         LIMIT COALESCE(CAST(:candidate_limit AS integer), 2147483647)
+                        OFFSET CAST(:candidate_offset AS integer)
                         """
                     ),
                     params,
@@ -2202,6 +2515,7 @@ class RetrievalService:
         retrieval_index_run_ids: tuple[uuid.UUID, ...],
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         limit: int | None,
+        offset: int = 0,
     ) -> list[_Candidate]:
         params: dict[str, object] = {
             "query": query,
@@ -2209,10 +2523,7 @@ class RetrievalService:
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
         }
-        limit_sql = ""
-        if limit is not None:
-            params["candidate_limit"] = limit
-            limit_sql = "\n                LIMIT :candidate_limit"
+        limit_sql = self._candidate_window_sql(params=params, limit=limit, offset=offset)
         query_sql = """
             WITH candidate_assets AS (
                 SELECT
@@ -2296,6 +2607,7 @@ class RetrievalService:
         retrieval_index_run_ids: tuple[uuid.UUID, ...],
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         limit: int | None,
+        offset: int = 0,
     ) -> list[_Candidate]:
         if self._embedding_client is None:
             return []
@@ -2322,10 +2634,9 @@ class RetrievalService:
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
             "candidate_limit": limit,
+            "candidate_offset": offset,
         }
-        limit_sql = ""
-        if limit is not None:
-            limit_sql = "\n                LIMIT :candidate_limit"
+        limit_sql = self._candidate_window_sql(params=params, limit=limit, offset=offset)
         self._configure_dense_vector_search(
             connection,
             candidate_limit=limit,
@@ -2475,6 +2786,7 @@ class RetrievalService:
                             ON jobs.id = runs.ingest_job_id
                         ORDER BY filtered_assets.dense_score DESC, tables.id
                         LIMIT COALESCE(CAST(:candidate_limit AS integer), 2147483647)
+                        OFFSET CAST(:candidate_offset AS integer)
                         """
                     ),
                     params,
@@ -2995,6 +3307,28 @@ class RetrievalService:
             )
         return next(iter(versions))
 
+    def _page_cursor_offset(
+        self,
+        *,
+        cursor: str | None,
+        kind: str,
+        fingerprint: str,
+    ) -> int | None:
+        if cursor is None:
+            return 0
+        try:
+            payload = decode_cursor(cursor)
+        except CursorError as exc:
+            raise RetrievalError(str(exc)) from exc
+        if payload.get("kind") != kind or payload.get("fingerprint") != fingerprint:
+            raise RetrievalError("cursor does not match request")
+        offset = payload.get("offset")
+        if offset is None:
+            return None
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise RetrievalError("cursor offset is invalid")
+        return offset
+
     def _paginate_ranked_results(
         self,
         *,
@@ -3023,17 +3357,27 @@ class RetrievalService:
             cursor_version = payload.get("index_version")
             if cursor_version != index_version:
                 raise RetrievalError("cursor index version is no longer active")
-            cursor_score = float(payload["score"])
-            cursor_entity_id = str(payload["entity_id"])
-            start_index = len(ordered)
-            for index, result in enumerate(ordered):
-                result_score = result.score
-                result_entity_id = self._result_identity(result)
-                if result_score < cursor_score or (
-                    result_score == cursor_score and result_entity_id > cursor_entity_id
+            cursor_offset = payload.get("offset")
+            if cursor_offset is not None:
+                if (
+                    not isinstance(cursor_offset, int)
+                    or isinstance(cursor_offset, bool)
+                    or cursor_offset < 0
                 ):
-                    start_index = index
-                    break
+                    raise RetrievalError("cursor offset is invalid")
+                start_index = min(cursor_offset, len(ordered))
+            else:
+                cursor_score = float(payload["score"])
+                cursor_entity_id = str(payload["entity_id"])
+                start_index = len(ordered)
+                for index, result in enumerate(ordered):
+                    result_score = result.score
+                    result_entity_id = self._result_identity(result)
+                    if result_score < cursor_score or (
+                        result_score == cursor_score and result_entity_id > cursor_entity_id
+                    ):
+                        start_index = index
+                        break
 
         page_items = ordered[start_index : start_index + max(0, limit)]
         next_cursor: str | None = None
@@ -3044,6 +3388,7 @@ class RetrievalService:
                     "kind": kind,
                     "fingerprint": fingerprint,
                     "index_version": index_version,
+                    "offset": start_index + len(page_items),
                     "score": repr(last_result.score),
                     "entity_id": self._result_identity(last_result),
                 }

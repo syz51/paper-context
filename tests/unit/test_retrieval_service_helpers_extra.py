@@ -14,6 +14,7 @@ from paper_context.retrieval.service import (
     _ActiveRunSelection,
     _build_table_preview,
     _Candidate,
+    _CandidateExpansionState,
     _dedupe_modes_from_results,
     _dedupe_warnings,
     _json_dumps,
@@ -651,6 +652,64 @@ def test_rerank_helpers_handle_empty_and_bad_indexes() -> None:
     bad_service = _service(reranker_client=_StubRerankerClient([[RerankItem(index=9, score=1.0)]]))
     with pytest.raises(RetrievalError, match="out-of-range candidate index"):
         bad_service._rerank_candidates(query="query", candidates=[candidate], limit=1)
+
+
+def test_certify_fused_shortlist_stops_before_sparse_exhaustion_when_boundary_is_safe() -> None:
+    service = _service(reranker_client=None)
+    run_id = uuid4()
+    state = _CandidateExpansionState(dense_exhausted=True)
+    batch = [
+        _passage_candidate(
+            entity_id=UUID(int=index + 1),
+            retrieval_index_run_id=run_id,
+            index_version="mvp-v1",
+            text=f"candidate-{index}",
+            modes={"sparse"},
+        )
+        for index in range(8)
+    ]
+
+    service._merge_candidate_batch(state=state, mode="sparse", offset=0, batch=batch)
+    state.sparse_count = len(batch)
+
+    shortlist = service._certify_fused_shortlist(state=state, target_count=3)
+
+    assert shortlist is not None
+    assert [candidate.entity_id for candidate in shortlist] == [
+        UUID(int=1),
+        UUID(int=2),
+        UUID(int=3),
+    ]
+
+
+def test_certify_fused_shortlist_waits_when_partial_candidate_can_still_enter() -> None:
+    service = _service(reranker_client=None)
+    run_id = uuid4()
+    state = _CandidateExpansionState()
+    sparse_batch = [
+        _passage_candidate(
+            entity_id=UUID(int=index + 1),
+            retrieval_index_run_id=run_id,
+            index_version="mvp-v1",
+            text=f"sparse-{index}",
+            modes={"sparse"},
+        )
+        for index in range(3)
+    ]
+    dense_only = _passage_candidate(
+        entity_id=UUID(int=10),
+        retrieval_index_run_id=run_id,
+        index_version="mvp-v1",
+        text="dense-only",
+        modes={"dense"},
+    )
+
+    service._merge_candidate_batch(state=state, mode="sparse", offset=0, batch=sparse_batch)
+    state.sparse_count = len(sparse_batch)
+    service._merge_candidate_batch(state=state, mode="dense", offset=0, batch=[dense_only])
+    state.dense_count = 1
+
+    assert service._certify_fused_shortlist(state=state, target_count=2) is None
 
 
 def test_row_and_result_conversions_round_trip() -> None:
