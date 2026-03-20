@@ -132,11 +132,16 @@ class _CrashOnceProcessor(DeterministicIngestProcessor):
         return section_ids
 
 
-def _live_pdf_path() -> Path:
-    configured = os.environ.get("PAPER_CONTEXT_E2E_PDF_PATH", "~/Downloads/attention.pdf")
-    pdf_path = Path(configured).expanduser()
+def _integration_pdf_path() -> Path:
+    configured = os.environ.get("PAPER_CONTEXT_E2E_PDF_PATH")
+    if configured:
+        pdf_path = Path(configured).expanduser()
+    else:
+        pdf_path = (
+            Path(__file__).resolve().parents[1] / "fixtures" / "pdfs" / "attention-integration.pdf"
+        )
     if not pdf_path.is_file():
-        pytest.skip(f"live PDF fixture not found at {pdf_path}")
+        pytest.fail(f"integration PDF fixture not found at {pdf_path}")
     return pdf_path
 
 
@@ -383,14 +388,14 @@ def test_enqueue_document_rolls_back_when_queue_write_fails(
     assert ingest_job_count == 0
 
 
-def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_pdf(
+def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_pdf(
     monkeypatch: pytest.MonkeyPatch,
     migrated_postgres_engine,
     migrated_postgres_url: str,
     unique_queue_name: str,
     tmp_path: Path,
 ) -> None:
-    pdf_path = _live_pdf_path()
+    pdf_path = _integration_pdf_path()
     storage_root = tmp_path / "artifacts"
 
     monkeypatch.setenv("PAPER_CONTEXT_DATABASE__URL", migrated_postgres_url)
@@ -570,6 +575,9 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_live_
         assert retrieval_index["is_active"] is True
         assert retrieval_index["parser_source"] in {"docling", "pdfplumber"}
         assert primary_artifact["parser"] == retrieval_index["parser_source"]
+        assert (
+            source_artifact["storage_ref"] == f"documents/{document_id}/{ingest_job_id}/source.pdf"
+        )
         assert list_response.status_code == 200
         assert any(
             item["document_id"] == str(document_id) for item in list_response.json()["documents"]
