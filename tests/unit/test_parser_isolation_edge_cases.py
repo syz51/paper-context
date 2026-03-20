@@ -95,6 +95,30 @@ def test_subprocess_parser_stops_after_exceeding_output_limit(
     assert "output limit" in (result.failure_message or "")
 
 
+def test_run_parser_subprocess_bounds_flooded_stdout_and_stderr() -> None:
+    code = (
+        "import os\n"
+        "stdout_chunk = b'o' * 4096\n"
+        "stderr_chunk = b'e' * 4096\n"
+        "for _ in range(2048):\n"
+        "    os.write(1, stdout_chunk)\n"
+        "    os.write(2, stderr_chunk)\n"
+    )
+
+    result = parser_isolation._run_parser_subprocess(
+        [sys.executable, "-c", code],
+        timeout_seconds=10,
+        output_limit_bytes=128 * 1024,
+        preexec_fn=None,
+    )
+
+    assert result.timed_out is False
+    assert result.output_limit_exceeded is True
+    assert len(result.stdout) + len(result.stderr) == 128 * 1024
+    assert result.stdout
+    assert result.stderr
+
+
 def test_build_pdf_parser_and_create_inprocess_parser_branches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

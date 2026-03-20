@@ -2400,3 +2400,159 @@ def test_detail_helpers_require_active_retrieval_provenance(
 
     assert service.get_table(table_id=table_id) is None
     assert service.get_passage_context(passage_id=passage_id) is None
+
+
+def test_default_read_paths_handle_large_sections_and_table_payloads(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    selected_passage_id = uuid4()
+    sibling_passage_id = uuid4()
+    table_id = uuid4()
+    ingest_job_id = uuid4()
+
+    selected_text = "Selected large payload section. " + ("alpha " * 12_000)
+    sibling_text = "Sibling large payload section. " + ("beta " * 10_000)
+    headers_json: list[object] = [f"Header {index} " + ("H" * 128) for index in range(4)]
+    rows_json: list[list[object]] = [
+        [f"row-{row}-col-{column}-" + ("X" * 256) for column in range(4)] for row in range(40)
+    ]
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Large payload paper",
+            created_at=now,
+            updated_at=now,
+        )
+        _insert_revisioned_job(
+            connection,
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            trigger="upload",
+            warnings=["parser_fallback_used"],
+            created_at=now,
+        )
+        _insert_revisioned_section(
+            connection,
+            section_id=section_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            heading="Results",
+            heading_path=["Results", "Large payload section"],
+            page_start=10,
+            page_end=12,
+        )
+        _insert_revisioned_passage(
+            connection,
+            passage_id=selected_passage_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            section_id=section_id,
+            chunk_ordinal=1,
+            body_text=selected_text,
+            contextualized_text=selected_text,
+            token_count=8_000,
+            page_start=10,
+            page_end=11,
+            provenance_offsets={"pages": [10, 11], "charspans": [[0, len(selected_text)]]},
+        )
+        _insert_revisioned_passage(
+            connection,
+            passage_id=sibling_passage_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            section_id=section_id,
+            chunk_ordinal=2,
+            body_text=sibling_text,
+            contextualized_text=sibling_text,
+            token_count=7_000,
+            page_start=11,
+            page_end=12,
+            provenance_offsets={"pages": [11, 12], "charspans": [[0, len(sibling_text)]]},
+        )
+        _insert_revisioned_table(
+            connection,
+            table_id=table_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            section_id=section_id,
+            caption="Large payload table",
+            headers_json=headers_json,
+            rows_json=rows_json,
+            page_start=12,
+            page_end=12,
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        _insert_passage_asset(
+            connection,
+            run_id=run_id,
+            revision_id=revision_id,
+            passage_id=selected_passage_id,
+            document_id=document_id,
+            section_id=section_id,
+            publication_year=None,
+            search_text="large payload keyword selected section",
+            embedding=_vector_string(0),
+        )
+        _insert_table_asset(
+            connection,
+            run_id=run_id,
+            revision_id=revision_id,
+            table_id=table_id,
+            document_id=document_id,
+            section_id=section_id,
+            publication_year=None,
+            search_text="large payload keyword table",
+        )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+    )
+
+    table = service.get_table(table_id=table_id)
+    context = service.get_passage_context(
+        passage_id=selected_passage_id,
+        before=0,
+        after=1,
+    )
+    pack = service.build_context_pack(query="large payload keyword", limit=8)
+
+    assert table is not None
+    assert table.headers == tuple(headers_json)
+    assert table.row_count == len(rows_json)
+    assert len(table.rows) == len(rows_json)
+    assert table.rows[0] == tuple(rows_json[0])
+    assert table.rows[-1] == tuple(rows_json[-1])
+
+    assert context is not None
+    assert context.passage.text == selected_text
+    assert [item.text for item in context.context_passages] == [selected_text, sibling_text]
+    assert context.warnings == ("parser_fallback_used",)
+
+    assert [item.text for item in pack.passages] == [selected_text]
+    assert pack.tables[0].preview.row_count == len(rows_json)
+    assert pack.tables[0].preview.rows == tuple(tuple(row) for row in rows_json[:3])
+    assert [item.text for item in pack.parent_sections[0].supporting_passages] == [
+        selected_text,
+        sibling_text,
+    ]
+    assert pack.provenance.active_index_version == "mvp-v2"

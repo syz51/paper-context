@@ -1126,6 +1126,154 @@ def test_failed_replacement_reactivates_previous_ready_revision(
     assert revisions[1]["status"] == "failed"
 
 
+def test_failed_replacement_restores_latest_ready_revision_when_active_pointer_is_missing(
+    migrated_postgres_engine,
+    unique_queue_name: str,
+    tmp_path: Path,
+) -> None:
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            text("SELECT pgmq.create(:queue_name)"),
+            {"queue_name": unique_queue_name},
+        )
+
+    queue = IngestionQueue(unique_queue_name)
+    storage_root = tmp_path / "artifacts"
+    initial = _create_uploaded_document(
+        migrated_postgres_engine,
+        queue,
+        storage_root,
+        title="Original upload title",
+    )
+    initial_processor, _, _ = _build_processor(
+        storage_root,
+        primary_result=_make_parser_result(
+            parsed_document=_make_parsed_document(
+                title="Original parsed title",
+                paragraph_text="Original ready revision text for failure recovery.",
+            )
+        ),
+    )
+    handled_initial = _make_worker(
+        migrated_postgres_engine,
+        queue,
+        initial_processor,
+        vt_seconds=1,
+    ).run_once()
+
+    assert handled_initial is not None
+    assert handled_initial.payload.ingest_job_id == initial.ingest_job_id
+
+    service = DocumentsApiService(
+        engine=migrated_postgres_engine,
+        queue=queue,
+        storage=LocalFilesystemStorage(storage_root),
+        max_upload_bytes=5 * 1024 * 1024,
+    )
+    replacement = service.replace_document(
+        initial.document_id,
+        filename="replacement.pdf",
+        content_type="application/pdf",
+        upload=BytesIO(b"%PDF-1.4\nreplacement"),
+        title="Replacement upload title",
+    )
+
+    with migrated_postgres_engine.begin() as connection:
+        initial_revision_id = connection.execute(
+            text(
+                """
+                SELECT id
+                FROM document_revisions
+                WHERE document_id = :document_id
+                  AND revision_number = 1
+                """
+            ),
+            {"document_id": initial.document_id},
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                UPDATE documents
+                SET active_revision_id = NULL
+                WHERE id = :document_id
+                """
+            ),
+            {"document_id": initial.document_id},
+        )
+
+    replacement_processor, _, _ = _build_processor(
+        storage_root,
+        primary_result=_make_parser_result("fail", parser_name="docling"),
+    )
+    handled_replacement = _make_worker(
+        migrated_postgres_engine,
+        queue,
+        replacement_processor,
+        vt_seconds=1,
+    ).run_once()
+
+    assert handled_replacement is not None
+    assert handled_replacement.payload.ingest_job_id == replacement.ingest_job_id
+
+    with migrated_postgres_engine.begin() as connection:
+        document = (
+            connection.execute(
+                text(
+                    """
+                    SELECT title, current_status, active_revision_id
+                    FROM documents
+                    WHERE id = :document_id
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .one()
+        )
+        revisions = (
+            connection.execute(
+                text(
+                    """
+                    SELECT revision_number, status, title, activated_at, superseded_at
+                    FROM document_revisions
+                    WHERE document_id = :document_id
+                    ORDER BY revision_number
+                    """
+                ),
+                {"document_id": initial.document_id},
+            )
+            .mappings()
+            .all()
+        )
+        replacement_job = (
+            connection.execute(
+                text(
+                    """
+                    SELECT status, failure_code
+                    FROM ingest_jobs
+                    WHERE id = :ingest_job_id
+                    """
+                ),
+                {"ingest_job_id": replacement.ingest_job_id},
+            )
+            .mappings()
+            .one()
+        )
+
+    assert replacement_job["status"] == "failed"
+    assert replacement_job["failure_code"] == "docling_failed"
+    assert document["current_status"] == "ready"
+    assert document["active_revision_id"] == initial_revision_id
+    assert document["title"] == "Original parsed title"
+    assert revisions[0]["revision_number"] == 1
+    assert revisions[0]["status"] == "ready"
+    assert revisions[0]["title"] == "Original parsed title"
+    assert revisions[0]["activated_at"] is not None
+    assert revisions[0]["superseded_at"] is None
+    assert revisions[1]["revision_number"] == 2
+    assert revisions[1]["status"] == "failed"
+
+
 def test_replay_after_parser_artifact_crash_is_idempotent(
     migrated_postgres_engine,
     unique_queue_name: str,
