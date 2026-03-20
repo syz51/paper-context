@@ -1,78 +1,51 @@
-# APIs and Tools
+# APIs And Tools
 
-> **Default:** FastAPI owns operational HTTP endpoints and FastMCP owns the agent-facing tool surface. Downstream workflows should prefer `build_context_pack` over raw retrieval primitives.
+FastAPI owns operational HTTP routes. FastMCP owns the agent-facing retrieval surface. The codebase does not expose retrieval over plain REST today; retrieval is intentionally concentrated in MCP.
 
-This document defines the external interfaces for the MVP. For retrieval semantics and output provenance rules, see [Retrieval](./retrieval.md).
-
-## FastAPI endpoints
+## FastAPI
 
 ### `POST /documents`
 
-Upload a PDF and create an ingest job.
+Creates a new logical document and its first revision.
+
+Input:
+
+- multipart `file`
+- optional form `title`
 
 Returns:
 
 - `document_id`
 - `ingest_job_id`
-- initial status
-
-### `GET /documents`
-
-List documents with pagination and lightweight metadata.
-
-### `GET /documents/{document_id}`
-
-Return one document record, including current ingest status and active index-version metadata.
-
-### `GET /documents/{document_id}/outline`
-
-Return the section tree for the document.
-
-### `GET /documents/{document_id}/tables`
-
-Return tables for the document with captions, page spans, and preview data.
-
-### `GET /ingest-jobs/{ingest_job_id}`
-
-Return job status, warnings, and failure information.
+- `status`
 
 ### `POST /documents/{document_id}/replace`
 
-Replace the source PDF and trigger a new ingest job.
+Creates a new revision for an existing document and enqueues a replacement ingest job.
 
-## FastMCP tools
+Input:
 
-### `search_documents(query, filters, cursor)`
+- multipart `file`
+- optional form `title`
 
-Use when the caller needs document-level narrowing before passage or table retrieval.
+Returns:
 
-### `search_passages(query, filters, cursor)`
+- `document_id`
+- `ingest_job_id`
+- `status`
 
-Use for direct passage retrieval through the standard contextual retrieval pipeline.
+Response status is `202`.
 
-### `search_tables(query, filters, cursor)`
+### `GET /documents`
 
-Use for table-first retrieval when the question is metric-, result-, or parameter-table oriented.
+Lists current document summaries with cursor pagination.
 
-### `get_document_outline(document_id)`
+Fields:
 
-Use to inspect structure before or after retrieval.
+- `documents`
+- `next_cursor`
 
-### `get_table(table_id)`
-
-Use to fetch the full structured table payload for a specific result.
-
-### `get_passage_context(passage_id, before, after)`
-
-Use when a caller already has a passage and needs bounded neighboring context.
-
-### `build_context_pack(query, filters, cursor)`
-
-Preferred default tool for downstream workflows. It returns the best passages, linked tables, parent section context, provenance, and warnings in one call.
-
-## Output shapes
-
-### Document result
+Each document summary includes:
 
 - `document_id`
 - `title`
@@ -82,7 +55,147 @@ Preferred default tool for downstream workflows. It returns the best passages, l
 - `current_status`
 - `active_index_version`
 
-### Passage result
+### `GET /documents/{document_id}`
+
+Returns the active document summary for one logical document.
+
+### `GET /documents/{document_id}/outline`
+
+Returns the active revision’s section tree.
+
+Fields:
+
+- `document_id`
+- `title`
+- `sections`
+
+Each section node includes:
+
+- `section_id`
+- `parent_section_id`
+- `heading`
+- `section_path`
+- `ordinal`
+- `page_start`
+- `page_end`
+- `children`
+
+### `GET /documents/{document_id}/tables`
+
+Returns active-revision tables for a document.
+
+Fields:
+
+- `document_id`
+- `title`
+- `tables`
+
+Each table record includes:
+
+- `table_id`
+- `document_id`
+- `section_id`
+- `document_title`
+- `section_path`
+- `caption`
+- `table_type`
+- `preview`
+- `page_start`
+- `page_end`
+
+### `GET /ingest-jobs/{ingest_job_id}`
+
+Returns ingest status for one job.
+
+Fields:
+
+- `id`
+- `document_id`
+- `status`
+- `failure_code`
+- `failure_message`
+- `warnings`
+- `started_at`
+- `finished_at`
+- `trigger`
+
+### `GET /healthz`
+
+Simple liveness probe.
+
+Fields:
+
+- `service`
+- `status`
+- `version`
+
+### `GET /readyz`
+
+Operational readiness probe.
+
+Fields:
+
+- `service`
+- `status`
+- `version`
+- `database_ready`
+- `storage_root`
+- `storage_ready`
+- `queue_name`
+- `queue_ready`
+- `queue_metrics`
+- `operation_timings`
+
+`queue_metrics` includes:
+
+- `queue_name`
+- `queue_length`
+- `queue_visible_length`
+- `newest_msg_age_sec`
+- `oldest_msg_age_sec`
+- `total_messages`
+- `scrape_time`
+
+`operation_timings` reports recent observed timings for app and worker operations.
+
+## MCP Tools
+
+The app exposes FastMCP over Streamable HTTP at `/mcp`.
+
+Current tools:
+
+### `search_documents`
+
+Arguments:
+
+- `query`
+- `filters`
+- `cursor`
+- `limit`
+
+`filters` currently supports:
+
+- `document_ids`
+- `publication_years`
+
+Use this for document-level narrowing before passage or table retrieval.
+
+### `search_passages`
+
+Arguments:
+
+- `query`
+- `filters`
+- `cursor`
+- `limit`
+
+Returns:
+
+- `query`
+- `passages`
+- `next_cursor`
+
+Each passage result includes:
 
 - `passage_id`
 - `document_id`
@@ -96,9 +209,25 @@ Preferred default tool for downstream workflows. It returns the best passages, l
 - `page_end`
 - `index_version`
 - `retrieval_index_run_id`
+- `parser_source`
 - `warnings`
 
-### Table result
+### `search_tables`
+
+Arguments:
+
+- `query`
+- `filters`
+- `cursor`
+- `limit`
+
+Returns:
+
+- `query`
+- `tables`
+- `next_cursor`
+
+Each table result includes:
 
 - `table_id`
 - `document_id`
@@ -114,43 +243,96 @@ Preferred default tool for downstream workflows. It returns the best passages, l
 - `page_end`
 - `index_version`
 - `retrieval_index_run_id`
+- `parser_source`
 - `warnings`
 
-### Context-pack result
+### `get_document_outline`
+
+Arguments:
+
+- `document_id`
+
+Returns the same outline structure as the HTTP route.
+
+### `get_table`
+
+Arguments:
+
+- `table_id`
+
+Returns:
+
+- table identity and document metadata
+- `headers`
+- `rows`
+- `row_count`
+- `index_version`
+- `retrieval_index_run_id`
+- `parser_source`
+- `warnings`
+
+### `get_passage_context`
+
+Arguments:
+
+- `passage_id`
+- `before`
+- `after`
+
+Returns:
+
+- selected passage metadata
+- bounded neighboring passages
+- warning propagation
+
+### `build_context_pack`
+
+Arguments:
+
+- `query`
+- `filters`
+- `cursor`
+- `limit`
+
+Returns:
 
 - `context_pack_id`
 - `query`
-- `documents`
-- `parent_sections`
 - `passages`
 - `tables`
+- `parent_sections`
+- `documents`
 - `provenance`
 - `warnings`
 - `next_cursor`
 
-Output semantics for ranking, provenance, citations, and warnings are defined in [Retrieval](./retrieval.md).
+This is the preferred default tool for downstream consumers.
 
-## Agent usage guidance
+## Current Limits
 
-Use `build_context_pack` by default in downstream agent workflows.
+MCP route-level limit clamps:
 
-Only use raw search tools directly when the workflow specifically needs:
+- `search_documents`: max `100`
+- `search_passages`: max `8`
+- `search_tables`: max `5`
+- `build_context_pack`: max `8`
 
-- custom pagination
-- separate passage and table handling
-- structure inspection before pack assembly
+## Usage Guidance
 
-Agents should surface warnings, not suppress them. Fallback parser use and low-confidence metadata are part of the contract.
+Prefer `build_context_pack` when the caller wants grounded evidence for downstream synthesis or reasoning.
 
-## Transport
+Use raw search tools directly only when the workflow needs:
 
-FastMCP transport defaults:
+- independent passage and table pagination
+- explicit structure inspection
+- a follow-up call like `get_table` or `get_passage_context`
 
-- production: Streamable HTTP
-- local development: stdio
+Warnings are contract data. Consumers should surface them rather than hiding them.
 
-FastAPI remains plain HTTP. The system should not auto-generate MCP tools from FastAPI routes.
+## Out Of Scope
 
-## Out of scope
+The current public surface does not expose:
 
-The MVP tool surface does not expose LlamaIndex or PydanticAI primitives. Those belong in later downstream layers if they are introduced at all.
+- retrieval over ordinary REST routes
+- auto-generated tools from FastAPI
+- framework-specific abstractions from LlamaIndex or PydanticAI

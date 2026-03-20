@@ -1,41 +1,38 @@
-# Paper Context MVP Docs
+# Paper Context Docs
 
-This `docs/` set is the implementation-facing design for the revised Paper Context MVP. It defines a deterministic ingestion and retrieval system for born-digital research PDFs, optimized for quant and trading papers, with enough rationale to preserve decisions without turning the docs into long essays.
+This `docs/` directory documents the implemented MVP runtime, not just the original phase plan. The codebase is the final authority, and these files explain the current architecture, data model, contracts, and operational expectations in a form that is easier to navigate than the source alone.
 
-The system is a retrieval substrate for downstream tools and agents. It ingests PDFs, preserves sections, passages, tables, and provenance, and returns grounded context packs. It is not an answer-generation product, not a generic agent framework, and not a place to hide retrieval decisions behind LlamaIndex or PydanticAI abstractions.
+Use this doc set when you need to understand how Paper Context works today:
 
-Status note: this documentation set supersedes `~/Downloads/rag-plan.md` and is the current source of truth for the MVP design. Phase 4 is now focused on self-hosted hardening; revision-safe retention and stable document keyset pagination are already implemented in the runtime.
+- revision-aware ingestion and replacement
+- active document reads and retrieval semantics
+- FastAPI and MCP contracts
+- retrieval indexing and provenance guarantees
+- test coverage and next-step hardening work
 
-> **Current defaults**
->
-> - Parser: Docling first, `pdfplumber` fallback when Docling structure is not usable.
-> - Embeddings: Voyage `voyage-4-large`.
-> - Reranker: Zero Entropy `zerank-2`.
-> - Storage: Postgres + pgvector.
-> - API stack: FastAPI for operational HTTP, FastMCP for MCP tools.
-> - Retrieval shape: contextual retrieval over contextualized passage text plus parent-child retrieval.
-> - Framework boundary: no LlamaIndex or PydanticAI in the MVP core.
+Current defaults:
 
-## What the system is and is not
+- parser: Docling first, `pdfplumber` fallback
+- queue: PGMQ
+- storage: Postgres + pgvector plus local filesystem artifacts
+- API surface: FastAPI
+- MCP transport: FastMCP Streamable HTTP mounted at `/mcp`
+- dense model: `voyage-4-large`
+- reranker: `zerank-2`
+- retrieval shape: passage and table retrieval plus bounded context packs
 
-**The system is:**
+Important current caveats:
 
-- a single-tenant ingestion and retrieval service for born-digital paper PDFs
-- a normalized store for documents, sections, passages, tables, references, and artifacts
-- a deterministic retrieval layer that returns provenance-rich results and context packs
+- metadata enrichment is still intentionally minimal and defaults to a no-op enricher
+- provider-backed retrieval is optional; deterministic fallbacks are used when API keys are absent
+- older document revisions are retained, while all user-facing reads resolve through `documents.active_revision_id`
 
-**The system is not:**
-
-- a chat application or answer synthesizer
-- an OCR-first or scanned-PDF pipeline
-- a multi-tenant search platform
-- a LlamaIndex- or PydanticAI-based core architecture
-
-## Quick links
+## Quick Links
 
 - [Architecture](./architecture.md)
 - [Ingestion and Indexing](./ingestion-and-indexing.md)
-- [Retrieval](./retrieval.md)
 - [Data Model](./data-model.md)
 - [APIs and Tools](./apis-and-tools.md)
+- [Retrieval](./retrieval.md)
 - [Evaluation and Roadmap](./evaluation-and-roadmap.md)
+- [Test Strategy](./test-strategy.md)

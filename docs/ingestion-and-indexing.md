@@ -1,18 +1,29 @@
-# Ingestion and Indexing
+# Ingestion And Indexing
 
-> **Decision:** Ingestion is Docling-first, `pdfplumber`-fallback, and index-versioned. The worker produces canonical document structure first, then derived retrieval data. It does not depend on LlamaIndex or PydanticAI.
+The ingestion pipeline is implemented and revision-aware. The worker always builds canonical document structure first, then derived retrieval assets. Upload and replacement share the same pipeline; the main difference is whether a new stable document row is created.
 
-This document defines the upload path, parser flow, structure gate, metadata enrichment, normalization steps, contextualized chunk generation, and index-version rules.
+## Upload And Replace Flow
 
-## Upload flow and ingest job lifecycle
+`POST /documents`:
 
-`POST /documents` accepts a multipart PDF upload and creates:
+- validates the upload as a non-empty PDF
+- enforces the configured upload limit
+- stages the source file into local artifact storage
+- creates `documents`, `document_revisions`, `ingest_jobs`, and `document_artifacts` rows
+- enqueues a minimal PGMQ payload containing document and job identifiers
 
-- a `documents` row with initial status
-- an `ingest_jobs` row in `queued`
-- a `document_artifacts` entry for the original PDF
+`POST /documents/{document_id}/replace`:
 
-The worker advances the job through these states:
+- reuses the stable `documents.id`
+- creates a new revision and ingest job
+- stages a new source artifact for that revision
+- supersedes older queued jobs for the same document when appropriate
+
+The document stays pointed at its previous active revision until the replacement finishes successfully.
+
+## Ingest Job Lifecycle
+
+The worker advances jobs through these statuses:
 
 1. `queued`
 2. `parsing`
@@ -22,169 +33,166 @@ The worker advances the job through these states:
 6. `indexing`
 7. `ready` or `failed`
 
-`failed` is terminal for the current job run. Retries create a new job row linked to the same document.
+Each job also records:
 
-## Docling-first parse path
+- `failure_code`
+- `failure_message`
+- `warnings`
+- `stage_timings`
+- `trigger`
+- `started_at`
+- `finished_at`
 
-The worker runs Docling in born-digital mode with OCR disabled.
+Warnings are part of the durable job state, not ephemeral logs.
 
-Expected outputs from the primary path:
+## Queue And Claim Semantics
 
-- page-level text coverage
-- heading and section structure
-- table detections
-- page spans for sections, passages, and tables
+The queue payload is intentionally small. `ingest_job_id` is the authoritative lookup key.
 
-The raw Docling output is stored in `document_artifacts` and marked as the primary parse artifact when it passes the structure gate.
+Worker behavior:
 
-## Structure-quality gate
+- claims one message through PGMQ
+- locks the matching ingest job and revision
+- extends the lease during long-running stages
+- archives completed messages
+- skips duplicate work for terminal jobs
+- fails superseded jobs explicitly
 
-The gate runs after Docling parse and before chunk generation. It classifies the parse as `pass`, `degraded`, or `fail`.
+If a newer job exists for the same document, an older queued or in-flight job can be marked failed with `superseded_by_newer_ingest_job`.
 
-### `pass`
+## Parser Flow
 
-All of the following are true:
+### Primary path
 
-- most text-bearing pages are mapped into ordered sections
-- page ordering is stable
-- passage spans are recoverable
-- any detected tables have page provenance
+The worker runs Docling first. If the parse is structurally usable, the Docling artifact becomes the primary parser artifact for the revision.
 
-### `degraded`
+### Structure gate
 
-The text layer is usable, but at least one structural signal is weak:
+The parser output is classified as:
 
-- headings are incomplete or noisy
-- section boundaries are unreliable on some pages
-- tables are partially recoverable but not well structured
+- `pass`
+- `degraded`
+- `fail`
 
-`degraded` triggers the `pdfplumber` fallback path instead of indexing the Docling result directly.
+`pass` continues directly into normalization. `degraded` triggers fallback. `fail` ends the job with explicit failure metadata.
 
-### `fail`
+### Fallback path
 
-The PDF is not usable for MVP ingestion:
+When Docling returns `degraded`, the worker retries with `pdfplumber`.
 
-- the text layer is missing or too sparse
-- page order or spans are unreliable after fallback
-- the parser cannot produce stable passages with provenance
+If fallback succeeds:
 
-`fail` stops the job with an explicit reason. The system does not degrade into blob-text indexing.
+- the fallback artifact is stored
+- warnings are merged into the job
+- `parser_fallback_used` is added
+- downstream retrieval results preserve the fallback warning state
 
-## `pdfplumber` fallback path
+If fallback cannot recover stable structure and provenance, the job is failed rather than downgraded into blob-text indexing.
 
-When the Docling output is `degraded`, the worker retries extraction with `pdfplumber`.
+## Metadata Handling
 
-Fallback behavior:
-
-- create a new `document_artifacts` row with `parser = pdfplumber`
-- preserve the original Docling artifact for debugging
-- recover text spans, page spans, and simple table candidates where possible
-- continue normalization only if the fallback result reaches `pass`
-
-If fallback succeeds, the document is indexed with warnings:
-
-- `parser_fallback_used`
-- `reduced_structure_confidence`
-- optional `table_structure_partial`
-
-Those warnings must propagate into retrieval outputs and context packs.
-
-## Metadata recovery and synchronous enrichment
-
-Base metadata is recovered from parser output first:
+Base metadata comes from the parsed document:
 
 - title
 - authors
 - abstract
 - publication year
-- reference-section presence
+- metadata confidence
 
-Each field stores a confidence level and a source.
+The current runtime wires `NullMetadataEnricher`, so enrichment is effectively a no-op by default. The lifecycle still includes `enriching_metadata` because the pipeline is already structured for later provider-backed enrichment without needing to redesign job flow or contracts.
 
-The worker then performs synchronous enrichment against OpenAlex and Semantic Scholar to fill or validate:
-
-- author identities
-- venue
-- DOI
-- citation metadata
-
-Enrichment does not block the document from becoming searchable unless it causes a hard data-shape error. If enrichment fails, the job continues with warnings and partial metadata.
+If parsed metadata confidence is low, the worker adds `metadata_low_confidence`.
 
 ## Normalization
 
-The worker writes canonical record data in this order:
+Canonical rows are written per revision:
 
-1. `documents`
+1. document metadata
 2. `document_sections`
 3. `document_tables`
-4. `document_passages`
-5. `document_references`
-6. `document_artifacts`
+4. `document_references`
+5. `document_passages`
+6. parser artifacts and retrieval index metadata
 
 Normalization rules:
 
-- a **document** is the top-level paper record
-- a **section** is a heading-bounded structural unit
-- a **table** is a first-class extracted object, not serialized into passage text
-- a **passage** is a section-bounded chunkable prose span
-- a **reference** is a cited-work record extracted from the paper
+- sections preserve hierarchy and page spans
+- tables are first-class objects, not flattened into prose
+- passages are section-bounded chunks with canonical `body_text`
+- every derived row links back to the parser artifact that produced it
 
-All normalized rows must keep page provenance and a link back to the parse artifact that produced them.
+On reprocessing the same revision, the worker resets prior non-source rows for that revision before rebuilding them.
 
-## Contextualized chunk generation
+## Chunking
 
-Chunking runs after normalization and only on passage text.
+Chunking happens after normalization and before retrieval indexing.
 
-Defaults:
+Current defaults:
 
-- stay within section boundaries
-- target 300-700 tokens
-- use 10-15% overlap
-- store both the raw passage text and the contextualized retrieval text
+- section-bounded chunks
+- `min_tokens = 300`
+- `max_tokens = 700`
+- `overlap_fraction = 0.15`
 
-The contextualized text is deterministic. It prepends a short context string derived from:
+Each passage stores:
 
-- document title
-- section heading path
-- immediate local heading context when available
+- canonical `body_text`
+- derived `contextualized_text`
+- page provenance
+- chunk ordinal
 
-The raw passage text remains the canonical record. The contextualized text is derived index input used to materialize sparse passage search, produce embeddings, and drive retrieval.
+The contextualized text is deterministic and includes document and section context so sparse and dense retrieval operate over the same enriched representation.
 
-## Index-version creation and activation rules
+## Retrieval Indexing
 
-Every indexing run writes a `retrieval_index_runs` row that records:
+The worker writes one `retrieval_index_runs` row for each indexing build. That row records:
 
 - `index_version`
 - embedding provider and model
+- embedding dimensions
 - reranker provider and model
-- chunking policy version
-- parser provenance
-- status
+- `chunking_version`
+- `parser_source`
+- build `status`
+- activation timestamps
 
-Rules:
+The indexing step then materializes:
 
-- the active index version is corpus-scoped for the workspace
-- new documents are indexed under the current active version by default
-- any model or chunking-policy change creates a new index version
-- a new version becomes active only after its build completes successfully
-- retrieval must never mix embeddings from two index versions in one result set
+- `retrieval_passage_assets`
+- `retrieval_table_assets`
 
-## Failure modes
+Both asset sets are keyed to the revision and run that produced them.
 
-- **parse failure**
-  - Docling and fallback cannot produce stable passages with provenance
-- **metadata enrichment failure**
-  - OpenAlex or Semantic Scholar is unavailable or returns incompatible matches
-- **normalization failure**
-  - parser output cannot be mapped into canonical entities cleanly
-- **indexing failure**
-  - embedding, vector write, or index-run bookkeeping fails
+## Revision Activation
 
-Each failure must leave the job in `failed`, preserve the artifacts that were produced, and expose a machine-readable failure code plus a human-readable message.
+Successful indexing does not just mark the ingest job `ready`. It also:
 
-## Non-goals
+- marks the run active for that revision
+- updates the revision status to `ready`
+- updates `documents.active_revision_id`
+- copies active revision metadata back onto the top-level document row
 
-- OCR and scanned PDFs
-- multimodal parsing
-- free-text fallback indexing with no structure
-- LlamaIndex or PydanticAI abstractions in the ingestion path
+If a replacement fails and there is an older ready revision, the document can remain pointed at that earlier revision. This is the core reason replacement is documented as revision-safe rather than destructive.
+
+## Failure Behavior
+
+The worker fails the job with explicit machine-readable codes for cases such as:
+
+- missing source artifact
+- invalid artifact reference
+- Docling structure failure
+- fallback structure failure
+- normalization failure
+- indexing failure
+- superseded ingest job
+
+Failure preserves already-written artifacts when useful for debugging and keeps warnings attached to the job.
+
+## Non-Goals
+
+The current ingestion pipeline does not attempt:
+
+- OCR or scanned-PDF recovery
+- free-text indexing without provenance
+- multimodal ingestion
+- framework-managed ingestion abstractions

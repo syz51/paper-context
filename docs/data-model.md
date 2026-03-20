@@ -1,16 +1,14 @@
 # Data Model
 
-> **Default:** Postgres + pgvector is the authoritative store for canonical paper records, provenance, filters, and retrieval index metadata. Canonical record data and derived index data are kept separate.
+Postgres is the authoritative store for canonical paper data, revision state, queue-linked ingest state, and derived retrieval assets. The important modeling decision is that a paper has a stable document identity and one or more retained revisions.
 
-This document describes the canonical entities, key fields, relationships, provenance requirements, quant tags, and index-version rules used by the MVP.
-
-## Canonical entities
+## Active-Revision Model
 
 ### `documents`
 
-Top-level paper record.
+`documents` is the stable identity for a logical paper.
 
-Key fields:
+Important fields:
 
 - `id`
 - `title`
@@ -21,17 +19,70 @@ Key fields:
 - `metadata_confidence`
 - `quant_tags`
 - `current_status`
+- `active_revision_id`
 - `created_at`
 - `updated_at`
 
-### `document_sections`
+The top-level document row mirrors the currently active revision for convenience, but the canonical versioned state lives in `document_revisions` and revision-scoped child rows.
 
-Normalized heading-bounded structure within a document.
+### `document_revisions`
 
-Key fields:
+Each upload or replacement creates a new document revision.
+
+Important fields:
 
 - `id`
 - `document_id`
+- `revision_number`
+- `status`
+- `title`
+- `authors`
+- `abstract`
+- `publication_year`
+- `source_type`
+- `metadata_confidence`
+- `quant_tags`
+- `source_artifact_id`
+- `ingest_job_id`
+- `activated_at`
+- `superseded_at`
+- `created_at`
+- `updated_at`
+
+This table is what makes replacement non-destructive.
+
+## Revision-Scoped Canonical Entities
+
+Every canonical child entity is keyed to both `document_id` and `revision_id`.
+
+### `document_artifacts`
+
+Stored source and parser artifacts.
+
+Important fields:
+
+- `id`
+- `document_id`
+- `revision_id`
+- `ingest_job_id`
+- `artifact_type`
+- `parser`
+- `storage_ref`
+- `checksum`
+- `is_primary`
+- `created_at`
+
+Artifact types include the source PDF plus parser outputs.
+
+### `document_sections`
+
+Normalized section tree for one revision.
+
+Important fields:
+
+- `id`
+- `document_id`
+- `revision_id`
 - `parent_section_id`
 - `heading`
 - `heading_path`
@@ -42,12 +93,13 @@ Key fields:
 
 ### `document_passages`
 
-Canonical prose spans and derived retrieval inputs.
+Canonical prose chunks for one revision.
 
-Key fields:
+Important fields:
 
 - `id`
 - `document_id`
+- `revision_id`
 - `section_id`
 - `chunk_ordinal`
 - `body_text`
@@ -59,16 +111,17 @@ Key fields:
 - `quant_tags`
 - `artifact_id`
 
-`body_text` is canonical record data. `contextualized_text` is derived retrieval and index input.
+`body_text` is canonical display text. `contextualized_text` is derived retrieval input.
 
 ### `document_tables`
 
-First-class extracted tables.
+First-class extracted tables for one revision.
 
-Key fields:
+Important fields:
 
 - `id`
 - `document_id`
+- `revision_id`
 - `section_id`
 - `caption`
 - `table_type`
@@ -81,12 +134,13 @@ Key fields:
 
 ### `document_references`
 
-Extracted cited-work records from the document.
+Extracted references for one revision.
 
-Key fields:
+Important fields:
 
 - `id`
 - `document_id`
+- `revision_id`
 - `raw_citation`
 - `normalized_title`
 - `authors`
@@ -95,47 +149,41 @@ Key fields:
 - `source_confidence`
 - `artifact_id`
 
-### `document_artifacts`
-
-Stored source and parse artifacts.
-
-Key fields:
-
-- `id`
-- `document_id`
-- `artifact_type`
-- `parser`
-- `storage_ref`
-- `checksum`
-- `is_primary`
-- `created_at`
-
-Artifact types include the original PDF, Docling output, and fallback parser output.
+## Ingest State
 
 ### `ingest_jobs`
 
-Worker-tracked ingestion state.
+One ingest job belongs to one document revision.
 
-Key fields:
+Important fields:
 
 - `id`
 - `document_id`
+- `revision_id`
+- `source_artifact_id`
 - `status`
 - `failure_code`
 - `failure_message`
 - `warnings`
+- `stage_timings`
 - `started_at`
 - `finished_at`
 - `trigger`
+- `created_at`
+
+This is the canonical lifecycle record for upload and replacement processing.
+
+## Retrieval State
 
 ### `retrieval_index_runs`
 
-Derived indexing metadata for a document under a specific index version.
+One indexing build for one revision under one index version.
 
-Key fields:
+Important fields:
 
 - `id`
 - `document_id`
+- `revision_id`
 - `ingest_job_id`
 - `index_version`
 - `embedding_provider`
@@ -146,29 +194,83 @@ Key fields:
 - `chunking_version`
 - `parser_source`
 - `status`
+- `is_active`
+- `activated_at`
+- `deactivated_at`
 - `created_at`
 
-## Relationships and provenance links
+The schema enforces one active run per revision, not one single active run globally for the whole corpus.
+
+### `retrieval_passage_assets`
+
+Derived passage search rows for one run.
+
+Important fields:
+
+- `id`
+- `retrieval_index_run_id`
+- `document_id`
+- `revision_id`
+- `passage_id`
+- `section_id`
+- `publication_year`
+- `search_text`
+- `search_tsvector`
+- `embedding`
+- `created_at`
+
+### `retrieval_table_assets`
+
+Derived table search rows for one run.
+
+Important fields:
+
+- `id`
+- `retrieval_index_run_id`
+- `document_id`
+- `revision_id`
+- `table_id`
+- `section_id`
+- `publication_year`
+- `search_text`
+- `semantic_text`
+- `search_tsvector`
+- `embedding`
+- `created_at`
+
+Table embeddings are already present in the schema and retrieval build path.
+
+## Provenance Rules
 
 Required relationships:
 
-- `documents.id` -> `document_sections.document_id`
-- `documents.id` -> `document_passages.document_id`
-- `documents.id` -> `document_tables.document_id`
-- `documents.id` -> `document_references.document_id`
-- `documents.id` -> `document_artifacts.document_id`
-- `documents.id` -> `ingest_jobs.document_id`
-- `documents.id` -> `retrieval_index_runs.document_id`
-- `document_sections.id` -> `document_passages.section_id`
-- `document_sections.id` -> `document_tables.section_id`
-- `document_artifacts.id` -> normalized rows via `artifact_id`
-- `ingest_jobs.id` -> `retrieval_index_runs.ingest_job_id`
+- every canonical child row references `document_id`
+- every canonical child row references `revision_id`
+- passages and tables reference `section_id`
+- canonical rows reference the `document_artifacts` row that produced them through `artifact_id`
+- retrieval assets reference the `retrieval_index_runs` row that produced them
 
-Required provenance rule:
+Required retrieval provenance:
 
-Every section, passage, table, and reference must link back to the `document_artifacts` row that produced it. Every retrieval result must link back to the `retrieval_index_runs` row that indexed it.
+- `document_id`
+- `section_id`
+- `index_version`
+- `retrieval_index_run_id`
+- page range
+- `parser_source`
 
-## Index-versioning rules
+## Read Semantics
+
+User-facing document reads are active-revision reads:
+
+- `GET /documents/{id}`
+- `GET /documents/{id}/outline`
+- `GET /documents/{id}/tables`
+- retrieval responses returned through MCP
+
+Those reads join through `documents.active_revision_id` so they reflect the current live revision, while older revisions remain stored.
+
+## Index-Version Rules
 
 `index_version` identifies a retrieval-compatible combination of:
 
@@ -179,58 +281,18 @@ Every section, passage, table, and reference must link back to the `document_art
 
 Rules:
 
-- a document can have many `retrieval_index_runs`
-- only one index version is active for live retrieval at a time
-- all results in one response must come from the same active index version
-- model changes or chunking changes require a new index version
-- canonical record rows remain stable across reindexing where possible; derived index rows change freely
+- a revision can have multiple historical runs
+- only one run is active per revision
+- one response must not mix index versions
+- changing embedding or reranking defaults requires a new versioned build
 
-## Quant-specific tags
+## Quant Tags
 
-Quant-specific tags live on:
+Quant-specific tags may appear on:
 
 - `documents.quant_tags`
+- `document_revisions.quant_tags`
 - `document_passages.quant_tags`
 - `document_tables.quant_tags`
 
-Standard keys:
-
-- `asset_universe`
-- `exchange_or_market`
-- `market_type`
-- `sampling_frequency`
-- `holding_period`
-- `sample_period`
-- `transaction_cost_model`
-- `baseline_type`
-- `metric_type`
-- `data_source_mentions`
-- `implementation_cues`
-
-Document-level tags capture paper-wide signals. Passage and table tags capture local signals used in filtering and ranking.
-
-## Canonical record data vs derived index data
-
-Canonical record data:
-
-- `documents`
-- `document_sections`
-- `document_passages.body_text`
-- `document_tables`
-- `document_references`
-- `document_artifacts`
-- `ingest_jobs`
-
-Derived or index data:
-
-- `document_passages.contextualized_text`
-- vector embeddings stored through pgvector
-- sparse-search tsvector materialization from contextualized passage text and table lexical fields
-- rerank scores
-- `retrieval_index_runs`
-
-The rule is simple: canonical data represents the paper as parsed; derived data represents how the system currently retrieves it.
-
-## Out of scope
-
-The MVP data model does not include LlamaIndex node graphs, PydanticAI state, user memory, or multi-tenant personalization tables. Those layers can read from this schema later, but they are not canonical data.
+These fields are available for future filtering and ranking, but the currently exposed public filters are still narrow.

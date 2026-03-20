@@ -1,40 +1,86 @@
 # Paper Context Test Strategy
 
-## Suite taxonomy
+The test suite is organized around behavior boundaries: pure logic, app slices, real Postgres seams, contract stability, migrations, and deployment-shape regression checks.
 
-- `unit`: pure logic, parsing, configuration, storage helpers, worker control flow, and adapter translation tests.
-- `slice`: in-process `FastAPI` `TestClient` coverage for lifespan, `/healthz`, `/readyz`, and MCP mounting behavior.
-- `integration`: real Postgres/PGMQ seams, including queue round-trips, ingestion flow, and readiness against a migrated database.
-- `contract`: `/openapi.json` stability, response-model compatibility, and golden JSON payloads for the current health endpoints.
-- `regression`: deployment-shape assertions plus optional staging-only smoke coverage.
-- `migration`: fresh-database Alembic upgrade smoke, layered on top of the integration lane.
+## Suite Taxonomy
 
-## Supported commands
+- `unit`: isolated logic for parsing, queue helpers, ingestion helpers, retrieval helpers, CLI behavior, config, and observability
+- `slice`: in-process FastAPI and MCP app coverage, including lifespan, routing, health, readiness, and mounted MCP behavior
+- `integration`: real Postgres and PGMQ tests for queue flow, ingestion, retrieval, readiness, and MCP integration
+- `contract`: OpenAPI checks plus golden payload compatibility for HTTP and MCP contracts
+- `migration`: fresh-database Alembic upgrade smoke
+- `regression`: deployment-shape and smoke checks, including optional staging-only coverage
 
+## Standard Commands
+
+- `uv run pre-commit run --all-files`
+- `uv run pyright`
 - `uv run pytest -m "unit or slice"`
 - `uv run pytest -m "integration or migration" -n 2 --dist=loadfile`
 - `uv run pytest -m contract`
-- `uv run pytest -m regression`
+- `uv run pytest -m "regression and not staging_only"`
 
-## Postgres-backed integration tests
+## What Contract Tests Cover
 
-- `requires_postgres` tests run against a real Postgres instance with `pgmq` and `vector`.
-- By default the suite starts the repo's `db` service from [docker-compose.yml](/Users/roy/Documents/rag/docker-compose.yml) if Docker is available.
-- To target an already-running database, set `PAPER_CONTEXT_TEST_DATABASE_URL`.
-- Each integration test gets a fresh database, and Alembic is applied programmatically before the test runs.
+Contract tests currently check more than health endpoints. They include:
 
-## CI lanes
+- `/openapi.json` compatibility
+- document upload, list, detail, outline, tables, replace, and ingest-job payloads
+- `healthz` and `readyz`
+- MCP tool payloads for:
+  - `search_documents`
+  - `search_passages`
+  - `search_tables`
+  - `get_document_outline`
+  - `get_table`
+  - `get_passage_context`
+  - `build_context_pack`
 
-- `static-checks`: `pre-commit` static checks, including `pyright`
-- `unit-slice`: PR-blocking fast tests with branch coverage, JUnit XML, and coverage XML artifacts
-- `contract`: schema and golden-response compatibility checks with JUnit XML
-- `integration-postgres`: PR-blocking real Postgres/PGMQ tests, including migration smoke, with retained pytest and Docker logs
-- `integration-postgres` uses `pytest-xdist` with `-n 2` and `--dist=loadfile` to reduce wall-clock time without fanning out the Postgres-backed lane too aggressively.
-- `regression-smoke`: lightweight regression checks that do not require a deployed staging stack
+Golden files live under `tests/contract/golden/`.
 
-## Staging regression
+## Postgres-Backed Integration Coverage
 
-- `staging_only` tests are disabled unless `PAPER_CONTEXT_RUN_STAGING_TESTS=1`.
-- Provide `PAPER_CONTEXT_STAGING_BASE_URL` to target the same-VPS non-production Dokploy stack.
-- Keep that environment isolated from production:
-  separate Compose project, separate domain, separate database volume and env vars, and separate artifacts path.
+Integration tests are the main protection for behavior that unit tests cannot prove alone:
+
+- PGMQ enqueue, claim, lease extension, archive, and redelivery
+- end-to-end ingestion flow
+- parser fallback behavior
+- revision retention and replacement activation
+- retrieval against real schema objects and vector/search assets
+- MCP behavior against the integrated app stack
+
+`requires_postgres` tests run against a real Postgres instance with `pgmq` and `vector`.
+
+By default the suite can use the repo’s Compose `db` service. To point tests at an existing database, set `PAPER_CONTEXT_TEST_DATABASE_URL`.
+
+## Current High-Value Regression Areas
+
+Tests should remain especially strong around:
+
+- active-revision reads after replacement
+- failure rollback that preserves the previous ready revision
+- queue redelivery without duplicate canonical state
+- index-version isolation in result pages and context packs
+- warning propagation from ingest into retrieval
+
+## CI Lanes
+
+- `static-checks`: pre-commit and type checking
+- `unit-slice`: fast PR-blocking logic and app tests with coverage
+- `contract`: schema and golden-response compatibility
+- `integration-postgres`: real Postgres and migration coverage
+- `regression-smoke`: deployment and non-staging regression checks
+
+The Postgres lane uses `pytest-xdist` with `-n 2 --dist=loadfile` to keep runtime reasonable without over-parallelizing shared infrastructure.
+
+## Staging Regression
+
+`staging_only` tests stay disabled unless `PAPER_CONTEXT_RUN_STAGING_TESTS=1`.
+
+When enabled, provide `PAPER_CONTEXT_STAGING_BASE_URL` and keep the target isolated from production:
+
+- separate Compose project
+- separate domain
+- separate database volume
+- separate env vars
+- separate artifacts path

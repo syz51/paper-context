@@ -1,142 +1,112 @@
 # Retrieval
 
-> **Default:** Retrieval uses metadata filter -> sparse -> dense -> fusion -> rerank -> parent expansion, with contextualized passage text feeding both sparse and dense passage retrieval, Voyage `voyage-4-large` for embeddings, and Zero Entropy `zerank-2` for reranking. Results are provenance-rich and index-version aware.
+Retrieval is implemented as one shared deterministic service used by MCP. It operates over the active revision for each document and returns provenance-rich results tied to a single index version.
 
-This document defines the query pipeline, top-k defaults, table handling, parent-child retrieval behavior, context-pack assembly, and the retrieval output contract. For provenance and index fields, see [Data Model](./data-model.md).
+## Pipeline
 
-## Query pipeline
+Every retrieval request follows the same broad sequence:
 
-Every retrieval request follows the same ordered stages:
+1. apply document-level filters
+2. select active retrieval runs for active document revisions
+3. run sparse retrieval
+4. run dense retrieval
+5. fuse sparse and dense candidates
+6. rerank the fused set
+7. assemble bounded result pages or context packs
 
-1. **Metadata filter**
-   - apply document-level and passage-level filters first
-   - common filters include year, tags, document IDs, and result type
-2. **Sparse retrieval**
-   - run Postgres full-text search over contextualized passage text, section headings, and selected metadata
-   - for tables, keep a separate lexical path over captions, headers, and serialized cell text
-3. **Dense retrieval**
-   - embed the query once with Voyage `voyage-4-large`
-   - search pgvector against the active index version
-4. **Fusion**
-   - merge sparse and dense candidates
-   - deduplicate by entity ID
-   - preserve source-stage provenance for debugging
-5. **Rerank**
-   - rerank the fused candidate set with Zero Entropy `zerank-2`
-6. **Parent expansion**
-   - attach section and document context for the selected child items
+Current public filters are intentionally narrow:
 
-The pipeline is deterministic and service-owned. Future agents consume these outputs; they do not change the retrieval algorithm.
+- `document_ids`
+- `publication_years`
 
-Query rewriting, query expansion, and multi-query retrieval are not part of the MVP default pipeline. If they are revisited later, they should be introduced as optional pre-retrieval augmentation modes that still fuse into the same rerank and provenance-aware output contract.
+## Passage Retrieval
 
-## Passage retrieval policy
+Passage retrieval is the default path for narrative content.
 
-Passage search is the default retrieval path for narrative content.
+Current budgets:
 
-Default budgets:
+- sparse candidates: `30`
+- dense candidates: `30`
+- fused candidates: `40`
+- page limit: `8`
 
-- sparse candidate set: top 30
-- dense candidate set: top 30
-- fused rerank set: top 40
-- final returned passages: top 8
+Behavior:
 
-Passage behavior:
+- sparse search runs over contextualized passage search text
+- dense search runs over passage embeddings in `retrieval_passage_assets`
+- final results return canonical `body_text`, not contextualized text
+- pagination is cursor-based and tied to query, filters, and index version
 
-- search over the contextualized passage text for sparse retrieval
-- search over the same contextualized passage text for dense retrieval
-- return the raw passage text for display and citation
-- preserve section path, page range, chunk ordinal, and index-version provenance
-- allow pagination by cursor over the reranked result set
+## Table Retrieval
 
-## Table retrieval path
+Tables are a first-class retrieval target, not an attachment-only feature.
 
-Table retrieval is a separate first-class path.
+Current budgets:
 
-Default budgets:
+- sparse candidates: `20`
+- dense candidates: `20`
+- fused candidates: `24`
+- page limit: `5`
 
-- sparse candidate set: top 20
-- dense candidate set: top 10
-- fused rerank set: top 20
-- final returned tables: top 5
+Behavior:
 
-Table behavior:
+- sparse search emphasizes caption, headers, and serialized cell text
+- dense search uses table embeddings in `retrieval_table_assets`
+- result previews are bounded row samples, not the full table body
+- `get_table` is the follow-up call for full structured rows
 
-- lexical search emphasizes caption, headers, and serialized cell text
-- dense search is allowed when table embeddings exist for the active version
-- results return structured previews, not flattened prose
-- tables may also be attached during context-pack assembly when they are linked to selected passages or sections
+## Fusion And Reranking
 
-## Parent-child retrieval behavior
+Sparse and dense candidates are fused and deduplicated before reranking. Result provenance preserves whether an item matched through sparse, dense, or both modes.
 
-The child retrieval unit is the passage or table. The parent retrieval unit is the section, with document metadata attached above it.
+Default model settings:
+
+- embedding model: `voyage-4-large`
+- reranker model: `zerank-2`
+
+If provider keys are missing, the runtime uses deterministic embedding and heuristic reranking implementations so retrieval remains available in local development.
+
+## Active Revision And Index-Version Rules
+
+Retrieval always resolves through the active document revision.
 
 Rules:
 
-- child results always include `document_id` and `section_id`
-- parent expansion returns the minimal section context needed to interpret the child
-- section expansion must not silently pull the whole document body
-- context packs may include sibling passages when needed for coherence, but the triggering child items stay explicit
+- results in one response must not mix index versions
+- result cursors are bound to the index version that produced them
+- a revision can have multiple historical runs, but one active run
+- changing model or chunking policy requires a new run and versioned activation
 
-This keeps retrieval precise while still returning enough structure for downstream use.
+If an attempted page or pack would mix index versions, retrieval treats that as an error rather than returning ambiguous provenance.
 
-## Context-pack assembly
+## Parent Expansion And Context Packs
 
-A **context pack** is the preferred retrieval product for downstream agents and tools.
+The primary retrieval units are passages and tables. Parent expansion adds only the minimum structure needed to interpret them.
 
-A context pack contains:
+Context-pack behavior:
 
-- selected passage results
-- related table results when relevant
-- parent section metadata
-- document metadata
-- pack-level warnings
-- pack-level provenance
+- starts from reranked passages
+- attaches relevant tables
+- attaches parent section metadata
+- includes supporting sibling passages when needed
+- remains bounded rather than dumping full documents
 
-Assembly rules:
+When the parent expansion must be trimmed, the pack includes `parent_context_truncated`.
 
-- start from reranked child results
-- attach only the parent structure needed to interpret those results
-- include citations at the passage or table level, not only at the pack level
-- keep the pack bounded; do not use it as a full-document export
+## Warning Semantics
 
-## Citation and provenance rules
+Warnings are contract-level data and may appear on job records, retrieval items, and whole packs.
 
-Every returned passage or table must include enough provenance to be cited directly.
-
-Required provenance fields:
-
-- `document_id`
-- `section_id`
-- `index_version`
-- `retrieval_index_run_id`
-- `page_start`
-- `page_end`
-- `parser_source`
-
-Recommended citation fields:
-
-- document title
-- section path
-- passage or table ID
-- table caption when applicable
-
-Warnings must be explicit. Common warnings include:
+Common warnings:
 
 - `parser_fallback_used`
 - `reduced_structure_confidence`
 - `metadata_low_confidence`
 - `parent_context_truncated`
 
-## Embedding and reranker defaults
+Consumers should propagate these warnings instead of hiding them.
 
-- embedding model: Voyage `voyage-4-large`
-- reranker model: Zero Entropy `zerank-2`
-- sparse passage retrieval reads `contextualized_text` through the active sparse index materialization
-- dense retrieval always reads from the active `index version`
-- any model swap requires a new index version before activation
-
-## Retrieval output contract
+## Output Contract
 
 ### Passage result
 
@@ -152,6 +122,7 @@ Warnings must be explicit. Common warnings include:
 - `page_end`
 - `index_version`
 - `retrieval_index_run_id`
+- `parser_source`
 - `warnings`
 
 ### Table result
@@ -170,19 +141,44 @@ Warnings must be explicit. Common warnings include:
 - `page_end`
 - `index_version`
 - `retrieval_index_run_id`
+- `parser_source`
 - `warnings`
+
+### Table detail result
+
+- all table identity and location fields
+- `headers`
+- `rows`
+- `row_count`
+- `index_version`
+- `retrieval_index_run_id`
+- `parser_source`
+- `warnings`
+
+### Passage context result
+
+- selected passage metadata
+- neighboring passages with `relationship`
+- pack-level warnings
 
 ### Context-pack result
 
 - `context_pack_id`
 - `query`
-- `passages[]`
-- `tables[]`
-- `parent_sections[]`
-- `documents[]`
+- `passages`
+- `tables`
+- `parent_sections`
+- `documents`
 - `provenance`
 - `warnings`
+- `next_cursor`
 
-## Out of scope
+## Out Of Scope
 
-The MVP retrieval layer does not expose LlamaIndex retrievers, PydanticAI plans, citation-graph traversal, or answer synthesis. Those are downstream consumers of this contract, not part of it.
+The retrieval layer still does not implement:
+
+- query rewriting by default
+- multi-query retrieval
+- citation-graph traversal
+- answer synthesis
+- framework-managed retrievers

@@ -1,88 +1,124 @@
 # Architecture
 
-> **Decision:** The MVP is a deterministic retrieval system built from FastAPI, FastMCP, Postgres + pgvector, Docling, Voyage `voyage-4-large`, and Zero Entropy `zerank-2`. LlamaIndex and PydanticAI are explicitly outside the MVP core.
+Paper Context is implemented as a self-hosted, revision-aware ingestion and retrieval system. The architecture is intentionally narrow: one FastAPI app, one worker, one Postgres instance with `pgvector` and `pgmq`, one local artifact store, and one MCP surface mounted inside the app.
 
-This document describes the runtime surfaces, the boundary between ingestion and retrieval responsibilities, and the point where any future agent layer begins. For pipeline details, see [Ingestion and Indexing](./ingestion-and-indexing.md), [Retrieval](./retrieval.md), [Data Model](./data-model.md), and [APIs and Tools](./apis-and-tools.md).
+## Runtime Topology
 
-## Runtime surfaces
+The deployed runtime consists of four processes:
 
-### `api`
+- `db`: Postgres with the `vector` and `pgmq` extensions
+- `migrate`: one-shot Alembic runner
+- `app`: FastAPI service for HTTP endpoints and MCP mounting
+- `worker`: background ingestion and indexing loop
 
-FastAPI service for uploads, document inspection, ingest job status, and operational reads. This surface owns request validation, job creation, and stable HTTP contracts.
+In local and production Compose files, MCP is not a separate process. The FastMCP app is mounted by the FastAPI service at `/mcp`.
+
+## Service Responsibilities
+
+### `app`
+
+Owns:
+
+- upload and replacement request validation
+- source PDF staging
+- `documents` and `ingest_jobs` creation
+- document inspection routes
+- `healthz` and `readyz`
+- mounted MCP transport
+
+It does not perform parsing or indexing inline.
 
 ### `worker`
 
-Background ingestion and indexing process. It owns parsing, structure gating, metadata enrichment, normalization, contextualized retrieval-text generation, sparse-index materialization, embedding, and index-version writes.
+Owns:
 
-### `mcp`
+- queue claim, lease extension, archive, and redelivery behavior
+- parser execution and structure gating
+- canonical normalization
+- chunking and contextualized retrieval text generation
+- retrieval asset materialization
+- revision activation on success and rollback-on-failure behavior
 
-FastMCP server exposing curated retrieval tools. It reuses the retrieval service layer directly rather than auto-wrapping FastAPI endpoints.
+### `db`
 
-### `skill` (optional)
+Owns:
 
-A thin downstream companion layer that teaches agents how to use the MCP tools well. It is not part of the retrieval core and should not contain canonical business logic.
+- canonical records
+- revision state
+- ingest-job lifecycle state
+- retrieval index runs and retrieval assets
+- queue dispatch through PGMQ
 
-## Component responsibilities
+### local artifact storage
 
-- `api`
-  - accept `POST /documents`
-  - create and expose `ingest_jobs`
-  - expose document metadata, outline, and table reads
-- `worker`
-  - parse with Docling, then `pdfplumber` only when needed
-  - normalize document structure into canonical entities
-  - generate contextualized passage retrieval text
-  - materialize sparse-search inputs and write embeddings
-  - write retrieval index metadata
-- `mcp`
-  - expose search and context-pack tools
-  - return provenance, warnings, and stable identifiers
-  - keep agent-facing tool contracts small and explicit
-- `skill`
-  - prefer `build_context_pack` over raw primitive calls
-  - encode downstream usage guidance, not retrieval logic
+Owns:
 
-## Canonical request and data flow
+- source PDFs
+- parser-produced artifacts
 
-1. A client uploads a PDF through `POST /documents`.
-2. The API creates a `document` shell and an `ingest_job`, then hands work to the worker.
-3. The worker stores the original file as an artifact, runs Docling, evaluates structure quality, and falls back to `pdfplumber` only if the Docling output is not usable.
-4. The worker recovers metadata, enriches it synchronously from OpenAlex and Semantic Scholar, and normalizes sections, passages, tables, references, and artifacts into Postgres.
-5. The worker creates contextualized passage retrieval text, materializes sparse-search inputs, embeds them with Voyage `voyage-4-large`, and records the run under an `index version`.
-6. Retrieval queries run through metadata filtering, sparse search, dense search, fusion, reranking with `zerank-2`, parent expansion, and context-pack assembly.
-7. FastAPI and FastMCP return the same underlying document, passage, table, and context-pack semantics with provenance and warnings attached.
+Artifacts are referenced from Postgres through `document_artifacts.storage_ref`.
 
-## Deterministic retrieval boundary
+## Core Architectural Decision
 
-The deterministic core ends at retrieval outputs and context packs. That means:
+The stable paper identity is `documents.id`. Uploads and replacements create new `document_revisions` rows instead of overwriting canonical state in place.
 
-- ingestion, normalization, indexing, search, reranking, and provenance live in this codebase
-- MCP tools expose those deterministic capabilities directly
-- any future agent layer consumes retrieval outputs but does not replace retrieval logic
+That gives the runtime these properties:
 
-This boundary is deliberate. It keeps the MVP debuggable, testable, and implementation-first.
+- current reads resolve through `documents.active_revision_id`
+- replacement can be staged and indexed before activation
+- failed replacements do not need to destroy the previous ready state
+- retrieval results stay tied to the specific revision and `retrieval_index_run_id` that produced them
 
-## Major stack choices
+## End-To-End Flow
 
-- **Docling + `pdfplumber` fallback**
-  - Docling is the primary parser because it preserves paper structure well enough to support sections, passages, and tables.
-  - `pdfplumber` is the fallback because it gives a deterministic lower-level recovery path when Docling structure is weak.
-- **Postgres + pgvector**
-  - One authoritative store for canonical records, filters, provenance, and vector retrieval.
-  - Avoids splitting the MVP across multiple persistence systems.
+1. A client uploads a PDF through `POST /documents` or replaces an existing one through `POST /documents/{document_id}/replace`.
+2. The app stages the source PDF, creates or reuses the stable document row, creates a new revision, creates an ingest job, and enqueues minimal queue payload metadata.
+3. The worker claims the queue message, locks the ingest job and revision, and skips work if the job is already terminal or superseded.
+4. The worker parses with Docling first and falls back to `pdfplumber` only when the primary parse is structurally degraded.
+5. The worker writes canonical sections, tables, references, passages, and parser artifacts for the revision.
+6. The worker creates contextualized retrieval text, builds passage and table retrieval assets, records a `retrieval_index_runs` row, and marks that run active for the revision.
+7. On success, the worker updates `documents.active_revision_id` to the new revision. On failure, the previous ready revision can remain active.
+8. FastAPI and MCP reads return only the active revision for a document, with provenance and warnings preserved.
+
+## Retrieval Boundary
+
+The deterministic core includes:
+
+- parsing and fallback policy
+- normalization
+- chunking policy
+- sparse and dense retrieval
+- fusion and reranking
+- parent expansion
+- context-pack assembly
+- warnings and provenance fields
+
+Future agent logic is downstream of this boundary. Agents can use MCP tools, but they should not replace retrieval logic implemented in the service layer.
+
+## Current Stack Choices
+
+- **FastAPI**
+  - operational HTTP surface
+  - app lifecycle, storage root creation, and MCP mounting
+- **FastMCP**
+  - curated tool surface mounted at `/mcp`
+  - no auto-generated tool surface from FastAPI routes
+- **Postgres + `pgvector` + `pgmq`**
+  - canonical records, queue dispatch, filters, vectors, and search assets in one store
+- **Docling + `pdfplumber`**
+  - primary parser plus deterministic fallback
 - **Voyage `voyage-4-large`**
-  - Default dense retrieval model for contextualized passage and table embeddings.
+  - default dense embedding model
 - **Zero Entropy `zerank-2`**
-  - Default reranker for fused sparse+dense candidates before final result selection.
-- **FastAPI + FastMCP**
-  - FastAPI is the operational surface.
-  - FastMCP is the tool surface.
-  - Keeping them separate avoids turning the HTTP API into an accidental tool contract.
-- **Contextual retrieval text + parent-child retrieval**
-  - The indexed passage representation is a section-bounded passage with deterministic context added.
-  - The same contextualized representation feeds sparse passage search and dense passage embeddings.
-  - Retrieval returns the best child results plus the parent structure needed to interpret them.
+  - default reranker model
 
-## Out of scope
+When provider API keys are missing, the runtime uses deterministic embedding and heuristic reranking implementations so the system remains operable locally.
 
-The MVP core does not include LlamaIndex, PydanticAI, autonomous answer generation, citation-graph traversal, or a memory layer. Those can be layered on later, but they must consume the deterministic retrieval contracts defined here rather than replace them.
+## Out Of Scope
+
+The current architecture does not include:
+
+- OCR or scanned-PDF support
+- answer synthesis
+- a separate orchestration or agent runtime
+- LlamaIndex or PydanticAI in the core ingestion or retrieval path
