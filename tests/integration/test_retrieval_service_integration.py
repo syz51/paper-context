@@ -207,7 +207,11 @@ def _insert_table_asset(
     section_id: UUID,
     publication_year: int | None,
     search_text: str,
+    semantic_text: str | None = None,
+    embedding: str | None = None,
 ) -> None:
+    table_semantic_text = semantic_text or search_text
+    table_embedding = embedding or _vector_string(999)
     connection.execute(
         text(
             """
@@ -220,7 +224,9 @@ def _insert_table_asset(
                 section_id,
                 publication_year,
                 search_text,
-                search_tsvector
+                semantic_text,
+                search_tsvector,
+                embedding
             )
             VALUES (
                 :id,
@@ -231,7 +237,9 @@ def _insert_table_asset(
                 :section_id,
                 :publication_year,
                 :search_text,
-                to_tsvector('english', :search_text)
+                :semantic_text,
+                to_tsvector('english', :search_text),
+                CAST(:embedding AS vector)
             )
             """
         ),
@@ -244,6 +252,8 @@ def _insert_table_asset(
             "section_id": section_id,
             "publication_year": publication_year,
             "search_text": search_text,
+            "semantic_text": table_semantic_text,
+            "embedding": table_embedding,
         },
     )
 
@@ -638,6 +648,7 @@ def test_search_passages_and_tables_return_only_active_index_version_rows(
                 section_id=section_id,
                 publication_year=None,
                 search_text="Shared methods table A B 1 2 3 4",
+                embedding=_vector_string(100),
             )
 
     service = RetrievalService(
@@ -664,7 +675,7 @@ def test_search_passages_and_tables_return_only_active_index_version_rows(
     assert tables[0].retrieval_index_run_id == active_run_id
     assert tables[0].preview.headers == ("A", "B")
     assert tables[0].preview.rows == (("1", "2"), ("3", "4"))
-    assert tables[0].retrieval_modes == ("sparse",)
+    assert tables[0].retrieval_modes == ("sparse", "dense")
 
 
 def test_active_revision_controls_reads_and_hides_previous_revision(
@@ -1052,7 +1063,7 @@ def test_active_revision_controls_reads_and_hides_previous_revision(
                     search_tsvector,
                     embedding,
                     created_at
-                ) VALUES (
+                    ) VALUES (
                     :id,
                     :retrieval_index_run_id,
                     :revision_id,
@@ -1064,7 +1075,7 @@ def test_active_revision_controls_reads_and_hides_previous_revision(
                     to_tsvector('english', :search_text),
                     CAST(:embedding AS vector),
                     :created_at
-                )
+                    )
                 """,
                 {
                     "id": uuid4(),
@@ -1093,7 +1104,9 @@ def test_active_revision_controls_reads_and_hides_previous_revision(
                     section_id,
                     publication_year,
                     search_text,
+                    semantic_text,
                     search_tsvector,
+                    embedding,
                     created_at
                 ) VALUES (
                     :id,
@@ -1104,7 +1117,9 @@ def test_active_revision_controls_reads_and_hides_previous_revision(
                     :section_id,
                     :publication_year,
                     :search_text,
+                    :semantic_text,
                     to_tsvector('english', :search_text),
+                    CAST(:embedding AS vector),
                     :created_at
                 )
                 """,
@@ -1119,6 +1134,8 @@ def test_active_revision_controls_reads_and_hides_previous_revision(
                     "section_id": revision["section_id"],
                     "publication_year": revision["publication_year"],
                     "search_text": revision["table_search_text"],
+                    "semantic_text": revision["table_search_text"],
+                    "embedding": revision["embedding"],
                     "created_at": revision["created_at"],
                 },
             )
@@ -1167,6 +1184,7 @@ def test_active_revision_controls_reads_and_hides_previous_revision(
     assert tables[0].table_id == active_table_id
     assert tables[0].document_title == "Active title"
     assert tables[0].index_version == "mvp-v2"
+    assert tables[0].retrieval_modes == ("sparse", "dense")
 
     assert context is not None
     assert context.passage.document_title == "Active title"
@@ -1322,6 +1340,7 @@ def test_search_passages_and_tables_include_all_active_versions_during_rollout(
                 section_id=section_id,
                 publication_year=None,
                 search_text=f"Rollout keyword {title} table",
+                embedding=_vector_string(20 if document_id == newer_document_id else 21),
             )
 
     service = RetrievalService(
@@ -1338,9 +1357,204 @@ def test_search_passages_and_tables_include_all_active_versions_during_rollout(
     assert {result.index_version for result in passages} == {"mvp-v2"}
     assert {result.document_id for result in tables} == {newer_document_id}
     assert {result.index_version for result in tables} == {"mvp-v2"}
+    assert {result.retrieval_modes for result in tables} == {("sparse", "dense")}
     assert pack.provenance.active_index_version == "mvp-v2"
     assert {result.document_id for result in pack.passages} == {newer_document_id}
     assert {result.index_version for result in pack.passages} == {"mvp-v2"}
+
+
+def test_build_context_pack_includes_table_led_documents(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    passage_document_id = uuid4()
+    table_document_id = uuid4()
+    passage_revision_id = uuid4()
+    table_revision_id = uuid4()
+    passage_section_id = uuid4()
+    table_section_id = uuid4()
+    passage_ingest_job_id = uuid4()
+    table_ingest_job_id = uuid4()
+    passage_run_id = uuid4()
+    table_run_id = uuid4()
+    passage_id = uuid4()
+    table_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=passage_document_id,
+            revision_id=passage_revision_id,
+            revision_number=1,
+            title="Passage-led paper",
+            created_at=now,
+            updated_at=now,
+        )
+        _insert_revisioned_document(
+            connection,
+            document_id=table_document_id,
+            revision_id=table_revision_id,
+            revision_number=1,
+            title="Table-led paper",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=passage_ingest_job_id,
+                document_id=passage_document_id,
+                revision_id=passage_revision_id,
+                source_artifact_id=None,
+                status="ready",
+                failure_code=None,
+                failure_message=None,
+                warnings=[],
+                stage_timings={},
+                started_at=now,
+                finished_at=now,
+                trigger="upload",
+                created_at=now,
+            )
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=table_ingest_job_id,
+                document_id=table_document_id,
+                revision_id=table_revision_id,
+                source_artifact_id=None,
+                status="ready",
+                failure_code=None,
+                failure_message=None,
+                warnings=[],
+                stage_timings={},
+                started_at=now,
+                finished_at=now,
+                trigger="upload",
+                created_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=passage_section_id,
+                document_id=passage_document_id,
+                revision_id=passage_revision_id,
+                parent_section_id=None,
+                heading="Methods",
+                heading_path=["Methods"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+                artifact_id=None,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=table_section_id,
+                document_id=table_document_id,
+                revision_id=table_revision_id,
+                parent_section_id=None,
+                heading="Results",
+                heading_path=["Results"],
+                ordinal=1,
+                page_start=2,
+                page_end=2,
+                artifact_id=None,
+            )
+        )
+        connection.execute(
+            insert(DocumentPassage).values(
+                id=passage_id,
+                document_id=passage_document_id,
+                revision_id=passage_revision_id,
+                section_id=passage_section_id,
+                chunk_ordinal=0,
+                body_text="Table-led query passage.",
+                contextualized_text="Table-led query passage.",
+                token_count=4,
+                page_start=1,
+                page_end=1,
+                provenance_offsets={},
+                artifact_id=None,
+            )
+        )
+        connection.execute(
+            insert(DocumentTable).values(
+                id=table_id,
+                document_id=table_document_id,
+                revision_id=table_revision_id,
+                section_id=table_section_id,
+                caption="Unrelated table",
+                table_type="lexical",
+                headers_json=["A"],
+                rows_json=[["1"]],
+                page_start=2,
+                page_end=2,
+                artifact_id=None,
+            )
+        )
+        _insert_run(
+            connection,
+            run_id=passage_run_id,
+            document_id=passage_document_id,
+            revision_id=passage_revision_id,
+            ingest_job_id=passage_ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        _insert_run(
+            connection,
+            run_id=table_run_id,
+            document_id=table_document_id,
+            revision_id=table_revision_id,
+            ingest_job_id=table_ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        _insert_passage_asset(
+            connection,
+            run_id=passage_run_id,
+            revision_id=passage_revision_id,
+            passage_id=passage_id,
+            document_id=passage_document_id,
+            section_id=passage_section_id,
+            publication_year=None,
+            search_text="Table-led query passage.",
+            embedding=_vector_string(7),
+        )
+        _insert_table_asset(
+            connection,
+            run_id=table_run_id,
+            revision_id=table_revision_id,
+            table_id=table_id,
+            document_id=table_document_id,
+            section_id=table_section_id,
+            publication_year=None,
+            search_text="Table-led query table content",
+            embedding=_vector_string(7),
+        )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+        embedding_client=FixedEmbeddingClient({"table-led query": _vector_values(7)}),
+        reranker_client=IdentityReranker(),
+    )
+
+    pack = service.build_context_pack(query="table-led query")
+
+    assert {result.document_id for result in pack.passages} == {passage_document_id}
+    assert {result.document_id for result in pack.tables} == {table_document_id}
+    assert {document.document_id for document in pack.documents} == {
+        passage_document_id,
+        table_document_id,
+    }
+    assert pack.tables[0].retrieval_modes == ("sparse", "dense")
 
 
 def test_search_passages_dense_path_uses_embeddings(
@@ -1842,6 +2056,7 @@ def test_search_retrieval_filters_apply_via_document_scope(
                 section_id=section_id,
                 publication_year=None,
                 search_text=f"{label.title()} table A {1 if label == 'match' else 2}",
+                embedding=_vector_string(4 if label == "match" else 5),
             )
 
     service = RetrievalService(
@@ -1867,6 +2082,7 @@ def test_search_retrieval_filters_apply_via_document_scope(
 
     assert [result.document_id for result in filters] == [matching_document_id]
     assert [result.document_id for result in table_filters] == [matching_document_id]
+    assert table_filters[0].retrieval_modes == ("sparse", "dense")
 
 
 def test_active_retrieval_run_unique_index_blocks_duplicate_active_rows(
@@ -2076,6 +2292,7 @@ def test_phase3_retrieval_helpers_support_cursor_table_detail_and_passage_contex
             section_id=section_id,
             publication_year=None,
             search_text="Methods table A B 1 2 3 4",
+            embedding=_vector_string(30),
         )
 
     service = RetrievalService(
@@ -2521,6 +2738,7 @@ def test_default_read_paths_handle_large_sections_and_table_payloads(
             section_id=section_id,
             publication_year=None,
             search_text="large payload keyword table",
+            embedding=_vector_string(0),
         )
 
     service = RetrievalService(

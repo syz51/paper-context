@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import zip_longest
 from typing import Any, Literal, cast
 
 from sqlalchemy import (
@@ -75,14 +76,20 @@ PASSAGE_DENSE_CANDIDATES = 30
 PASSAGE_FUSED_CANDIDATES = 40
 PASSAGE_RESULT_LIMIT = 8
 TABLE_SPARSE_CANDIDATES = 20
-TABLE_FUSED_CANDIDATES = 20
+TABLE_DENSE_CANDIDATES = 20
+TABLE_FUSED_CANDIDATES = 24
 TABLE_RESULT_LIMIT = 5
 RRF_K = 60
 PARENT_SIBLINGS_BEFORE = 1
 PARENT_SIBLINGS_AFTER = 1
 TABLE_PREVIEW_ROWS = 3
+TABLE_SEMANTIC_SAMPLE_ROWS = 3
 EMBEDDING_DIMENSIONS = 1024
 INDEX_BUILD_BATCH_SIZE = 128
+DENSE_EF_SEARCH_MIN = 40
+DENSE_EF_SEARCH_MAX = 400
+DENSE_EF_SEARCH_MULTIPLIER = 6
+DENSE_FILTER_EF_SEARCH_MULTIPLIER = 10
 _RETRIEVAL_NAMESPACE = uuid.UUID("68b1ce8d-1a1e-49f5-b1db-47052d7ece6c")
 
 _DOCUMENTS_SQL = table(
@@ -366,10 +373,41 @@ class DocumentRetrievalIndexer:
             revision_id=revision_id,
             batch_size=INDEX_BUILD_BATCH_SIZE,
         ):
+            table_semantic_texts = [self._build_table_semantic_text(row) for row in tables]
+            with observe_operation(
+                "ingest.embedding",
+                logger=logger,
+                fields={
+                    "document_id": str(document_id),
+                    "revision_id": str(revision_id),
+                    "ingest_job_id": str(ingest_job_id),
+                    "batch_size": len(tables),
+                    "entity_kind": "table",
+                },
+            ) as embedding_timing:
+                table_embeddings = self.embedding_client.embed(
+                    table_semantic_texts,
+                    input_type="document",
+                )
+            _accumulate_stage_timing(stage_timings, "embedding_seconds", embedding_timing)
+            batch_dimensions = table_embeddings.dimensions
+            if batch_dimensions != EMBEDDING_DIMENSIONS:
+                raise RetrievalError(
+                    "embedding dimension mismatch for retrieval assets: "
+                    f"expected {EMBEDDING_DIMENSIONS}, got {batch_dimensions}"
+                )
+            if embedding_dimensions is None:
+                embedding_dimensions = batch_dimensions
+            elif embedding_dimensions != batch_dimensions:
+                raise RetrievalError(
+                    "embedding dimension mismatch across retrieval asset batches: "
+                    f"expected {embedding_dimensions}, got {batch_dimensions}"
+                )
             self._insert_table_asset_batch(
                 connection,
                 run_id=run_id,
                 rows=tables,
+                embeddings=table_embeddings.embeddings,
                 created_at=now,
             )
         self._activate_build_run(
@@ -722,6 +760,7 @@ class DocumentRetrievalIndexer:
         *,
         run_id: uuid.UUID,
         rows: list[_TableIndexRow],
+        embeddings: tuple[tuple[float, ...], ...],
         created_at: datetime,
     ) -> None:
         statement = insert(RetrievalTableAsset).values(
@@ -733,13 +772,17 @@ class DocumentRetrievalIndexer:
             section_id=bindparam("b_section_id"),
             publication_year=bindparam("b_publication_year"),
             search_text=bindparam("b_search_text"),
+            semantic_text=bindparam("b_semantic_text"),
             search_tsvector=func.to_tsvector("english", bindparam("b_search_text")),
+            embedding=bindparam("b_embedding"),
             created_at=bindparam("b_created_at"),
         )
         payloads: list[dict[str, object]] = []
-        for row in rows:
+        for row, embedding in zip(rows, embeddings, strict=True):
             asset_id = uuid.uuid4()
             search_text = self._build_table_search_text(row)
+            semantic_text = self._build_table_semantic_text(row)
+            embedding_literal = _vector_literal(embedding)
             payloads.append(
                 {
                     "id": asset_id,
@@ -758,6 +801,10 @@ class DocumentRetrievalIndexer:
                     "b_publication_year": row.publication_year,
                     "search_text": search_text,
                     "b_search_text": search_text,
+                    "semantic_text": semantic_text,
+                    "b_semantic_text": semantic_text,
+                    "embedding": embedding_literal,
+                    "b_embedding": embedding_literal,
                     "created_at": created_at,
                     "b_created_at": created_at,
                 }
@@ -831,6 +878,48 @@ class DocumentRetrievalIndexer:
             lines.append("Table rows:")
             lines.extend(row_lines)
         return "\n".join(lines)
+
+    def _build_table_semantic_text(self, row: _TableIndexRow) -> str:
+        section_path = " > ".join(row.section_path) if row.section_path else "Body"
+        lines = [
+            f"Document title: {row.document_title}",
+            f"Section path: {section_path}",
+        ]
+        if row.publication_year is not None:
+            lines.append(f"Publication year: {row.publication_year}")
+        if row.table_type:
+            lines.append(f"Table type: {row.table_type}")
+        if row.caption:
+            lines.append(f"Table caption: {row.caption}")
+        if row.headers:
+            lines.append(f"Columns: {', '.join(row.headers)}")
+        examples = [
+            example
+            for example in (
+                self._build_table_semantic_example(row.headers, table_row)
+                for table_row in row.rows[:TABLE_SEMANTIC_SAMPLE_ROWS]
+            )
+            if example
+        ]
+        if examples:
+            lines.append("Example values:")
+            lines.extend(examples)
+        return "\n".join(lines)
+
+    def _build_table_semantic_example(
+        self,
+        headers: tuple[str, ...],
+        table_row: tuple[str, ...],
+    ) -> str:
+        parts: list[str] = []
+        for index, (header, value) in enumerate(
+            zip_longest(headers, table_row, fillvalue=""), start=1
+        ):
+            if not value:
+                continue
+            label = header or f"Column {index}"
+            parts.append(f"{label}={value}")
+        return "; ".join(parts)
 
 
 class RetrievalService:
@@ -1017,14 +1106,13 @@ class RetrievalService:
                     fingerprint=fingerprint,
                 )
                 passages = passage_page.items
-                pack_document_ids = tuple(dict.fromkeys(result.document_id for result in passages))
                 tables = tuple(
                     self._search_tables_with_connection(
                         connection,
                         query=query,
                         filters=filters,
                         limit=TABLE_RESULT_LIMIT,
-                        filtered_document_ids=pack_document_ids or filtered_document_ids,
+                        filtered_document_ids=filtered_document_ids,
                         active_runs=active_runs,
                     )
                 )
@@ -1321,6 +1409,31 @@ class RetrievalService:
             raise RetrievalError("retrieval service has no connection factory configured")
         return self._connection_factory()
 
+    def _initial_sparse_candidate_limit(
+        self,
+        *,
+        base_limit: int,
+        result_limit: int | None,
+    ) -> int:
+        if result_limit is None:
+            return base_limit
+        return max(base_limit, result_limit * 4)
+
+    def _initial_dense_candidate_limit(
+        self,
+        *,
+        base_limit: int,
+        result_limit: int | None,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+    ) -> int:
+        limit = self._initial_sparse_candidate_limit(
+            base_limit=base_limit,
+            result_limit=result_limit,
+        )
+        if result_limit is not None and filtered_document_ids is not None:
+            limit = max(limit, result_limit * 8)
+        return limit
+
     def _search_passages_with_connection(
         self,
         connection: Connection,
@@ -1347,14 +1460,23 @@ class RetrievalService:
             )
         if not active_runs.run_ids:
             return []
+        sparse_limit = self._initial_sparse_candidate_limit(
+            base_limit=PASSAGE_SPARSE_CANDIDATES,
+            result_limit=limit,
+        )
+        dense_limit = self._initial_dense_candidate_limit(
+            base_limit=PASSAGE_DENSE_CANDIDATES,
+            result_limit=limit,
+            filtered_document_ids=filtered_document_ids,
+        )
         results, _, _ = self._load_ranked_passage_results(
             connection,
             query=query,
             limit=limit,
             filtered_document_ids=filtered_document_ids,
             active_runs=active_runs,
-            sparse_candidate_limit=PASSAGE_SPARSE_CANDIDATES,
-            dense_candidate_limit=PASSAGE_DENSE_CANDIDATES,
+            sparse_candidate_limit=sparse_limit,
+            dense_candidate_limit=dense_limit,
         )
         return results
 
@@ -1384,13 +1506,23 @@ class RetrievalService:
             )
         if not active_runs.run_ids:
             return []
-        results, _ = self._load_ranked_table_results(
+        sparse_limit = self._initial_sparse_candidate_limit(
+            base_limit=TABLE_SPARSE_CANDIDATES,
+            result_limit=limit,
+        )
+        dense_limit = self._initial_dense_candidate_limit(
+            base_limit=TABLE_DENSE_CANDIDATES,
+            result_limit=limit,
+            filtered_document_ids=filtered_document_ids,
+        )
+        results, _, _ = self._load_ranked_table_results(
             connection,
             query=query,
             limit=limit,
             filtered_document_ids=filtered_document_ids,
             active_runs=active_runs,
-            sparse_candidate_limit=TABLE_SPARSE_CANDIDATES,
+            sparse_candidate_limit=sparse_limit,
+            dense_candidate_limit=dense_limit,
         )
         return results
 
@@ -1406,8 +1538,15 @@ class RetrievalService:
         active_runs: _ActiveRunSelection,
         fingerprint: str,
     ) -> SearchPage[PassageResult]:
-        sparse_limit = PASSAGE_SPARSE_CANDIDATES
-        dense_limit = PASSAGE_DENSE_CANDIDATES
+        sparse_limit = self._initial_sparse_candidate_limit(
+            base_limit=PASSAGE_SPARSE_CANDIDATES,
+            result_limit=limit,
+        )
+        dense_limit = self._initial_dense_candidate_limit(
+            base_limit=PASSAGE_DENSE_CANDIDATES,
+            result_limit=limit,
+            filtered_document_ids=filtered_document_ids,
+        )
         previous_signature: tuple[tuple[str, ...], str | None] | None = None
         while True:
             results, sparse_count, dense_count = self._load_ranked_passage_results(
@@ -1462,16 +1601,25 @@ class RetrievalService:
         active_runs: _ActiveRunSelection,
         fingerprint: str,
     ) -> SearchPage[TableResult]:
-        sparse_limit = TABLE_SPARSE_CANDIDATES
+        sparse_limit = self._initial_sparse_candidate_limit(
+            base_limit=TABLE_SPARSE_CANDIDATES,
+            result_limit=limit,
+        )
+        dense_limit = self._initial_dense_candidate_limit(
+            base_limit=TABLE_DENSE_CANDIDATES,
+            result_limit=limit,
+            filtered_document_ids=filtered_document_ids,
+        )
         previous_signature: tuple[tuple[str, ...], str | None] | None = None
         while True:
-            results, sparse_count = self._load_ranked_table_results(
+            results, sparse_count, dense_count = self._load_ranked_table_results(
                 connection,
                 query=query,
                 limit=None,
                 filtered_document_ids=filtered_document_ids,
                 active_runs=active_runs,
                 sparse_candidate_limit=sparse_limit,
+                dense_candidate_limit=dense_limit,
             )
             page = cast(
                 SearchPage[TableResult],
@@ -1489,7 +1637,8 @@ class RetrievalService:
                 page.next_cursor,
             )
             sparse_exhausted = sparse_count < sparse_limit
-            if sparse_exhausted:
+            dense_exhausted = self._embedding_client is None or dense_count < dense_limit
+            if sparse_exhausted and dense_exhausted:
                 return page
             if (
                 page.next_cursor is not None
@@ -1498,7 +1647,10 @@ class RetrievalService:
             ):
                 return page
             previous_signature = signature
-            sparse_limit *= 2
+            if not sparse_exhausted:
+                sparse_limit *= 2
+            if self._embedding_client is not None and not dense_exhausted:
+                dense_limit *= 2
 
     def _load_ranked_passage_results(
         self,
@@ -1548,9 +1700,10 @@ class RetrievalService:
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         active_runs: _ActiveRunSelection,
         sparse_candidate_limit: int | None,
-    ) -> tuple[list[TableResult], int]:
+        dense_candidate_limit: int | None,
+    ) -> tuple[list[TableResult], int, int]:
         if not query.strip() or filtered_document_ids == () or not active_runs.run_ids:
-            return [], 0
+            return [], 0, 0
         sparse_candidates = self._load_sparse_table_candidates(
             connection,
             query=query,
@@ -1558,15 +1711,23 @@ class RetrievalService:
             filtered_document_ids=filtered_document_ids,
             limit=sparse_candidate_limit,
         )
+        dense_candidates = self._load_dense_table_candidates(
+            connection,
+            query=query,
+            retrieval_index_run_ids=active_runs.run_ids,
+            filtered_document_ids=filtered_document_ids,
+            limit=dense_candidate_limit,
+        )
         fused = self._fuse_candidates(
             sparse_candidates,
-            [],
+            dense_candidates,
             fused_limit=None if limit is None else TABLE_FUSED_CANDIDATES,
         )
         reranked = self._rerank_candidates(query=query, candidates=fused, limit=limit)
         return (
             [self._candidate_to_table_result(candidate) for candidate in reranked],
             len(sparse_candidates),
+            len(dense_candidates),
         )
 
     def _resolve_active_run_selection(
@@ -1712,6 +1873,48 @@ class RetrievalService:
         rows = connection.execute(statement, params).scalars().all()
         return tuple(cast(list[uuid.UUID], rows))
 
+    def _configure_dense_vector_search(
+        self,
+        connection: Connection,
+        *,
+        candidate_limit: int | None,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+    ) -> None:
+        ef_search = self._dense_ef_search(
+            candidate_limit=candidate_limit,
+            filtered_document_ids=filtered_document_ids,
+        )
+        connection.execute(text(f"SET LOCAL hnsw.ef_search = {ef_search}"))
+        connection.execute(text("SET LOCAL hnsw.iterative_scan = strict_order"))
+
+    def _dense_ef_search(
+        self,
+        *,
+        candidate_limit: int | None,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+    ) -> int:
+        effective_limit = max(candidate_limit or 0, 1)
+        multiplier = (
+            DENSE_FILTER_EF_SEARCH_MULTIPLIER
+            if filtered_document_ids is not None
+            else DENSE_EF_SEARCH_MULTIPLIER
+        )
+        return max(
+            DENSE_EF_SEARCH_MIN,
+            min(DENSE_EF_SEARCH_MAX, effective_limit * multiplier),
+        )
+
+    def _should_retry_exact_dense_query(
+        self,
+        *,
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        returned_count: int,
+        requested_limit: int | None,
+    ) -> bool:
+        if filtered_document_ids is None or requested_limit is None:
+            return False
+        return returned_count < requested_limit
+
     def _load_sparse_passage_candidates(
         self,
         connection: Connection,
@@ -1833,11 +2036,16 @@ class RetrievalService:
             "retrieval_index_run_ids": list(retrieval_index_run_ids),
             "apply_document_filter": filtered_document_ids is not None,
             "document_ids": list(filtered_document_ids or ()),
+            "candidate_limit": limit,
         }
         limit_sql = ""
         if limit is not None:
-            params["candidate_limit"] = limit
             limit_sql = "\n                LIMIT :candidate_limit"
+        self._configure_dense_vector_search(
+            connection,
+            candidate_limit=limit,
+            filtered_document_ids=filtered_document_ids,
+        )
         query_sql = """
             WITH candidate_assets AS (
                 SELECT
@@ -1906,6 +2114,84 @@ class RetrievalService:
             .mappings()
             .all()
         )
+        if self._should_retry_exact_dense_query(
+            filtered_document_ids=filtered_document_ids,
+            returned_count=len(rows),
+            requested_limit=limit,
+        ):
+            exact_rows = (
+                connection.execute(
+                    text(
+                        """
+                        WITH filtered_assets AS MATERIALIZED (
+                            SELECT
+                                assets.id,
+                                assets.retrieval_index_run_id,
+                                assets.passage_id,
+                                1 - (
+                                    assets.embedding <=> CAST(:query_embedding AS vector)
+                                ) AS dense_score
+                            FROM retrieval_passage_assets assets
+                            WHERE assets.retrieval_index_run_id = ANY(
+                                CAST(:retrieval_index_run_ids AS uuid[])
+                            )
+                              AND assets.embedding IS NOT NULL
+                              AND (
+                                  :apply_document_filter = false
+                                  OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
+                              )
+                        )
+                        SELECT
+                            passages.id AS passage_id,
+                            passages.document_id,
+                            passages.section_id,
+                            passages.chunk_ordinal,
+                            passages.body_text,
+                            passages.contextualized_text,
+                            passages.page_start,
+                            passages.page_end,
+                            COALESCE(
+                                revisions.title,
+                                documents.title,
+                                'Untitled document'
+                            ) AS document_title,
+                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
+                            runs.id AS retrieval_index_run_id,
+                            runs.index_version,
+                            runs.parser_source,
+                            COALESCE(jobs.warnings, '[]'::jsonb) AS warnings,
+                            filtered_assets.dense_score
+                        FROM filtered_assets
+                        JOIN retrieval_index_runs runs
+                            ON runs.id = filtered_assets.retrieval_index_run_id
+                        JOIN document_passages passages
+                            ON passages.id = filtered_assets.passage_id
+                           AND (
+                               passages.revision_id = runs.revision_id
+                               OR (passages.revision_id IS NULL AND runs.revision_id IS NULL)
+                           )
+                        JOIN document_sections sections
+                            ON sections.id = passages.section_id
+                           AND (
+                               sections.revision_id = passages.revision_id
+                               OR (sections.revision_id IS NULL AND passages.revision_id IS NULL)
+                           )
+                        JOIN documents
+                            ON documents.id = passages.document_id
+                        LEFT JOIN document_revisions revisions
+                            ON revisions.id = documents.active_revision_id
+                        JOIN ingest_jobs jobs
+                            ON jobs.id = runs.ingest_job_id
+                        ORDER BY filtered_assets.dense_score DESC, passages.id
+                        LIMIT COALESCE(CAST(:candidate_limit AS integer), 2147483647)
+                        """
+                    ),
+                    params,
+                )
+                .mappings()
+                .all()
+            )
+            rows = exact_rows
         return [self._row_to_passage_candidate(row) for row in rows]
 
     def _load_sparse_table_candidates(
@@ -1933,7 +2219,6 @@ class RetrievalService:
                     assets.id,
                     assets.retrieval_index_run_id,
                     assets.table_id,
-                    assets.search_text,
                     ts_rank_cd(
                         assets.search_tsvector,
                         websearch_to_tsquery('english', :query)
@@ -1966,7 +2251,7 @@ class RetrievalService:
                 runs.index_version,
                 runs.parser_source,
                 COALESCE(jobs.warnings, '[]'::jsonb) AS warnings,
-                candidate_assets.search_text,
+                assets.semantic_text,
                 candidate_assets.rank_score
             FROM candidate_assets
             JOIN retrieval_table_assets assets
@@ -2001,6 +2286,203 @@ class RetrievalService:
             .mappings()
             .all()
         )
+        return [self._row_to_table_candidate(row) for row in rows]
+
+    def _load_dense_table_candidates(
+        self,
+        connection: Connection,
+        *,
+        query: str,
+        retrieval_index_run_ids: tuple[uuid.UUID, ...],
+        filtered_document_ids: tuple[uuid.UUID, ...] | None,
+        limit: int | None,
+    ) -> list[_Candidate]:
+        if self._embedding_client is None:
+            return []
+        with observe_operation(
+            "retrieval.embedding",
+            logger=logger,
+            fields={
+                "query": query.strip(),
+                "candidate_limit": limit,
+                "entity_kind": "table",
+            },
+        ):
+            batch = self._embedding_client.embed([query], input_type="query")
+        if not batch.embeddings:
+            return []
+        if batch.dimensions != EMBEDDING_DIMENSIONS:
+            raise RetrievalError(
+                "query embedding dimension mismatch: "
+                f"expected {EMBEDDING_DIMENSIONS}, got {batch.dimensions}"
+            )
+        params: dict[str, object] = {
+            "query_embedding": _vector_literal(batch.embeddings[0]),
+            "retrieval_index_run_ids": list(retrieval_index_run_ids),
+            "apply_document_filter": filtered_document_ids is not None,
+            "document_ids": list(filtered_document_ids or ()),
+            "candidate_limit": limit,
+        }
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "\n                LIMIT :candidate_limit"
+        self._configure_dense_vector_search(
+            connection,
+            candidate_limit=limit,
+            filtered_document_ids=filtered_document_ids,
+        )
+        query_sql = """
+            WITH candidate_assets AS (
+                SELECT
+                    assets.id,
+                    assets.retrieval_index_run_id,
+                    assets.table_id,
+                    1 - (assets.embedding <=> CAST(:query_embedding AS vector)) AS dense_score
+                FROM retrieval_table_assets assets
+                WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
+                  AND assets.embedding IS NOT NULL
+                  AND (
+                      :apply_document_filter = false
+                      OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
+                  )
+                ORDER BY assets.embedding <=> CAST(:query_embedding AS vector), assets.table_id
+            """
+        query_sql += limit_sql
+        query_sql += """
+            )
+            SELECT
+                tables.id AS table_id,
+                tables.document_id,
+                tables.section_id,
+                tables.caption,
+                tables.table_type,
+                COALESCE(tables.headers_json, '[]'::jsonb) AS headers_json,
+                COALESCE(tables.rows_json, '[]'::jsonb) AS rows_json,
+                tables.page_start,
+                tables.page_end,
+                COALESCE(revisions.title, documents.title, 'Untitled document') AS document_title,
+                COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
+                runs.id AS retrieval_index_run_id,
+                runs.index_version,
+                runs.parser_source,
+                COALESCE(jobs.warnings, '[]'::jsonb) AS warnings,
+                assets.semantic_text,
+                candidate_assets.dense_score
+            FROM candidate_assets
+            JOIN retrieval_table_assets assets
+                ON assets.id = candidate_assets.id
+            JOIN retrieval_index_runs runs
+                ON runs.id = assets.retrieval_index_run_id
+            JOIN document_tables tables
+                ON tables.id = assets.table_id
+               AND (
+                   tables.revision_id = runs.revision_id
+                   OR (tables.revision_id IS NULL AND runs.revision_id IS NULL)
+               )
+            JOIN document_sections sections
+                ON sections.id = tables.section_id
+               AND (
+                   sections.revision_id = tables.revision_id
+                   OR (sections.revision_id IS NULL AND tables.revision_id IS NULL)
+               )
+            JOIN documents
+                ON documents.id = tables.document_id
+            LEFT JOIN document_revisions revisions
+                ON revisions.id = documents.active_revision_id
+            JOIN ingest_jobs jobs
+                ON jobs.id = runs.ingest_job_id
+            ORDER BY assets.embedding <=> CAST(:query_embedding AS vector), tables.id
+            """
+        rows = (
+            connection.execute(
+                text(query_sql),
+                params,
+            )
+            .mappings()
+            .all()
+        )
+        if self._should_retry_exact_dense_query(
+            filtered_document_ids=filtered_document_ids,
+            returned_count=len(rows),
+            requested_limit=limit,
+        ):
+            exact_rows = (
+                connection.execute(
+                    text(
+                        """
+                        WITH filtered_assets AS MATERIALIZED (
+                            SELECT
+                                assets.id,
+                                assets.retrieval_index_run_id,
+                                assets.table_id,
+                                1 - (
+                                    assets.embedding <=> CAST(:query_embedding AS vector)
+                                ) AS dense_score
+                            FROM retrieval_table_assets assets
+                            WHERE assets.retrieval_index_run_id = ANY(
+                                CAST(:retrieval_index_run_ids AS uuid[])
+                            )
+                              AND assets.embedding IS NOT NULL
+                              AND (
+                                  :apply_document_filter = false
+                                  OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
+                              )
+                        )
+                        SELECT
+                            tables.id AS table_id,
+                            tables.document_id,
+                            tables.section_id,
+                            tables.caption,
+                            tables.table_type,
+                            COALESCE(tables.headers_json, '[]'::jsonb) AS headers_json,
+                            COALESCE(tables.rows_json, '[]'::jsonb) AS rows_json,
+                            tables.page_start,
+                            tables.page_end,
+                            COALESCE(
+                                revisions.title,
+                                documents.title,
+                                'Untitled document'
+                            ) AS document_title,
+                            COALESCE(sections.heading_path, '[]'::jsonb) AS section_path,
+                            runs.id AS retrieval_index_run_id,
+                            runs.index_version,
+                            runs.parser_source,
+                            COALESCE(jobs.warnings, '[]'::jsonb) AS warnings,
+                            assets.semantic_text,
+                            filtered_assets.dense_score
+                        FROM filtered_assets
+                        JOIN retrieval_table_assets assets
+                            ON assets.id = filtered_assets.id
+                        JOIN retrieval_index_runs runs
+                            ON runs.id = filtered_assets.retrieval_index_run_id
+                        JOIN document_tables tables
+                            ON tables.id = filtered_assets.table_id
+                           AND (
+                               tables.revision_id = runs.revision_id
+                               OR (tables.revision_id IS NULL AND runs.revision_id IS NULL)
+                           )
+                        JOIN document_sections sections
+                            ON sections.id = tables.section_id
+                           AND (
+                               sections.revision_id = tables.revision_id
+                               OR (sections.revision_id IS NULL AND tables.revision_id IS NULL)
+                           )
+                        JOIN documents
+                            ON documents.id = tables.document_id
+                        LEFT JOIN document_revisions revisions
+                            ON revisions.id = documents.active_revision_id
+                        JOIN ingest_jobs jobs
+                            ON jobs.id = runs.ingest_job_id
+                        ORDER BY filtered_assets.dense_score DESC, tables.id
+                        LIMIT COALESCE(CAST(:candidate_limit AS integer), 2147483647)
+                        """
+                    ),
+                    params,
+                )
+                .mappings()
+                .all()
+            )
+            rows = exact_rows
         return [self._row_to_table_candidate(row) for row in rows]
 
     def _fuse_candidates(
@@ -2116,7 +2598,7 @@ class RetrievalService:
             index_version=row["index_version"],
             parser_source=row.get("parser_source"),
             warnings=warnings,
-            rerank_text=row["search_text"],
+            rerank_text=row.get("semantic_text") or row.get("search_text") or "",
             table_id=row["table_id"],
             caption=row["caption"],
             table_type=row["table_type"],

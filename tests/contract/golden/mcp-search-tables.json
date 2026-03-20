@@ -15,7 +15,7 @@
         "row_count": 1
       },
       "score": 0.88,
-      "retrieval_modes": ["sparse"],
+      "retrieval_modes": ["sparse", "dense"],
       "page_start": 2,
       "page_end": 2,
       "index_version": "mvp-v1",

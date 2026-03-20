@@ -166,6 +166,8 @@ EXPECTED_SCHEMA_TABLE_COLUMNS = {
         "publication_year",
         "search_text",
         "search_tsvector",
+        "semantic_text",
+        "embedding",
         "created_at",
     },
 }
@@ -233,6 +235,7 @@ EXPECTED_SCHEMA_INDEX_COLUMNS = {
         "retrieval_index_run_id",
     ],
     "ix_retrieval_table_assets_search_tsvector": ["search_tsvector"],
+    "ix_retrieval_table_assets_embedding": ["embedding"],
 }
 
 

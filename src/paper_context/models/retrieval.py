@@ -237,6 +237,12 @@ class RetrievalTableAsset(Base):
             "search_tsvector",
             postgresql_using="gin",
         ),
+        Index(
+            "ix_retrieval_table_assets_embedding",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -267,5 +273,7 @@ class RetrievalTableAsset(Base):
     )
     publication_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     search_text: Mapped[str] = mapped_column(Text, nullable=False)
+    semantic_text: Mapped[str] = mapped_column(Text, nullable=False)
     search_tsvector: Mapped[str] = mapped_column(TSVECTOR, nullable=False)
+    embedding: Mapped[list[float] | None] = mapped_column(PgVector(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

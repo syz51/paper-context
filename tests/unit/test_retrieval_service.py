@@ -217,6 +217,7 @@ def test_search_tables_returns_structured_preview() -> None:
     )
 
     service._load_sparse_table_candidates = MagicMock(return_value=[table_candidate])  # type: ignore[method-assign]
+    service._load_dense_table_candidates = MagicMock(return_value=[table_candidate])  # type: ignore[method-assign]
 
     results = service.search_tables(query="table query")
 
@@ -225,20 +226,32 @@ def test_search_tables_returns_structured_preview() -> None:
     assert results[0].preview.headers == ("A", "B")
     assert results[0].preview.rows == (("1", "2"), ("3", "4"))
     assert results[0].preview.row_count == 2
-    assert results[0].retrieval_modes == ("sparse",)
+    assert results[0].retrieval_modes == ("sparse", "dense")
 
 
-def test_search_tables_skips_dense_candidate_loader() -> None:
+def test_search_tables_dense_only_hit_survives_rerank() -> None:
     service = _service()
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
     service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
         return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
     )
+    run_id = uuid4()
+    dense_candidate = _table_candidate(
+        entity_id=uuid4(),
+        retrieval_index_run_id=run_id,
+        index_version="mvp-v1",
+        text="Dense only table",
+        modes={"dense"},
+    )
     service._load_sparse_table_candidates = MagicMock(return_value=[])  # type: ignore[method-assign]
+    service._load_dense_table_candidates = MagicMock(return_value=[dense_candidate])  # type: ignore[method-assign]
 
-    assert service.search_tables(query="table query") == []
+    results = service.search_tables(query="dense table")
 
-    service._load_sparse_table_candidates.assert_called_once()
+    assert len(results) == 1
+    assert results[0].table_id == dense_candidate.table_id
+    assert results[0].retrieval_modes == ("dense",)
+    service._load_dense_table_candidates.assert_called_once()
 
 
 def test_build_context_pack_propagates_warnings_and_provenance() -> None:
@@ -316,6 +329,85 @@ def test_build_context_pack_propagates_warnings_and_provenance() -> None:
         retrieval_modes=("sparse",),
     )
     assert pack.warnings == ("parser_fallback_used", "parent_context_truncated")
+
+
+def test_build_context_pack_allows_table_led_documents() -> None:
+    service = _service()
+    passage = PassageResult(
+        passage_id=uuid4(),
+        document_id=uuid4(),
+        section_id=uuid4(),
+        document_title="Paper A",
+        section_path=("Methods",),
+        text="Selected context",
+        score=1.0,
+        retrieval_modes=("sparse",),
+        page_start=1,
+        page_end=1,
+        index_version="mvp-v1",
+        retrieval_index_run_id=uuid4(),
+    )
+    table = TableResult(
+        table_id=uuid4(),
+        document_id=uuid4(),
+        section_id=uuid4(),
+        document_title="Paper B",
+        section_path=("Results",),
+        caption="Result table",
+        table_type="lexical",
+        preview=TablePreview(headers=("A",), rows=(("1",),), row_count=1),
+        score=1.0,
+        retrieval_modes=("sparse", "dense"),
+        page_start=1,
+        page_end=1,
+        index_version="mvp-v1",
+        retrieval_index_run_id=uuid4(),
+    )
+    passage_document = DocumentSummary(
+        document_id=passage.document_id,
+        title="Paper A",
+        authors=(),
+        publication_year=2024,
+        quant_tags={},
+        current_status="ready",
+        active_index_version="mvp-v1",
+    )
+    table_document = DocumentSummary(
+        document_id=table.document_id,
+        title="Paper B",
+        authors=(),
+        publication_year=2024,
+        quant_tags={},
+        current_status="ready",
+        active_index_version="mvp-v1",
+    )
+
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(
+            run_ids=(passage.retrieval_index_run_id, table.retrieval_index_run_id),
+            index_versions=("mvp-v1",),
+        )
+    )
+    service._search_passages_page_with_connection = MagicMock(  # type: ignore[method-assign]
+        return_value=SearchPage(items=(passage,), next_cursor=None, index_version="mvp-v1")
+    )
+    service._search_tables_with_connection = MagicMock(return_value=[table])  # type: ignore[method-assign]
+    service._load_parent_sections = MagicMock(return_value=())  # type: ignore[method-assign]
+    service._load_document_summaries = MagicMock(  # type: ignore[method-assign]
+        return_value=(passage_document, table_document)
+    )
+
+    pack = service.build_context_pack(query="table-led query")
+
+    assert pack.passages == (passage,)
+    assert pack.tables == (table,)
+    assert {document.document_id for document in pack.documents} == {
+        passage.document_id,
+        table.document_id,
+    }
+    assert pack.provenance.retrieval_modes == ("sparse", "dense")
+    assert service._search_tables_with_connection.call_args.kwargs["filtered_document_ids"] is None
 
 
 def test_build_context_pack_rejects_mixed_index_versions() -> None:

@@ -492,6 +492,53 @@ def test_sparse_and_dense_candidate_loaders_cover_rows_and_empty_results() -> No
     )
 
 
+def test_ranked_table_results_fuse_sparse_and_dense_candidates() -> None:
+    service = _service(reranker_client=None)
+    run_id = uuid4()
+    shared = _table_candidate(
+        entity_id=uuid4(),
+        retrieval_index_run_id=run_id,
+        index_version="mvp-v1",
+        text="shared table",
+        modes={"sparse"},
+    )
+    sparse_only = _table_candidate(
+        entity_id=uuid4(),
+        retrieval_index_run_id=run_id,
+        index_version="mvp-v1",
+        text="sparse table",
+        modes={"sparse"},
+    )
+    shared_dense = _table_candidate(
+        entity_id=shared.entity_id,
+        retrieval_index_run_id=run_id,
+        index_version="mvp-v1",
+        text="shared table",
+        modes={"dense"},
+    )
+
+    service._load_sparse_table_candidates = MagicMock(return_value=[shared, sparse_only])  # type: ignore[method-assign]
+    service._load_dense_table_candidates = MagicMock(return_value=[shared_dense])  # type: ignore[method-assign]
+
+    results, sparse_count, dense_count = service._load_ranked_table_results(
+        MagicMock(),
+        query="search",
+        limit=5,
+        filtered_document_ids=None,
+        active_runs=_ActiveRunSelection(run_ids=(run_id,), index_versions=("mvp-v1",)),
+        sparse_candidate_limit=5,
+        dense_candidate_limit=5,
+    )
+
+    assert sparse_count == 2
+    assert dense_count == 1
+    assert len(results) == 2
+    assert results[0].table_id == shared.table_id
+    assert results[0].retrieval_modes == ("sparse", "dense")
+    assert results[1].table_id == sparse_only.table_id
+    assert results[1].retrieval_modes == ("sparse",)
+
+
 def test_dense_loader_rejects_bad_embedding_dimensions() -> None:
     service = _service(
         embedding_client=_StubEmbeddingClient(
@@ -941,7 +988,13 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
                     model="stub",
                     dimensions=1024,
                     embeddings=((0.1,) * 1024,),
-                )
+                ),
+                EmbeddingBatch(
+                    provider="stub",
+                    model="stub",
+                    dimensions=1024,
+                    embeddings=((0.1,) * 1024,),
+                ),
             ]
         ),
         reranker_client=_StubRerankerClient([[RerankItem(index=0, score=1.0)]]),
@@ -1031,10 +1084,12 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
         connection,
         run_id=run_id,
         rows=[table_index_row],
+        embeddings=((0.2,) * 1024,),
         created_at=datetime.now(UTC),
     )
     table_params = connection.execute.call_args_list[-1].args[1][0]
     assert "Table headers: A | 2" in table_params["search_text"]
+    assert table_params["embedding"] == _vector_literal((0.2,) * 1024)
 
     passage_batches = iter([[passage_index_row]])
     table_batches = iter([[table_index_row]])
@@ -1059,6 +1114,7 @@ def test_indexer_helper_methods_and_rebuild_control_flow() -> None:
     indexer._clear_existing_assets.assert_called_once()
     indexer._insert_passage_asset_batch.assert_called_once()
     indexer._insert_table_asset_batch.assert_called_once()
+    assert indexer._insert_table_asset_batch.call_args.kwargs["embeddings"] == ((0.1,) * 1024,)
     indexer._activate_build_run.assert_called_once()
 
 
@@ -1174,7 +1230,8 @@ def test_ranked_result_loaders_cover_guard_clauses_and_missing_active_runs() -> 
         filtered_document_ids=(),
         active_runs=active_runs,
         sparse_candidate_limit=5,
-    ) == ([], 0)
+        dense_candidate_limit=5,
+    ) == ([], 0, 0)
 
     empty_selection = _service(active_index_version=None)._resolve_active_run_selection(
         _connection(_mock_result(rows=[])),
