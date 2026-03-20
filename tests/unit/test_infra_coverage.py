@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -291,19 +290,27 @@ def test_parser_isolation_subprocess_parser_covers_failure_branches(
     assert no_input.failure_code == "docling_subprocess_protocol_failed"
 
     def _nonzero_exit(*args, **kwargs):
-        del kwargs
-        return subprocess.CompletedProcess(args[0], 1, stdout=b"oops", stderr=b"err")
+        del args, kwargs
+        return parser_isolation._BoundedSubprocessResult(
+            returncode=1,
+            stdout=b"oops",
+            stderr=b"err",
+        )
 
-    monkeypatch.setattr(parser_isolation.subprocess, "run", _nonzero_exit)
+    monkeypatch.setattr(parser_isolation, "_run_parser_subprocess", _nonzero_exit)
     nonzero = parser.parse("paper.pdf", b"%PDF-1.4")
     assert nonzero.gate_status == "fail"
     assert nonzero.failure_code == "docling_subprocess_failed"
 
     def _bad_json(*args, **kwargs):
-        del kwargs
-        return subprocess.CompletedProcess(args[0], 0, stdout=b"not-json", stderr=b"")
+        del args, kwargs
+        return parser_isolation._BoundedSubprocessResult(
+            returncode=0,
+            stdout=b"not-json",
+            stderr=b"",
+        )
 
-    monkeypatch.setattr(parser_isolation.subprocess, "run", _bad_json)
+    monkeypatch.setattr(parser_isolation, "_run_parser_subprocess", _bad_json)
     bad_json = parser.parse("paper.pdf", b"%PDF-1.4")
     assert bad_json.gate_status == "fail"
     assert bad_json.failure_code == "docling_subprocess_protocol_failed"

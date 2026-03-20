@@ -131,7 +131,7 @@ def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
         warnings=(),
     )
     service._load_ranked_table_results = MagicMock(  # type: ignore[method-assign]
-        return_value=([table_a, table_b], 0)
+        return_value=([table_a, table_b], 0, 0)
     )
 
     first_page = service.search_tables_page(query="beta", limit=1)
