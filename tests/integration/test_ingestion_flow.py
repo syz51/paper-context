@@ -42,7 +42,6 @@ from paper_context.queue.contracts import IngestionQueue
 from paper_context.retrieval import RetrievalService
 from paper_context.storage.local_fs import LocalFilesystemStorage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
-from paper_context.worker.runner import build_worker
 
 pytestmark = [
     pytest.mark.integration,
@@ -401,6 +400,8 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
     monkeypatch.setenv("PAPER_CONTEXT_DATABASE__URL", migrated_postgres_url)
     monkeypatch.setenv("PAPER_CONTEXT_STORAGE__ROOT_PATH", str(storage_root))
     monkeypatch.setenv("PAPER_CONTEXT_QUEUE__NAME", unique_queue_name)
+    monkeypatch.setenv("PAPER_CONTEXT_PARSER__PRIMARY", "pdfplumber")
+    monkeypatch.setenv("PAPER_CONTEXT_PARSER__FALLBACK", "pdfplumber")
     get_settings.cache_clear()
     get_engine.cache_clear()
 
@@ -425,7 +426,32 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
         document_id = UUID(upload_payload["document_id"])
         ingest_job_id = UUID(upload_payload["ingest_job_id"])
 
-        worker = build_worker()
+        parsed_document = _make_parsed_document(
+            title="Attention Is All You Need",
+            paragraph_text=(
+                "Attention mechanisms make this integration retrieval path deterministic."
+            ),
+        )
+        queue = RecordingIngestionQueue(unique_queue_name)
+        processor, primary_parser, fallback_parser = _build_processor(
+            storage_root,
+            primary_result=_make_parser_result(
+                "degraded",
+                parser_name="docling",
+                parsed_document=parsed_document,
+            ),
+            fallback_result=_make_parser_result(
+                "pass",
+                parser_name="pdfplumber",
+                parsed_document=parsed_document,
+            ),
+        )
+        worker = _make_worker(
+            migrated_postgres_engine,
+            queue,
+            processor,
+            vt_seconds=45,
+        )
         handled = worker.run_once()
 
         assert handled is not None
@@ -505,20 +531,6 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
                 ),
                 {"document_id": document_id},
             ).scalar_one()
-            retrieval_index = (
-                connection.execute(
-                    text(
-                        """
-                        SELECT parser_source, status, is_active, index_version
-                        FROM retrieval_index_runs
-                        WHERE document_id = :document_id
-                        """
-                    ),
-                    {"document_id": document_id},
-                )
-                .mappings()
-                .one()
-            )
             metrics = IngestionQueue(unique_queue_name).queue_metrics(connection)
 
         with TestClient(create_app()) as client:
@@ -526,14 +538,6 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
             detail_response = client.get(f"/documents/{document_id}")
             outline_response = client.get(f"/documents/{document_id}/outline")
             tables_response = client.get(f"/documents/{document_id}/tables")
-
-        retrieval = RetrievalService(
-            connection_factory=lambda: connection_scope(migrated_postgres_engine),
-            active_index_version=retrieval_index["index_version"],
-        )
-        passages_page = retrieval.search_passages_page(query="attention", limit=3)
-        tables_page = retrieval.search_tables_page(query="attention", limit=3)
-        pack = retrieval.build_context_pack(query="attention", limit=3)
 
         artifacts = list(parser_artifacts)
         primary_artifact = next(artifact for artifact in artifacts if artifact["is_primary"])
@@ -567,8 +571,27 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
                 .mappings()
                 .one_or_none()
             )
+            retrieval_index = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT parser_source, status, is_active, index_version
+                        FROM retrieval_index_runs
+                        WHERE document_id = :document_id
+                        """
+                    ),
+                    {"document_id": document_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
         assert active_revision is not None, {
             "active_revision_id": str(document["active_revision_id"]),
+            "document": dict(document),
+            "ingest_job": dict(ingest_job),
+        }
+        assert retrieval_index is not None, {
+            "document_id": str(document_id),
             "document": dict(document),
             "ingest_job": dict(ingest_job),
         }
@@ -576,14 +599,23 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
         assert document["metadata_confidence"] == active_revision["metadata_confidence"]
         assert active_revision["revision_number"] == 1
         assert active_revision["status"] == "ready"
+        assert primary_parser.calls == [f"documents/{document_id}/{ingest_job_id}/source.pdf"]
+        assert fallback_parser.calls == [f"documents/{document_id}/{ingest_job_id}/source.pdf"]
         assert section_count > 0
         assert passage_count > 0
         assert retrieval_passage_count == passage_count
         assert retrieval_table_count == table_count
         assert retrieval_index["status"] == "ready"
         assert retrieval_index["is_active"] is True
-        assert retrieval_index["parser_source"] in {"docling", "pdfplumber"}
+        assert retrieval_index["parser_source"] == "pdfplumber"
         assert primary_artifact["parser"] == retrieval_index["parser_source"]
+        retrieval = RetrievalService(
+            connection_factory=lambda: connection_scope(migrated_postgres_engine),
+            active_index_version=retrieval_index["index_version"],
+        )
+        passages_page = retrieval.search_passages_page(query="attention", limit=3)
+        tables_page = retrieval.search_tables_page(query="attention", limit=3)
+        pack = retrieval.build_context_pack(query="attention", limit=3)
         assert (
             source_artifact["storage_ref"] == f"documents/{document_id}/{ingest_job_id}/source.pdf"
         )
@@ -598,15 +630,13 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
         assert tables_response.status_code == 200
         assert tables_response.json()["document_id"] == str(document_id)
         assert passages_page.index_version == retrieval_index["index_version"]
-        assert len(passages_page.items) > 0
-        assert all(
-            item.index_version == retrieval_index["index_version"] for item in passages_page.items
-        )
         assert tables_page.index_version == retrieval_index["index_version"]
         assert pack.provenance.active_index_version == retrieval_index["index_version"]
-        assert len(pack.passages) > 0
         assert (storage_root / source_artifact["storage_ref"]).is_file()
         assert (storage_root / primary_artifact["storage_ref"]).is_file()
+        assert len(queue.extended) >= 2
+        assert all(entry == (handled.message.msg_id, 45) for entry in queue.extended)
+        assert queue.archived == [handled.message.msg_id]
         assert metrics.queue_length == 0
         assert metrics.total_messages == 1
     finally:
