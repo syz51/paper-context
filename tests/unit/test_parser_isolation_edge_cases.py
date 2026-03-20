@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -11,6 +13,13 @@ from paper_context.ingestion import parser_isolation
 from paper_context.ingestion.types import ParserArtifact
 
 pytestmark = pytest.mark.unit
+
+_REAL_POPEN = subprocess.Popen
+
+
+def _launch_real_process(code: str, **kwargs):
+    child_kwargs = {key: kwargs[key] for key in ("stdout", "stderr", "preexec_fn") if key in kwargs}
+    return _REAL_POPEN([sys.executable, "-c", code], **child_kwargs)
 
 
 def test_subprocess_parser_requires_content_or_source_path() -> None:
@@ -25,7 +34,7 @@ def test_subprocess_parser_handles_os_error(monkeypatch: pytest.MonkeyPatch) -> 
     def raise_os_error(*args, **kwargs):
         raise OSError("no exec")
 
-    monkeypatch.setattr(parser_isolation.subprocess, "run", raise_os_error)
+    monkeypatch.setattr(parser_isolation.subprocess, "Popen", raise_os_error)
 
     result = parser_isolation.SubprocessPdfParser("docling").parse("paper.pdf", b"%PDF-1.4")
 
@@ -40,23 +49,50 @@ def test_subprocess_parser_uses_source_path_and_handles_nonzero_exit(
 ) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(command, **kwargs):
+    def fake_popen(command, **kwargs):
         captured["command"] = command
-        captured["input"] = kwargs["input"]
-        return SimpleNamespace(returncode=9, stdout=b"bad stdout", stderr=b"bad stderr")
+        return _launch_real_process(
+            "import sys; "
+            "sys.stdout.write('bad stdout'); "
+            "sys.stderr.write('bad stderr'); "
+            "sys.stdout.flush(); "
+            "sys.stderr.flush(); "
+            "sys.exit(9)",
+            **kwargs,
+        )
 
-    monkeypatch.setattr(parser_isolation.subprocess, "run", fake_run)
+    monkeypatch.setattr(parser_isolation.subprocess, "Popen", fake_popen)
 
     result = parser_isolation.SubprocessPdfParser("docling").parse(
         "paper.pdf",
         source_path=tmp_path / "paper.pdf",
     )
 
-    assert captured["input"] is None
     assert str(tmp_path / "paper.pdf") == cast(list[str], captured["command"])[-1]
     assert result.gate_status == "fail"
     assert result.failure_code == "docling_subprocess_failed"
     assert "exited with code 9" in (result.failure_message or "")
+
+
+def test_subprocess_parser_stops_after_exceeding_output_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_popen(command, **kwargs):
+        return _launch_real_process(
+            "import sys; sys.stdout.write('x' * 1024); sys.stdout.flush()",
+            **kwargs,
+        )
+
+    monkeypatch.setattr(parser_isolation.subprocess, "Popen", fake_popen)
+
+    result = parser_isolation.SubprocessPdfParser(
+        "docling",
+        config=parser_isolation.ParserIsolationConfig(output_limit_mb=0),
+    ).parse("paper.pdf", b"%PDF-1.4")
+
+    assert result.gate_status == "fail"
+    assert result.failure_code == "docling_subprocess_output_limit_exceeded"
+    assert "output limit" in (result.failure_message or "")
 
 
 def test_build_pdf_parser_and_create_inprocess_parser_branches(

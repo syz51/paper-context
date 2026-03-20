@@ -292,7 +292,7 @@ class DocumentsApiService:
                 return None
             rows = (
                 connection.execute(
-                    self._document_table_projection_statement(
+                    self._document_table_preview_statement(
                         DocumentTable.document_id == document_id,
                         DocumentTable.revision_id == active_revision_id,
                     )
@@ -654,6 +654,36 @@ class DocumentsApiService:
             statement = statement.where(predicate)
         return statement.order_by(DocumentSection.ordinal.asc().nullslast(), DocumentTable.id)
 
+    def _document_table_preview_statement(self, *predicates: ColumnElement[bool]):
+        rows_json = func.coalesce(DocumentTable.rows_json, sa_cast([], JSONB))
+        statement = (
+            select(
+                DocumentTable.id.label("table_id"),
+                DocumentTable.document_id,
+                DocumentTable.section_id,
+                func.coalesce(Document.title, "Untitled document").label("document_title"),
+                func.coalesce(DocumentSection.heading_path, sa_cast([], JSONB)).label(
+                    "section_path"
+                ),
+                DocumentTable.caption,
+                DocumentTable.table_type,
+                func.coalesce(DocumentTable.headers_json, sa_cast([], JSONB)).label("headers_json"),
+                func.coalesce(func.jsonb_array_length(rows_json), 0).label("rows_json_count"),
+                rows_json[0].label("rows_json_preview_0"),
+                rows_json[1].label("rows_json_preview_1"),
+                rows_json[2].label("rows_json_preview_2"),
+                DocumentTable.page_start,
+                DocumentTable.page_end,
+                DocumentSection.ordinal.label("section_ordinal"),
+            )
+            .select_from(DocumentTable)
+            .join(Document, Document.id == DocumentTable.document_id)
+            .join(DocumentSection, DocumentSection.id == DocumentTable.section_id)
+        )
+        for predicate in predicates:
+            statement = statement.where(predicate)
+        return statement.order_by(DocumentSection.ordinal.asc().nullslast(), DocumentTable.id)
+
     def _normalize_document_limit(self, limit: int) -> int:
         return max(1, min(limit, _MAX_DOCUMENT_PAGE_SIZE))
 
@@ -735,26 +765,37 @@ class DocumentsApiService:
         )
 
     def _row_to_document_table_record(self, row: Any) -> DocumentTableRecord:
-        headers = [str(value) for value in cast(list[object], row["headers_json"] or [])]
-        rows = [
-            [str(cell) for cell in cast(list[object], table_row)]
-            for table_row in cast(list[list[object]], row["rows_json"] or [])
-        ]
+        row_mapping = cast(Mapping[str, Any], row)
+        headers = [str(value) for value in cast(list[object], row_mapping["headers_json"] or [])]
+        preview_rows: list[list[str]] = []
+        for key in ("rows_json_preview_0", "rows_json_preview_1", "rows_json_preview_2"):
+            table_row = row_mapping.get(key)
+            if table_row is None:
+                continue
+            preview_rows.append([str(cell) for cell in cast(list[object], table_row)])
+        row_count = cast(int | None, row_mapping.get("rows_json_count"))
+        if row_count is None and "rows_json" in row_mapping:
+            rows = [
+                [str(cell) for cell in cast(list[object], table_row)]
+                for table_row in cast(list[list[object]], row_mapping["rows_json"] or [])
+            ]
+            preview_rows = rows[:3]
+            row_count = len(rows)
         return DocumentTableRecord(
-            table_id=row["table_id"],
-            document_id=row["document_id"],
-            section_id=row["section_id"],
-            document_title=row["document_title"],
-            section_path=cast(list[str], row["section_path"] or []),
-            caption=row["caption"],
-            table_type=row["table_type"],
+            table_id=row_mapping["table_id"],
+            document_id=row_mapping["document_id"],
+            section_id=row_mapping["section_id"],
+            document_title=row_mapping["document_title"],
+            section_path=cast(list[str], row_mapping["section_path"] or []),
+            caption=row_mapping["caption"],
+            table_type=row_mapping["table_type"],
             preview=TablePreviewModel(
                 headers=headers,
-                rows=rows[:3],
-                row_count=len(rows),
+                rows=preview_rows,
+                row_count=row_count if row_count is not None else len(preview_rows),
             ),
-            page_start=row["page_start"],
-            page_end=row["page_end"],
+            page_start=row_mapping["page_start"],
+            page_end=row_mapping["page_end"],
         )
 
     def _stage_upload(self, upload: BinaryIO) -> BinaryIO:

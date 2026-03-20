@@ -37,6 +37,7 @@ from paper_context.ingestion.types import (
     ParserArtifact,
     ParserResult,
 )
+from paper_context.models import Document, DocumentRevision
 from paper_context.queue.contracts import IngestQueuePayload
 from paper_context.queue.pgmq import PgmqMessage
 
@@ -997,30 +998,34 @@ def test_mark_helpers_issue_expected_updates() -> None:
     document_id = uuid4()
     revision_id = uuid4()
 
-    processor._mark_stage(
-        connection,
-        ingest_job_id=ingest_job_id,
-        document_id=document_id,
-        revision_id=revision_id,
-        status="parsing",
-        warnings=["a", "a"],
-    )
-    processor._mark_failed(
-        connection,
-        ingest_job_id=ingest_job_id,
-        document_id=document_id,
-        revision_id=revision_id,
-        failure_code="parse_failed",
-        failure_message="Parser failed",
-        warnings=["existing", "existing", "new"],
-    )
-    processor._mark_ready(
-        connection,
-        ingest_job_id=ingest_job_id,
-        document_id=document_id,
-        revision_id=revision_id,
-        warnings=["ready", "ready"],
-    )
+    with (
+        patch.object(DeterministicIngestProcessor, "_has_newer_job", return_value=False),
+        patch.object(DeterministicIngestProcessor, "_restore_active_revision_after_failure"),
+    ):
+        processor._mark_stage(
+            connection,
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            status="parsing",
+            warnings=["a", "a"],
+        )
+        processor._mark_failed(
+            connection,
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            failure_code="parse_failed",
+            failure_message="Parser failed",
+            warnings=["existing", "existing", "new"],
+        )
+        processor._mark_ready(
+            connection,
+            ingest_job_id=ingest_job_id,
+            document_id=document_id,
+            revision_id=revision_id,
+            warnings=["ready", "ready"],
+        )
 
     assert connection.execute.call_count == 13
     stage_params = connection.execute.call_args_list[0].args[1]
@@ -1228,6 +1233,85 @@ def test_activate_revision_if_current_marks_revision_ready_without_promotion() -
     fallback_update_params = connection.execute.call_args_list[3].args[1]
     assert fallback_update_params["revision_id"] == revision_id
     assert fallback_update_params["b_now"] == now
+
+
+def test_restore_active_revision_after_failure_keeps_existing_activation_ready() -> None:
+    processor, _, _, _, _ = _make_processor()
+    connection = MagicMock()
+    document_id = uuid4()
+    active_revision_id = uuid4()
+    now = datetime.now(UTC)
+
+    active_revision_result = MagicMock()
+    active_revision_result.scalar_one.return_value = active_revision_id
+    document_update_result = MagicMock()
+    connection.execute.side_effect = [
+        active_revision_result,
+        document_update_result,
+    ]
+
+    processor._restore_active_revision_after_failure(
+        connection,
+        document_id=document_id,
+        now=now,
+        newer_job_exists=True,
+    )
+
+    assert connection.execute.call_count == 2
+    restore_statement = connection.execute.call_args_list[1].args[0]
+    assert restore_statement._values[Document.__table__.c.current_status].value == "ready"
+    assert restore_statement._values[Document.__table__.c.updated_at].value == now
+
+
+def test_restore_active_revision_after_failure_promotes_latest_ready_revision() -> None:
+    processor, _, _, _, _ = _make_processor()
+    connection = MagicMock()
+    document_id = uuid4()
+    ready_revision_id = uuid4()
+    now = datetime.now(UTC)
+
+    active_revision_result = MagicMock()
+    active_revision_result.scalar_one.return_value = None
+    ready_revision_result = MagicMock()
+    ready_revision_result.mappings.return_value.one_or_none.return_value = {
+        "id": ready_revision_id,
+        "title": "Paper",
+        "authors": ["Ada"],
+        "abstract": "Abstract",
+        "publication_year": 2024,
+        "source_type": "pdf",
+        "metadata_confidence": 0.9,
+        "quant_tags": {"domain": "test"},
+    }
+    document_update_result = MagicMock()
+    revision_update_result = MagicMock()
+    connection.execute.side_effect = [
+        active_revision_result,
+        ready_revision_result,
+        document_update_result,
+        revision_update_result,
+    ]
+
+    processor._restore_active_revision_after_failure(
+        connection,
+        document_id=document_id,
+        now=now,
+        newer_job_exists=False,
+    )
+
+    assert connection.execute.call_count == 4
+    restore_statement = connection.execute.call_args_list[2].args[0]
+    assert (
+        restore_statement._values[Document.__table__.c.active_revision_id].value
+        == ready_revision_id
+    )
+    assert restore_statement._values[Document.__table__.c.current_status].value == "ready"
+    assert restore_statement._values[Document.__table__.c.title].value == "Paper"
+    revision_statement = connection.execute.call_args_list[3].args[0]
+    revision_params = connection.execute.call_args_list[3].args[1]
+    assert revision_statement._values[DocumentRevision.__table__.c.status].value == "ready"
+    assert revision_params["revision_id"] == ready_revision_id
+    assert revision_params["b_now"] == now
 
 
 def test_synthetic_processor_updates_non_terminal_job() -> None:

@@ -2182,12 +2182,200 @@ class RetrievalService:
         )
         if not section_ids:
             return ()
+        selected_passages_by_section: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
+        for passage in passages:
+            selected_passages_by_section[passage.section_id].add(passage.passage_id)
+
+        selected_passage_ids = tuple(dict.fromkeys(passage.passage_id for passage in passages))
+        passage_windows_query = self._parent_section_passage_windows_subquery(
+            section_ids=section_ids,
+        )
+        section_row_counts = self._load_parent_section_row_counts(
+            connection,
+            passage_windows_query=passage_windows_query,
+        )
+        if not section_row_counts:
+            return ()
+        passage_windows = self._load_parent_section_passage_windows(
+            connection,
+            passage_windows_query=passage_windows_query,
+            selected_passage_ids=selected_passage_ids,
+        )
+
+        requested_ranges_by_section: dict[uuid.UUID, list[tuple[int, int]]] = defaultdict(list)
+        for section_id in section_ids:
+            section_row_count = section_row_counts.get(section_id, 0)
+            if section_row_count <= 0:
+                continue
+            selected_row_numbers = [
+                cast(int, row["row_number"])
+                for row in passage_windows
+                if cast(uuid.UUID, row["section_id"]) == section_id
+                and cast(uuid.UUID, row["passage_id"])
+                in selected_passages_by_section.get(section_id, set())
+            ]
+            if selected_row_numbers:
+                for row_number in selected_row_numbers:
+                    requested_ranges_by_section[section_id].append(
+                        (
+                            max(1, row_number - PARENT_SIBLINGS_BEFORE),
+                            min(section_row_count, row_number + PARENT_SIBLINGS_AFTER),
+                        )
+                    )
+                continue
+            requested_ranges_by_section[section_id].append(
+                (1, min(section_row_count, PARENT_SIBLINGS_AFTER + 1))
+            )
+
+        requested_ranges_by_section = {
+            section_id: list(self._merge_parent_section_ranges(ranges))
+            for section_id, ranges in requested_ranges_by_section.items()
+            if ranges
+        }
+        if not requested_ranges_by_section:
+            return ()
+
+        rows = self._load_parent_section_rows(
+            connection,
+            passage_windows_query=passage_windows_query,
+            requested_ranges_by_section=requested_ranges_by_section,
+        )
+        grouped_rows: dict[uuid.UUID, list[Any]] = defaultdict(list)
+        for row in rows:
+            grouped_rows[cast(uuid.UUID, row["section_id"])].append(row)
+
+        parent_sections: list[ParentSectionResult] = []
+        for section_id in section_ids:
+            section_rows = grouped_rows.get(section_id, [])
+            if not section_rows:
+                continue
+            selected_ids = selected_passages_by_section.get(section_id, set())
+            supporting_passages: list[ContextPassage] = []
+            for row in section_rows:
+                relationship = "selected" if row["passage_id"] in selected_ids else "sibling"
+                supporting_passages.append(
+                    ContextPassage(
+                        passage_id=row["passage_id"],
+                        text=row["body_text"],
+                        chunk_ordinal=row["chunk_ordinal"],
+                        page_start=row["page_start"],
+                        page_end=row["page_end"],
+                        relationship=cast(Literal["selected", "sibling"], relationship),
+                    )
+                )
+            warnings: list[str] = []
+            if section_row_counts.get(section_id, 0) > len(section_rows):
+                warnings.append("parent_context_truncated")
+            first_row = section_rows[0]
+            parent_sections.append(
+                ParentSectionResult(
+                    section_id=section_id,
+                    document_id=first_row["document_id"],
+                    document_title=first_row["document_title"],
+                    heading=first_row["heading"],
+                    section_path=tuple(cast(list[str], first_row["section_path"] or [])),
+                    page_start=first_row["section_page_start"],
+                    page_end=first_row["section_page_end"],
+                    supporting_passages=tuple(supporting_passages),
+                    warnings=_dedupe_warnings(warnings),
+                )
+            )
+        return tuple(parent_sections)
+
+    def _parent_section_passage_windows_subquery(
+        self,
+        *,
+        section_ids: tuple[uuid.UUID, ...],
+    ):
+        return (
+            select(
+                _DOCUMENT_PASSAGES_SQL.c.id.label("passage_id"),
+                _DOCUMENT_PASSAGES_SQL.c.section_id,
+                _DOCUMENT_PASSAGES_SQL.c.chunk_ordinal,
+                func.row_number()
+                .over(
+                    partition_by=_DOCUMENT_PASSAGES_SQL.c.section_id,
+                    order_by=(
+                        _DOCUMENT_PASSAGES_SQL.c.chunk_ordinal,
+                        _DOCUMENT_PASSAGES_SQL.c.id,
+                    ),
+                )
+                .label("row_number"),
+                func.count()
+                .over(partition_by=_DOCUMENT_PASSAGES_SQL.c.section_id)
+                .label("section_row_count"),
+            )
+            .where(_DOCUMENT_PASSAGES_SQL.c.section_id.in_(section_ids))
+            .subquery("parent_section_passage_windows")
+        )
+
+    def _load_parent_section_passage_windows(
+        self,
+        connection: Connection,
+        *,
+        passage_windows_query: Any,
+        selected_passage_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[Any, ...]:
+        if not selected_passage_ids:
+            return ()
+        selected_rows = (
+            connection.execute(
+                select(
+                    passage_windows_query.c.passage_id,
+                    passage_windows_query.c.section_id,
+                    passage_windows_query.c.row_number,
+                    passage_windows_query.c.section_row_count,
+                ).where(passage_windows_query.c.passage_id.in_(selected_passage_ids))
+            )
+            .mappings()
+            .all()
+        )
+        return tuple(selected_rows)
+
+    def _load_parent_section_row_counts(
+        self,
+        connection: Connection,
+        *,
+        passage_windows_query: Any,
+    ) -> dict[uuid.UUID, int]:
         rows = (
             connection.execute(
                 select(
-                    _DOCUMENT_PASSAGES_SQL.c.id.label("passage_id"),
-                    _DOCUMENT_PASSAGES_SQL.c.section_id,
-                    _DOCUMENT_PASSAGES_SQL.c.chunk_ordinal,
+                    passage_windows_query.c.section_id,
+                    func.max(passage_windows_query.c.section_row_count).label("section_row_count"),
+                ).group_by(passage_windows_query.c.section_id)
+            )
+            .mappings()
+            .all()
+        )
+        return {
+            cast(uuid.UUID, row["section_id"]): cast(int, row["section_row_count"]) for row in rows
+        }
+
+    def _load_parent_section_rows(
+        self,
+        connection: Connection,
+        *,
+        passage_windows_query: Any,
+        requested_ranges_by_section: dict[uuid.UUID, list[tuple[int, int]]],
+    ) -> list[Any]:
+        range_clauses = [
+            and_(
+                passage_windows_query.c.section_id == section_id,
+                passage_windows_query.c.row_number.between(start, end),
+            )
+            for section_id, ranges in requested_ranges_by_section.items()
+            for start, end in ranges
+        ]
+        if not range_clauses:
+            return []
+        return list(
+            connection.execute(
+                select(
+                    passage_windows_query.c.passage_id.label("passage_id"),
+                    passage_windows_query.c.section_id,
+                    passage_windows_query.c.chunk_ordinal,
+                    passage_windows_query.c.section_row_count,
                     _DOCUMENT_PASSAGES_SQL.c.body_text,
                     _DOCUMENT_PASSAGES_SQL.c.page_start,
                     _DOCUMENT_PASSAGES_SQL.c.page_end,
@@ -2204,7 +2392,11 @@ class RetrievalService:
                     _DOCUMENT_SECTIONS_SQL.c.page_start.label("section_page_start"),
                     _DOCUMENT_SECTIONS_SQL.c.page_end.label("section_page_end"),
                 )
-                .select_from(_DOCUMENT_PASSAGES_SQL)
+                .select_from(passage_windows_query)
+                .join(
+                    _DOCUMENT_PASSAGES_SQL,
+                    _DOCUMENT_PASSAGES_SQL.c.id == passage_windows_query.c.passage_id,
+                )
                 .join(
                     _DOCUMENT_SECTIONS_SQL,
                     and_(
@@ -2223,79 +2415,29 @@ class RetrievalService:
                         _DOCUMENTS_SQL.c.active_revision_id,
                     ),
                 )
-                .where(
-                    _DOCUMENT_PASSAGES_SQL.c.section_id.in_(section_ids),
-                    _revision_match(
-                        _DOCUMENT_PASSAGES_SQL.c.revision_id,
-                        _DOCUMENT_SECTIONS_SQL.c.revision_id,
-                    ),
-                )
+                .where(or_(*range_clauses))
                 .order_by(
-                    _DOCUMENT_PASSAGES_SQL.c.section_id,
-                    _DOCUMENT_PASSAGES_SQL.c.chunk_ordinal,
-                    _DOCUMENT_PASSAGES_SQL.c.id,
+                    passage_windows_query.c.section_id,
+                    passage_windows_query.c.row_number,
+                    passage_windows_query.c.passage_id,
                 )
             )
             .mappings()
             .all()
         )
-        grouped_rows: dict[uuid.UUID, list[Any]] = defaultdict(list)
-        for row in rows:
-            grouped_rows[row["section_id"]].append(row)
 
-        selected_passages_by_section: dict[uuid.UUID, set[uuid.UUID]] = defaultdict(set)
-        for passage in passages:
-            selected_passages_by_section[passage.section_id].add(passage.passage_id)
-
-        parent_sections: list[ParentSectionResult] = []
-        for section_id in section_ids:
-            section_rows = grouped_rows.get(section_id, [])
-            if not section_rows:
+    def _merge_parent_section_ranges(
+        self,
+        ranges: list[tuple[int, int]],
+    ) -> tuple[tuple[int, int], ...]:
+        merged_ranges: list[tuple[int, int]] = []
+        for start, end in sorted(ranges):
+            if not merged_ranges or start > merged_ranges[-1][1] + 1:
+                merged_ranges.append((start, end))
                 continue
-            selected_ids = selected_passages_by_section.get(section_id, set())
-            included_indexes: set[int] = set()
-            if selected_ids:
-                for index, row in enumerate(section_rows):
-                    if row["passage_id"] not in selected_ids:
-                        continue
-                    start = max(0, index - PARENT_SIBLINGS_BEFORE)
-                    end = min(len(section_rows), index + PARENT_SIBLINGS_AFTER + 1)
-                    included_indexes.update(range(start, end))
-            else:
-                included_indexes.update(range(min(len(section_rows), PARENT_SIBLINGS_AFTER + 1)))
-
-            supporting_passages: list[ContextPassage] = []
-            for index in sorted(included_indexes):
-                row = section_rows[index]
-                relationship = "selected" if row["passage_id"] in selected_ids else "sibling"
-                supporting_passages.append(
-                    ContextPassage(
-                        passage_id=row["passage_id"],
-                        text=row["body_text"],
-                        chunk_ordinal=row["chunk_ordinal"],
-                        page_start=row["page_start"],
-                        page_end=row["page_end"],
-                        relationship=cast(Literal["selected", "sibling"], relationship),
-                    )
-                )
-            warnings: list[str] = []
-            if len(section_rows) > len(included_indexes):
-                warnings.append("parent_context_truncated")
-            first_row = section_rows[0]
-            parent_sections.append(
-                ParentSectionResult(
-                    section_id=section_id,
-                    document_id=first_row["document_id"],
-                    document_title=first_row["document_title"],
-                    heading=first_row["heading"],
-                    section_path=tuple(cast(list[str], first_row["section_path"] or [])),
-                    page_start=first_row["section_page_start"],
-                    page_end=first_row["section_page_end"],
-                    supporting_passages=tuple(supporting_passages),
-                    warnings=_dedupe_warnings(warnings),
-                )
-            )
-        return tuple(parent_sections)
+            previous_start, previous_end = merged_ranges[-1]
+            merged_ranges[-1] = (previous_start, max(previous_end, end))
+        return tuple(merged_ranges)
 
     def _load_document_summaries(
         self,

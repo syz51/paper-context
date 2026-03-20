@@ -1352,7 +1352,31 @@ class DeterministicIngestProcessor:
         ingest_job_id: uuid.UUID,
         status: str,
         now: datetime,
+        newer_job_exists: bool | None = None,
     ) -> None:
+        if newer_job_exists is None:
+            newer_job_exists = DeterministicIngestProcessor._has_newer_job(
+                self,
+                connection,
+                ingest_job_id=ingest_job_id,
+            )
+        if newer_job_exists:
+            return
+        connection.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(
+                current_status=status,
+                updated_at=now,
+            )
+        )
+
+    def _has_newer_job(
+        self,
+        connection: Connection,
+        *,
+        ingest_job_id: uuid.UUID,
+    ) -> bool:
         current_job = aliased(IngestJob)
         newer_job = aliased(IngestJob)
         newer_job_exists = exists(
@@ -1374,17 +1398,7 @@ class DeterministicIngestProcessor:
             )
             .where(current_job.id == ingest_job_id)
         )
-        connection.execute(
-            update(Document)
-            .where(
-                Document.id == document_id,
-                ~newer_job_exists,
-            )
-            .values(
-                current_status=status,
-                updated_at=now,
-            )
-        )
+        return bool(connection.execute(select(newer_job_exists)).scalar_one())
 
     def _mark_stage(
         self,
@@ -1506,12 +1520,25 @@ class DeterministicIngestProcessor:
                 "b_now": now,
             },
         )
+        newer_job_exists = DeterministicIngestProcessor._has_newer_job(
+            self,
+            connection,
+            ingest_job_id=ingest_job_id,
+        )
         self._update_document_status_if_current(
             connection,
             document_id=document_id,
             ingest_job_id=ingest_job_id,
             status="failed",
             now=now,
+            newer_job_exists=newer_job_exists,
+        )
+        DeterministicIngestProcessor._restore_active_revision_after_failure(
+            self,
+            connection,
+            document_id=document_id,
+            now=now,
+            newer_job_exists=newer_job_exists,
         )
 
     def _mark_ready(
@@ -1673,6 +1700,90 @@ class DeterministicIngestProcessor:
                     "b_now": now,
                 },
             )
+
+    def _restore_active_revision_after_failure(
+        self,
+        connection: Connection,
+        *,
+        document_id: uuid.UUID,
+        now: datetime,
+        newer_job_exists: bool,
+    ) -> None:
+        active_revision_id = connection.execute(
+            select(Document.active_revision_id).where(Document.id == document_id)
+        ).scalar_one()
+        if active_revision_id is not None:
+            connection.execute(
+                update(Document)
+                .where(Document.id == document_id)
+                .values(
+                    current_status="ready",
+                    updated_at=now,
+                )
+            )
+            return
+        if newer_job_exists:
+            return
+        ready_revision_row = (
+            connection.execute(
+                select(
+                    DocumentRevision.id,
+                    DocumentRevision.title,
+                    DocumentRevision.authors,
+                    DocumentRevision.abstract,
+                    DocumentRevision.publication_year,
+                    DocumentRevision.source_type,
+                    DocumentRevision.metadata_confidence,
+                    DocumentRevision.quant_tags,
+                )
+                .where(
+                    DocumentRevision.document_id == document_id,
+                    DocumentRevision.status == "ready",
+                )
+                .order_by(
+                    DocumentRevision.revision_number.desc(),
+                    DocumentRevision.created_at.desc(),
+                    DocumentRevision.id.desc(),
+                )
+                .limit(1)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if ready_revision_row is None:
+            return
+        connection.execute(
+            update(Document)
+            .where(Document.id == document_id)
+            .values(
+                active_revision_id=ready_revision_row["id"],
+                title=ready_revision_row["title"],
+                authors=ready_revision_row["authors"],
+                abstract=ready_revision_row["abstract"],
+                publication_year=ready_revision_row["publication_year"],
+                source_type=ready_revision_row["source_type"],
+                metadata_confidence=ready_revision_row["metadata_confidence"],
+                quant_tags=ready_revision_row["quant_tags"],
+                current_status="ready",
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            update(DocumentRevision)
+            .where(DocumentRevision.id == bindparam("b_revision_id"))
+            .values(
+                status="ready",
+                activated_at=bindparam("b_now"),
+                superseded_at=None,
+                updated_at=bindparam("b_now"),
+            ),
+            {
+                "revision_id": ready_revision_row["id"],
+                "b_revision_id": ready_revision_row["id"],
+                "now": now,
+                "b_now": now,
+            },
+        )
 
 
 class SyntheticIngestProcessor:

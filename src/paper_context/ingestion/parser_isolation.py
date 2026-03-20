@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
+import selectors
 import shutil
 import subprocess  # nosec B404
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -27,6 +30,7 @@ _DEFAULT_MEMORY_LIMIT_MB = 2_048
 _DEFAULT_OUTPUT_LIMIT_MB = 32
 _ARTIFACT_FILENAME = "artifact.bin"
 _PARSED_DOCUMENT_FILENAME = "parsed_document.json"
+_SUBPROCESS_CAPTURE_CHUNK_SIZE = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,15 @@ class ParserIsolationConfig:
     timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS
     memory_limit_mb: int = _DEFAULT_MEMORY_LIMIT_MB
     output_limit_mb: int = _DEFAULT_OUTPUT_LIMIT_MB
+
+
+@dataclass(frozen=True)
+class _BoundedSubprocessResult:
+    returncode: int | None
+    stdout: bytes
+    stderr: bytes
+    timed_out: bool = False
+    output_limit_exceeded: bool = False
 
 
 class SubprocessPdfParser:
@@ -54,6 +67,7 @@ class SubprocessPdfParser:
         source_path: Path | None = None,
     ) -> ParserResult:
         output_root = Path(tempfile.mkdtemp(prefix=f"{self.name}-parser-"))
+        staged_input_path: Path | None = None
         command = [
             sys.executable,
             "-m",
@@ -62,40 +76,28 @@ class SubprocessPdfParser:
             filename,
             str(output_root),
         ]
-        subprocess_input: bytes | None = None
-        if source_path is not None:
-            command.append(str(source_path))
-        elif content is not None:
-            subprocess_input = content
-        else:
-            _cleanup_output_root(output_root)
-            return _subprocess_failure_result(
-                parser_name=self.name,
-                failure_code=f"{self.name}_subprocess_protocol_failed",
-                failure_message="parser requires content bytes or a source path",
-            )
         try:
-            completed = subprocess.run(  # nosec B603
+            if source_path is not None:
+                command.append(str(source_path))
+            elif content is not None:
+                staged_input_path = _stage_parser_input(
+                    content,
+                    parser_name=self.name,
+                    filename=filename,
+                )
+                command.append(str(staged_input_path))
+            else:
+                _cleanup_output_root(output_root)
+                return _subprocess_failure_result(
+                    parser_name=self.name,
+                    failure_code=f"{self.name}_subprocess_protocol_failed",
+                    failure_message="parser requires content bytes or a source path",
+                )
+            completed = _run_parser_subprocess(
                 command,
-                input=subprocess_input,
-                capture_output=True,
-                check=False,
-                timeout=self._config.timeout_seconds,
+                timeout_seconds=self._config.timeout_seconds,
+                output_limit_bytes=max(0, self._config.output_limit_mb) * 1024 * 1024,
                 preexec_fn=_parser_resource_limits(self._config),
-            )
-        except subprocess.TimeoutExpired as exc:
-            _cleanup_output_root(output_root)
-            return _subprocess_failure_result(
-                parser_name=self.name,
-                failure_code=f"{self.name}_timeout",
-                failure_message=(
-                    f"{self.name} parser exceeded the "
-                    f"{self._config.timeout_seconds}-second isolation timeout"
-                ),
-                details={
-                    "stdout": _decode_output(exc.stdout),
-                    "stderr": _decode_output(exc.stderr),
-                },
             )
         except OSError as exc:
             _cleanup_output_root(output_root)
@@ -111,7 +113,37 @@ class SubprocessPdfParser:
                 failure_code=f"{self.name}_subprocess_launch_failed",
                 failure_message=str(exc),
             )
+        finally:
+            _cleanup_staged_input(staged_input_path)
 
+        if completed.timed_out:
+            _cleanup_output_root(output_root)
+            return _subprocess_failure_result(
+                parser_name=self.name,
+                failure_code=f"{self.name}_timeout",
+                failure_message=(
+                    f"{self.name} parser exceeded the "
+                    f"{self._config.timeout_seconds}-second isolation timeout"
+                ),
+                details={
+                    "stdout": _decode_output(completed.stdout),
+                    "stderr": _decode_output(completed.stderr),
+                },
+            )
+        if completed.output_limit_exceeded:
+            _cleanup_output_root(output_root)
+            return _subprocess_failure_result(
+                parser_name=self.name,
+                failure_code=f"{self.name}_subprocess_output_limit_exceeded",
+                failure_message=(
+                    f"{self.name} parser exceeded the "
+                    f"{self._config.output_limit_mb}-MB isolation output limit"
+                ),
+                details={
+                    "stdout": _decode_output(completed.stdout),
+                    "stderr": _decode_output(completed.stderr),
+                },
+            )
         if completed.returncode != 0:
             _cleanup_output_root(output_root)
             return _subprocess_failure_result(
@@ -200,6 +232,124 @@ def _copy_artifact_content(artifact: ParserArtifact, destination: Path) -> None:
         raise ValueError("parser artifact is missing both content and content_path")
     with artifact.content_path.open("rb") as source, destination.open("wb") as target:
         shutil.copyfileobj(source, target, length=1024 * 1024)
+
+
+def _stage_parser_input(content: bytes, *, parser_name: str, filename: str) -> Path:
+    suffix = Path(filename).suffix or ".bin"
+    staged_input_fd, staged_input_name = tempfile.mkstemp(
+        prefix=f"{parser_name}-parser-input-",
+        suffix=suffix,
+    )
+    try:
+        with os.fdopen(staged_input_fd, "wb") as staged_input:
+            staged_input.write(content)
+        return Path(staged_input_name)
+    except Exception:
+        _cleanup_file(Path(staged_input_name))
+        raise
+
+
+def _cleanup_staged_input(staged_input_path: Path | None) -> None:
+    if staged_input_path is None:
+        return
+    _cleanup_file(staged_input_path)
+
+
+def _cleanup_file(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _run_parser_subprocess(
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    output_limit_bytes: int,
+    preexec_fn: Any | None,
+) -> _BoundedSubprocessResult:
+    process = subprocess.Popen(  # nosec B603
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=preexec_fn,
+    )
+    stdout_stream = process.stdout
+    stderr_stream = process.stderr
+    if stdout_stream is None or stderr_stream is None:
+        process.kill()
+        process.wait()
+        raise subprocess.SubprocessError("parser subprocess did not expose output pipes")
+
+    stdout_buffer = bytearray()
+    stderr_buffer = bytearray()
+    captured_bytes = 0
+    timed_out = False
+    output_limit_exceeded = False
+    selector = selectors.DefaultSelector()
+    selector.register(stdout_stream, selectors.EVENT_READ, "stdout")
+    selector.register(stderr_stream, selectors.EVENT_READ, "stderr")
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while selector.get_map():
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                timed_out = True
+                _kill_parser_process(process)
+                break
+            for key, _ in selector.select(timeout=remaining_seconds):
+                stream = cast(Any, key.fileobj)
+                chunk = stream.read1(_SUBPROCESS_CAPTURE_CHUNK_SIZE)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                remaining_output_bytes = output_limit_bytes - captured_bytes
+                if remaining_output_bytes <= 0:
+                    output_limit_exceeded = True
+                    _kill_parser_process(process)
+                    break
+                captured_chunk = chunk[:remaining_output_bytes]
+                if key.data == "stdout":
+                    stdout_buffer.extend(captured_chunk)
+                else:
+                    stderr_buffer.extend(captured_chunk)
+                captured_bytes += len(captured_chunk)
+                if len(chunk) > len(captured_chunk):
+                    output_limit_exceeded = True
+                    _kill_parser_process(process)
+                    break
+            if timed_out or output_limit_exceeded:
+                break
+        returncode = _wait_for_parser_process(process)
+        return _BoundedSubprocessResult(
+            returncode=returncode,
+            stdout=bytes(stdout_buffer),
+            stderr=bytes(stderr_buffer),
+            timed_out=timed_out,
+            output_limit_exceeded=output_limit_exceeded,
+        )
+    finally:
+        selector.close()
+        stdout_stream.close()
+        stderr_stream.close()
+
+
+def _kill_parser_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.kill()
+    except OSError:
+        return
+
+
+def _wait_for_parser_process(process: subprocess.Popen[bytes]) -> int:
+    try:
+        return process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        _kill_parser_process(process)
+        return process.wait()
 
 
 def _payload_to_parser_result(

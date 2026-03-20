@@ -948,6 +948,184 @@ def test_documents_replace_worker_promotes_new_revision_and_hides_old_retrieval_
     assert replacement_tables[0].caption == "Replacement metrics"
 
 
+def test_failed_replacement_reactivates_previous_ready_revision(
+    migrated_postgres_engine,
+    unique_queue_name: str,
+    tmp_path: Path,
+) -> None:
+    del unique_queue_name
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    initial_revision_id = uuid4()
+    replacement_revision_id = uuid4()
+    initial_ingest_job_id = uuid4()
+    replacement_ingest_job_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        connection.execute(
+            insert(Document).values(
+                id=document_id,
+                title="Original upload title",
+                authors=["Ada Lovelace"],
+                abstract="Original abstract",
+                publication_year=2024,
+                source_type="upload",
+                metadata_confidence=0.8,
+                quant_tags={"asset_universe": "rates"},
+                current_status="queued",
+                active_revision_id=None,
+                created_at=now - timedelta(minutes=2),
+                updated_at=now - timedelta(minutes=2),
+            )
+        )
+        connection.execute(
+            insert(DocumentRevision).values(
+                id=initial_revision_id,
+                document_id=document_id,
+                revision_number=1,
+                status="ready",
+                title="Initial parsed title",
+                authors=["Ada Lovelace"],
+                abstract="Initial abstract",
+                publication_year=2024,
+                source_type="upload",
+                metadata_confidence=0.8,
+                quant_tags={"asset_universe": "rates"},
+                source_artifact_id=None,
+                ingest_job_id=None,
+                activated_at=None,
+                superseded_at=None,
+                created_at=now - timedelta(minutes=2),
+                updated_at=now - timedelta(minutes=2),
+            )
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=initial_ingest_job_id,
+                document_id=document_id,
+                revision_id=initial_revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now - timedelta(minutes=2),
+                started_at=now - timedelta(minutes=2),
+                finished_at=now - timedelta(minutes=2),
+            )
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE document_revisions
+                SET ingest_job_id = :ingest_job_id
+                WHERE id = :revision_id
+                """
+            ),
+            {"revision_id": initial_revision_id, "ingest_job_id": initial_ingest_job_id},
+        )
+        connection.execute(
+            insert(DocumentRevision).values(
+                id=replacement_revision_id,
+                document_id=document_id,
+                revision_number=2,
+                status="queued",
+                title="Replacement upload title",
+                authors=["Ada Lovelace"],
+                abstract="Replacement abstract",
+                publication_year=2024,
+                source_type="upload",
+                metadata_confidence=0.8,
+                quant_tags={"asset_universe": "rates"},
+                source_artifact_id=None,
+                ingest_job_id=None,
+                activated_at=None,
+                superseded_at=None,
+                created_at=now - timedelta(minutes=1),
+                updated_at=now - timedelta(minutes=1),
+            )
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=replacement_ingest_job_id,
+                document_id=document_id,
+                revision_id=replacement_revision_id,
+                status="queued",
+                trigger="replace",
+                warnings=[],
+                created_at=now - timedelta(minutes=1),
+            )
+        )
+        connection.execute(
+            text(
+                """
+                UPDATE document_revisions
+                SET ingest_job_id = :ingest_job_id
+                WHERE id = :revision_id
+                """
+            ),
+            {
+                "revision_id": replacement_revision_id,
+                "ingest_job_id": replacement_ingest_job_id,
+            },
+        )
+
+    processor, _, _ = _build_processor(
+        tmp_path / "artifacts",
+        primary_result=_make_parser_result(),
+    )
+
+    with migrated_postgres_engine.begin() as connection:
+        processor._mark_failed(
+            connection,
+            ingest_job_id=replacement_ingest_job_id,
+            document_id=document_id,
+            revision_id=replacement_revision_id,
+            failure_code="docling_failed",
+            failure_message="docling failed",
+            warnings=[],
+        )
+
+    with migrated_postgres_engine.begin() as connection:
+        document = (
+            connection.execute(
+                text(
+                    """
+                    SELECT title, current_status, active_revision_id
+                    FROM documents
+                    WHERE id = :document_id
+                    """
+                ),
+                {"document_id": document_id},
+            )
+            .mappings()
+            .one()
+        )
+        revisions = (
+            connection.execute(
+                text(
+                    """
+                    SELECT id, revision_number, status, title, activated_at, superseded_at
+                    FROM document_revisions
+                    WHERE document_id = :document_id
+                    ORDER BY revision_number
+                    """
+                ),
+                {"document_id": document_id},
+            )
+            .mappings()
+            .all()
+        )
+
+    assert document["current_status"] == "ready"
+    assert document["active_revision_id"] == initial_revision_id
+    assert document["title"] == "Initial parsed title"
+    assert revisions[0]["revision_number"] == 1
+    assert revisions[0]["status"] == "ready"
+    assert revisions[0]["activated_at"] is not None
+    assert revisions[0]["superseded_at"] is None
+    assert revisions[1]["revision_number"] == 2
+    assert revisions[1]["status"] == "failed"
+
+
 def test_replay_after_parser_artifact_crash_is_idempotent(
     migrated_postgres_engine,
     unique_queue_name: str,

@@ -416,6 +416,48 @@ def test_create_http_app_uses_streamable_http_transport(monkeypatch: pytest.Monk
     ]
 
 
+def test_build_retrieval_service_uses_database_driven_active_index_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        providers=SimpleNamespace(
+            voyage_api_key=None,
+            zero_entropy_api_key=None,
+            voyage_model="voyage-4-large",
+            reranker_model="zerank-2",
+            index_version="env-pinned",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(mcp_module, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp_module, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        mcp_module,
+        "connection_scope",
+        lambda engine: nullcontext(engine),
+    )
+    monkeypatch.setattr(
+        mcp_module,
+        "DeterministicEmbeddingClient",
+        lambda *, model: SimpleNamespace(provider="deterministic", model=model),
+    )
+    monkeypatch.setattr(
+        mcp_module,
+        "HeuristicRerankerClient",
+        lambda *, model: SimpleNamespace(provider="deterministic", model=model),
+    )
+    monkeypatch.setattr(
+        mcp_module,
+        "RetrievalService",
+        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
+    )
+
+    mcp_module._build_retrieval_service()
+
+    assert captured["active_index_version"] is None
+
+
 def test_retrieval_service_health_summary() -> None:
     assert RetrievalService().health_summary() == {"status": "not-configured"}
 

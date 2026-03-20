@@ -406,12 +406,27 @@ def test_parser_worker_round_trips_parser_results(
 def test_subprocess_parser_returns_machine_readable_timeout_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _timeout(*args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=args[0], timeout=5, stderr=b"timeout")
+    real_popen = subprocess.Popen
 
-    monkeypatch.setattr(parser_isolation.subprocess, "run", _timeout)
+    def _popen(command, **kwargs):
+        child_kwargs = {
+            key: kwargs[key] for key in ("stdout", "stderr", "preexec_fn") if key in kwargs
+        }
+        return real_popen(
+            [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(0.25)",
+            ],
+            **child_kwargs,
+        )
 
-    result = parser_isolation.SubprocessPdfParser("docling").parse("paper.pdf", b"%PDF-1.4")
+    monkeypatch.setattr(parser_isolation.subprocess, "Popen", _popen)
+
+    result = parser_isolation.SubprocessPdfParser(
+        "docling",
+        config=parser_isolation.ParserIsolationConfig(timeout_seconds=0),
+    ).parse("paper.pdf", b"%PDF-1.4")
 
     assert result.gate_status == "fail"
     assert result.failure_code == "docling_timeout"
@@ -422,9 +437,9 @@ def test_subprocess_parser_returns_machine_readable_launch_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _launch_failure(*args, **kwargs):
-        raise subprocess.SubprocessError("resource limits unavailable")
+        raise OSError("resource limits unavailable")
 
-    monkeypatch.setattr(parser_isolation.subprocess, "run", _launch_failure)
+    monkeypatch.setattr(parser_isolation.subprocess, "Popen", _launch_failure)
 
     result = parser_isolation.SubprocessPdfParser("docling").parse("paper.pdf", b"%PDF-1.4")
 

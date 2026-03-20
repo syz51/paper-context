@@ -287,7 +287,7 @@ def _build_retrieval_service() -> RetrievalService:
     )
     return RetrievalService(
         connection_factory=lambda: connection_scope(get_engine()),
-        active_index_version=settings.providers.index_version,
+        active_index_version=None,
         embedding_client=embedding_client,
         reranker_client=reranker_client,
     )

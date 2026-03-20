@@ -770,8 +770,29 @@ def test_parent_sections_and_document_summaries() -> None:
         == ()
     )
 
+    counts_result = _mock_result(
+        rows=[
+            {
+                "section_id": section_id,
+                "section_row_count": len(rows),
+            }
+        ]
+    )
+    selected_rows_result = _mock_result(
+        rows=[
+            {
+                "passage_id": passage_id,
+                "section_id": section_id,
+                "row_number": 2,
+                "section_row_count": len(rows),
+            }
+        ]
+    )
+    window_rows_result = _mock_result(rows=rows[0:3])
+    connection = _connection(counts_result, selected_rows_result, window_rows_result)
+
     parent_sections = service._load_parent_sections(
-        _connection(_mock_result(rows=rows)),
+        connection,
         passages=(
             PassageResult(
                 passage_id=passage_id,
@@ -798,6 +819,7 @@ def test_parent_sections_and_document_summaries() -> None:
         "selected",
         "sibling",
     ]
+    assert connection.execute.call_count == 3
 
     summaries = service._load_document_summaries(
         _connection(
@@ -1226,55 +1248,49 @@ def test_parent_sections_cover_unselected_and_empty_section_paths() -> None:
         retrieval_index_run_id=uuid4(),
     )
 
+    counts_result = _mock_result(
+        rows=[
+            {
+                "section_id": populated_section_id,
+                "section_row_count": 3,
+            }
+        ]
+    )
+    window_rows_result = _mock_result(
+        rows=[
+            {
+                "passage_id": uuid4(),
+                "section_id": populated_section_id,
+                "chunk_ordinal": 1,
+                "body_text": "A",
+                "page_start": 1,
+                "page_end": 1,
+                "document_id": document_id,
+                "document_title": "Paper",
+                "heading": "Results",
+                "section_path": ["Results"],
+                "section_page_start": 1,
+                "section_page_end": 3,
+            },
+            {
+                "passage_id": uuid4(),
+                "section_id": populated_section_id,
+                "chunk_ordinal": 2,
+                "body_text": "B",
+                "page_start": 2,
+                "page_end": 2,
+                "document_id": document_id,
+                "document_title": "Paper",
+                "heading": "Results",
+                "section_path": ["Results"],
+                "section_page_start": 1,
+                "section_page_end": 3,
+            },
+        ]
+    )
+    connection = _connection(counts_result, window_rows_result)
     parent_sections = service._load_parent_sections(
-        _connection(
-            _mock_result(
-                rows=[
-                    {
-                        "passage_id": uuid4(),
-                        "section_id": populated_section_id,
-                        "chunk_ordinal": 1,
-                        "body_text": "A",
-                        "page_start": 1,
-                        "page_end": 1,
-                        "document_id": document_id,
-                        "document_title": "Paper",
-                        "heading": "Results",
-                        "section_path": ["Results"],
-                        "section_page_start": 1,
-                        "section_page_end": 3,
-                    },
-                    {
-                        "passage_id": uuid4(),
-                        "section_id": populated_section_id,
-                        "chunk_ordinal": 2,
-                        "body_text": "B",
-                        "page_start": 2,
-                        "page_end": 2,
-                        "document_id": document_id,
-                        "document_title": "Paper",
-                        "heading": "Results",
-                        "section_path": ["Results"],
-                        "section_page_start": 1,
-                        "section_page_end": 3,
-                    },
-                    {
-                        "passage_id": uuid4(),
-                        "section_id": populated_section_id,
-                        "chunk_ordinal": 3,
-                        "body_text": "C",
-                        "page_start": 3,
-                        "page_end": 3,
-                        "document_id": document_id,
-                        "document_title": "Paper",
-                        "heading": "Results",
-                        "section_path": ["Results"],
-                        "section_page_start": 1,
-                        "section_page_end": 3,
-                    },
-                ]
-            )
-        ),
+        connection,
         passages=(),
         tables=(
             table,
@@ -1303,3 +1319,4 @@ def test_parent_sections_cover_unselected_and_empty_section_paths() -> None:
         "sibling",
     ]
     assert parent_sections[0].warnings == ("parent_context_truncated",)
+    assert connection.execute.call_count == 2
