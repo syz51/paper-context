@@ -462,20 +462,6 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
                 .mappings()
                 .one()
             )
-            active_revision = (
-                connection.execute(
-                    text(
-                        """
-                        SELECT revision_number, status, title, metadata_confidence
-                        FROM document_revisions
-                        WHERE id = :revision_id
-                        """
-                    ),
-                    {"revision_id": document["active_revision_id"]},
-                )
-                .mappings()
-                .one()
-            )
             parser_artifacts = connection.execute(
                 text(
                     """
@@ -562,7 +548,30 @@ def test_documents_upload_and_worker_round_trip_against_real_postgres_with_repo_
         assert ingest_job["started_at"] is not None
         assert ingest_job["finished_at"] is not None
         assert document["current_status"] == "ready"
-        assert document["active_revision_id"] is not None
+        assert document["active_revision_id"] is not None, {
+            "document": dict(document),
+            "ingest_job": dict(ingest_job),
+        }
+        with migrated_postgres_engine.begin() as connection:
+            active_revision = (
+                connection.execute(
+                    text(
+                        """
+                        SELECT revision_number, status, title, metadata_confidence
+                        FROM document_revisions
+                        WHERE id = :revision_id
+                        """
+                    ),
+                    {"revision_id": document["active_revision_id"]},
+                )
+                .mappings()
+                .one_or_none()
+            )
+        assert active_revision is not None, {
+            "active_revision_id": str(document["active_revision_id"]),
+            "document": dict(document),
+            "ingest_job": dict(ingest_job),
+        }
         assert document["title"] == active_revision["title"]
         assert document["metadata_confidence"] == active_revision["metadata_confidence"]
         assert active_revision["revision_number"] == 1

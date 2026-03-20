@@ -275,7 +275,10 @@ class DeterministicIngestProcessor:
                 )
                 lease.extend()
                 warnings = _dedupe_warnings([*warnings, *fallback_result.warnings])
-                if fallback_result.gate_status != "pass" or fallback_result.parsed_document is None:
+                fallback_document = fallback_result.parsed_document
+                if fallback_result.gate_status == "pass" and fallback_document is None:
+                    fallback_document = fallback_result.load_parsed_document()
+                if fallback_result.gate_status != "pass" or fallback_document is None:
                     with connection.begin():
                         warnings = self._sync_processing_warnings(
                             connection,

@@ -900,6 +900,78 @@ def test_process_degraded_primary_with_failing_fallback_marks_failure() -> None:
     assert lease.extend.call_count == 2
 
 
+def test_process_degraded_primary_with_lazy_fallback_document_promotes_ready_path() -> None:
+    processor, _, primary_parser, fallback_parser, metadata_enricher = _make_processor()
+    connection = MagicMock()
+    context = _make_context()
+    parsed_document = _make_document(metadata_confidence=0.8)
+    processor._sync_processing_warnings = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda _connection, **kwargs: kwargs["warnings"]
+    )
+    source_artifact_id = uuid4()
+    revision_id = uuid4()
+
+    connection.execute.side_effect = _row_sequence(
+        [
+            _job_row(
+                document_id=context.payload.document_id,
+                revision_id=revision_id,
+                source_artifact_id=source_artifact_id,
+                warnings=[],
+            ),
+            {"id": source_artifact_id, "storage_ref": "documents/test/source.pdf"},
+            _job_row(
+                document_id=context.payload.document_id,
+                revision_id=revision_id,
+                source_artifact_id=source_artifact_id,
+                status="parsing",
+                warnings=["reduced_structure_confidence", "parser_fallback_used"],
+            ),
+            _job_row(
+                document_id=context.payload.document_id,
+                revision_id=revision_id,
+                source_artifact_id=source_artifact_id,
+                status="enriching_metadata",
+                warnings=["reduced_structure_confidence", "parser_fallback_used"],
+            ),
+            _job_row(
+                document_id=context.payload.document_id,
+                revision_id=revision_id,
+                source_artifact_id=source_artifact_id,
+                status="indexing",
+                warnings=["reduced_structure_confidence", "parser_fallback_used"],
+            ),
+        ]
+    )
+
+    primary_parser.parse.return_value = _make_parser_result(
+        gate_status="degraded",
+        parser_name="docling",
+        parsed_document=parsed_document,
+    )
+    fallback_parser.parse.return_value = ParserResult(
+        gate_status="pass",
+        parsed_document=None,
+        artifact=ParserArtifact(
+            artifact_type="pdfplumber_parse",
+            parser="pdfplumber",
+            filename="pdfplumber.json",
+            content=b"{}",
+        ),
+        warnings=[],
+        parsed_document_loader=lambda: parsed_document,
+    )
+
+    lease = MagicMock()
+    processor.process(connection, context, lease)
+
+    metadata_enricher.enrich.assert_called_once_with(parsed_document)
+    assert fallback_parser.parse.return_value.parsed_document == parsed_document
+    assert fallback_parser.parse.return_value.parsed_document_loader is None
+    assert lease.extend.call_count == 5
+    assert connection.execute.call_count >= 16
+
+
 def test_process_raises_when_processing_lock_cannot_be_claimed() -> None:
     processor, _, _, _, _ = _make_processor()
     connection = MagicMock()
