@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,6 +28,7 @@ from paper_context.ingestion.types import (
     ParserArtifact,
     ParserResult,
 )
+from paper_context.pagination import encode_cursor, fingerprint_payload
 from paper_context.queue.contracts import IngestionQueue
 from paper_context.storage.local_fs import LocalFilesystemStorage
 from paper_context.worker.loop import IngestWorker, WorkerConfig
@@ -67,12 +69,13 @@ class _StaticParser:
 
 class _McpSession:
     def __init__(self, client: TestClient) -> None:
+        initialize_request_id = 1
         initialize = client.post(
             "/mcp",
             headers=_MCP_HEADERS,
             json={
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": initialize_request_id,
                 "method": "initialize",
                 "params": {
                     "protocolVersion": "2025-03-26",
@@ -81,7 +84,7 @@ class _McpSession:
                 },
             },
         )
-        payload = _sse_json(initialize.text)
+        payload = _sse_json(initialize.text, expected_id=initialize_request_id)
         assert initialize.status_code == 200
         assert payload["result"]["serverInfo"]["name"] == "paper-context"
         self._client = client
@@ -95,18 +98,19 @@ class _McpSession:
         arguments: dict[str, object],
         expect_error: bool = False,
     ) -> Any:
+        request_id = self._next_id
         response = self._client.post(
             "/mcp",
             headers={**_MCP_HEADERS, "mcp-session-id": self._session_id},
             json={
                 "jsonrpc": "2.0",
-                "id": self._next_id,
+                "id": request_id,
                 "method": "tools/call",
                 "params": {"name": name, "arguments": arguments},
             },
         )
         self._next_id += 1
-        payload = _sse_json(response.text)
+        payload = _sse_json(response.text, expected_id=request_id)
         assert response.status_code == 200
         assert payload["result"]["isError"] is expect_error
         if expect_error:
@@ -148,11 +152,18 @@ def regression_runtime(
         get_engine.cache_clear()
 
 
-def _sse_json(response_text: str) -> dict[str, Any]:
+def _sse_json(response_text: str, *, expected_id: int | None = None) -> dict[str, Any]:
+    payloads: list[dict[str, Any]] = []
     for line in response_text.splitlines():
         if line.startswith("data: "):
-            return json.loads(line.removeprefix("data: "))
-    raise AssertionError(f"missing SSE payload: {response_text!r}")
+            payloads.append(json.loads(line.removeprefix("data: ")))
+    if expected_id is not None:
+        for payload in reversed(payloads):
+            if payload.get("id") == expected_id:
+                return payload
+    if not payloads:
+        raise AssertionError(f"missing SSE payload: {response_text!r}")
+    return payloads[-1]
 
 
 def _make_parsed_document(
@@ -160,13 +171,40 @@ def _make_parsed_document(
     title: str,
     keyword: str,
     table_caption: str,
+    publication_year: int = 2024,
+    metadata_confidence: float = 0.91,
+    paragraph_count: int = 2,
+    table_count: int = 1,
 ) -> ParsedDocument:
+    paragraphs = [
+        ParsedParagraph(
+            text=(
+                f"{keyword} passage {index + 1} preserves stable narrative tokens for "
+                "end to end regression retrieval."
+            ),
+            page_start=index + 1,
+            page_end=index + 1,
+            provenance_offsets={"pages": [index + 1], "charspans": [[0, 64]]},
+        )
+        for index in range(paragraph_count)
+    ]
+    tables = [
+        ParsedTable(
+            section_key="methods",
+            caption=table_caption if table_count == 1 else f"{table_caption} {index + 1}",
+            headers=["metric", "value"],
+            rows=[[f"{keyword} ratio {index + 1}", "1.0"], ["samples", "42"]],
+            page_start=paragraph_count + index + 1,
+            page_end=paragraph_count + index + 1,
+        )
+        for index in range(table_count)
+    ]
     return ParsedDocument(
         title=title,
         authors=["Ada Lovelace"],
         abstract=f"{keyword} abstract for regression coverage.",
-        publication_year=2024,
-        metadata_confidence=0.91,
+        publication_year=publication_year,
+        metadata_confidence=metadata_confidence,
         sections=[
             ParsedSection(
                 key="methods",
@@ -174,39 +212,11 @@ def _make_parsed_document(
                 heading_path=["Methods"],
                 level=1,
                 page_start=1,
-                page_end=2,
-                paragraphs=[
-                    ParsedParagraph(
-                        text=(
-                            f"{keyword} passage one preserves stable narrative tokens for "
-                            "end to end regression retrieval."
-                        ),
-                        page_start=1,
-                        page_end=1,
-                        provenance_offsets={"pages": [1], "charspans": [[0, 64]]},
-                    ),
-                    ParsedParagraph(
-                        text=(
-                            f"{keyword} passage two adds sibling context so passage context "
-                            "lookups stay regression tested."
-                        ),
-                        page_start=2,
-                        page_end=2,
-                        provenance_offsets={"pages": [2], "charspans": [[0, 63]]},
-                    ),
-                ],
+                page_end=max(paragraph_count, 1),
+                paragraphs=paragraphs,
             )
         ],
-        tables=[
-            ParsedTable(
-                section_key="methods",
-                caption=table_caption,
-                headers=["metric", "value"],
-                rows=[[f"{keyword} ratio", "1.0"], ["samples", "42"]],
-                page_start=2,
-                page_end=2,
-            )
-        ],
+        tables=tables,
         references=[],
     )
 
@@ -230,6 +240,67 @@ def _make_parser_result(
         warnings=["reduced_structure_confidence"] if gate_status == "degraded" else [],
         failure_code=f"{parser_name}_failed" if is_failure else None,
         failure_message=f"{parser_name} failed" if is_failure else None,
+    )
+
+
+def _make_paginated_document(
+    *,
+    title: str,
+    passage_keyword: str,
+    table_keyword: str,
+    paragraph_count: int,
+    table_count: int,
+) -> ParsedDocument:
+    paragraphs = []
+    for index in range(paragraph_count):
+        keyword_repeats = 5 if index == 0 else 4 if index == 1 else 1
+        paragraphs.append(
+            ParsedParagraph(
+                text=(
+                    ((passage_keyword + " ") * keyword_repeats)
+                    + f"ranked passage {index + 1} preserves deterministic pagination."
+                ).strip(),
+                page_start=index + 1,
+                page_end=index + 1,
+                provenance_offsets={"pages": [index + 1], "charspans": [[0, 64]]},
+            )
+        )
+
+    tables = []
+    for index in range(table_count):
+        keyword_repeats = 5 if index == 0 else 4 if index == 1 else 1
+        tables.append(
+            ParsedTable(
+                section_key="methods",
+                caption=(
+                    ((table_keyword + " ") * keyword_repeats) + f"ranked metrics {index + 1}"
+                ).strip(),
+                headers=["metric", "value"],
+                rows=[[f"row {index + 1}", str(index + 1)], ["samples", "42"]],
+                page_start=paragraph_count + index + 1,
+                page_end=paragraph_count + index + 1,
+            )
+        )
+
+    return ParsedDocument(
+        title=title,
+        authors=["Ada Lovelace"],
+        abstract=f"{passage_keyword} and {table_keyword} pagination regression coverage.",
+        publication_year=2024,
+        metadata_confidence=0.91,
+        sections=[
+            ParsedSection(
+                key="methods",
+                heading="Methods",
+                heading_path=["Methods"],
+                level=1,
+                page_start=1,
+                page_end=max(paragraph_count, 1),
+                paragraphs=paragraphs,
+            )
+        ],
+        tables=tables,
+        references=[],
     )
 
 
@@ -342,6 +413,40 @@ def test_operational_and_validation_journeys(regression_runtime: _RegressionRunt
     assert missing_replace.json()["detail"] == "document not found"
 
 
+def test_upload_limit_rejection_returns_413(
+    regression_runtime: _RegressionRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del regression_runtime
+    monkeypatch.setenv("PAPER_CONTEXT_UPLOAD__MAX_BYTES", "8")
+    get_settings.cache_clear()
+
+    try:
+        with TestClient(create_app()) as client:
+            response = client.post(
+                "/documents",
+                files={"file": ("paper.pdf", _PDF_BYTES, "application/pdf")},
+            )
+    finally:
+        get_settings.cache_clear()
+
+    assert response.status_code == 413
+    assert response.json()["detail"] == "uploaded file exceeds the 8-byte limit"
+
+
+def test_readiness_turns_degraded_when_storage_root_disappears(
+    regression_runtime: _RegressionRuntime,
+) -> None:
+    with TestClient(create_app()) as client:
+        shutil.rmtree(regression_runtime.storage_root)
+        readiness = client.get("/readyz")
+
+    assert readiness.status_code == 200
+    assert readiness.json()["status"] == "degraded"
+    assert readiness.json()["storage_ready"] is False
+    assert readiness.json()["queue_ready"] is True
+
+
 def test_upload_to_ready_http_and_mcp_journey(regression_runtime: _RegressionRuntime) -> None:
     parsed_document = _make_parsed_document(
         title="Journey Regression Paper",
@@ -452,6 +557,196 @@ def test_upload_to_ready_http_and_mcp_journey(regression_runtime: _RegressionRun
     assert "parser_fallback_used" in context_pack["warnings"]
 
 
+def test_document_listing_and_search_journeys_cover_filters_and_cursors(
+    regression_runtime: _RegressionRuntime,
+) -> None:
+    first_document = _make_parsed_document(
+        title="Filter Regression Alpha",
+        keyword="filterbeacon-alpha",
+        table_caption="filterbeacon metrics alpha",
+        publication_year=2024,
+    )
+    second_document = _make_parsed_document(
+        title="Filter Regression Beta",
+        keyword="filterbeacon-beta",
+        table_caption="filterbeacon metrics beta",
+        publication_year=2025,
+    )
+
+    with TestClient(create_app()) as client:
+        first_upload = _upload_document(client, title="Alpha upload title")
+        second_upload = _upload_document(client, title="Beta upload title")
+        first_document_id = UUID(str(first_upload["document_id"]))
+        second_document_id = UUID(str(second_upload["document_id"]))
+
+        first_handled, _, _ = _run_worker(
+            regression_runtime,
+            primary_result=_make_parser_result(parsed_document=first_document),
+        )
+        second_handled, _, _ = _run_worker(
+            regression_runtime,
+            primary_result=_make_parser_result(parsed_document=second_document),
+        )
+
+        assert first_handled.payload.document_id == first_document_id
+        assert second_handled.payload.document_id == second_document_id
+
+        first_page = client.get("/documents", params={"limit": 1})
+        first_cursor = first_page.json()["next_cursor"]
+        second_page = client.get("/documents", params={"limit": 1, "cursor": first_cursor})
+
+        mcp = _McpSession(client)
+        filtered_documents = mcp.call_tool(
+            name="search_documents",
+            arguments={
+                "query": "   ",
+                "filters": {
+                    "document_ids": [str(first_document_id), str(second_document_id)],
+                    "publication_years": [2024],
+                },
+                "limit": 5,
+            },
+        )
+        search_first_page = mcp.call_tool(
+            name="search_documents",
+            arguments={"query": "Filter Regression", "limit": 1},
+        )
+        search_second_page = mcp.call_tool(
+            name="search_documents",
+            arguments={
+                "query": "Filter Regression",
+                "limit": 1,
+                "cursor": search_first_page["next_cursor"],
+            },
+        )
+
+    assert first_page.status_code == 200
+    assert second_page.status_code == 200
+    listed_document_ids = {
+        first_page.json()["documents"][0]["document_id"],
+        second_page.json()["documents"][0]["document_id"],
+    }
+    assert listed_document_ids == {str(first_document_id), str(second_document_id)}
+    assert second_page.json()["next_cursor"] is None
+    assert [document["document_id"] for document in filtered_documents["documents"]] == [
+        str(first_document_id)
+    ]
+    searched_document_ids = {
+        search_first_page["documents"][0]["document_id"],
+        search_second_page["documents"][0]["document_id"],
+    }
+    assert searched_document_ids == {str(first_document_id), str(second_document_id)}
+    assert search_second_page["next_cursor"] is None
+
+
+def test_mcp_pagination_modes_and_cursor_errors_regressions(
+    regression_runtime: _RegressionRuntime,
+) -> None:
+    passage_query = "pagebeacon"
+    table_query = "tablebeacon"
+    paginated_document = _make_paginated_document(
+        title="Pagination Regression Paper",
+        passage_keyword=passage_query,
+        table_keyword=table_query,
+        paragraph_count=41,
+        table_count=24,
+    )
+
+    with TestClient(create_app()) as client:
+        upload = _upload_document(client, title="Pagination upload title")
+        document_id = UUID(str(upload["document_id"]))
+        handled, _, _ = _run_worker(
+            regression_runtime,
+            primary_result=_make_parser_result(parsed_document=paginated_document),
+        )
+        assert handled.payload.document_id == document_id
+
+        mcp = _McpSession(client)
+        first_passage_page = mcp.call_tool(
+            name="search_passages",
+            arguments={"query": passage_query, "limit": 1},
+        )
+        second_passage_page = mcp.call_tool(
+            name="search_passages",
+            arguments={
+                "query": passage_query,
+                "limit": 1,
+                "cursor": first_passage_page["next_cursor"],
+            },
+        )
+        first_table_page = mcp.call_tool(
+            name="search_tables",
+            arguments={"query": table_query, "limit": 1},
+        )
+        second_table_page = mcp.call_tool(
+            name="search_tables",
+            arguments={
+                "query": table_query,
+                "limit": 1,
+                "cursor": first_table_page["next_cursor"],
+            },
+        )
+        bounded_passage_page = mcp.call_tool(
+            name="search_passages",
+            arguments={
+                "query": passage_query,
+                "limit": 2,
+                "pagination_mode": "bounded",
+                "max_rerank_candidates": 3,
+                "max_expansion_rounds": 1,
+            },
+        )
+        bounded_table_page = mcp.call_tool(
+            name="search_tables",
+            arguments={
+                "query": table_query,
+                "limit": 2,
+                "pagination_mode": "bounded",
+                "max_rerank_candidates": 3,
+                "max_expansion_rounds": 1,
+            },
+        )
+        fingerprint = fingerprint_payload(
+            {
+                "kind": "passages",
+                "query": passage_query,
+                "pagination_mode": "exact",
+                "max_rerank_candidates": None,
+                "max_expansion_rounds": None,
+                "filters": {"document_ids": [], "publication_years": []},
+            }
+        )
+        legacy_cursor = encode_cursor(
+            {
+                "kind": "passages",
+                "fingerprint": fingerprint,
+                "index_version": "mvp-v1",
+                "score": "3.0",
+                "entity_id": str(first_passage_page["passages"][0]["passage_id"]),
+            }
+        )
+        legacy_cursor_error = mcp.call_tool(
+            name="search_passages",
+            arguments={"query": passage_query, "limit": 1, "cursor": legacy_cursor},
+            expect_error=True,
+        )
+
+    assert first_passage_page["next_cursor"] is not None
+    assert (
+        second_passage_page["passages"][0]["passage_id"]
+        != first_passage_page["passages"][0]["passage_id"]
+    )
+    assert first_table_page["next_cursor"] is not None
+    assert second_table_page["tables"][0]["table_id"] != first_table_page["tables"][0]["table_id"]
+    assert bounded_passage_page["exact"] is False
+    assert bounded_passage_page["truncated"] is True
+    assert "bounded_pagination_truncated" in bounded_passage_page["warnings"]
+    assert bounded_table_page["exact"] is False
+    assert bounded_table_page["truncated"] is True
+    assert "bounded_pagination_truncated" in bounded_table_page["warnings"]
+    assert "cursor is no longer supported" in legacy_cursor_error
+
+
 def test_successful_replacement_switches_http_and_mcp_reads(
     regression_runtime: _RegressionRuntime,
 ) -> None:
@@ -557,6 +852,82 @@ def test_successful_replacement_switches_http_and_mcp_reads(
     assert old_passage_error == "Error calling tool 'get_passage_context': passage not found"
     assert old_table_error == "Error calling tool 'get_table': table not found"
     assert replacement_pack["documents"][0]["title"] == "Replacement Regression Paper"
+
+
+def test_newer_replacement_supersedes_older_queued_job(
+    regression_runtime: _RegressionRuntime,
+) -> None:
+    initial_document = _make_parsed_document(
+        title="Supersede Regression Original",
+        keyword="supersede-origin",
+        table_caption="supersede-origin metrics",
+    )
+    newest_document = _make_parsed_document(
+        title="Supersede Regression Final",
+        keyword="supersede-final",
+        table_caption="supersede-final metrics",
+    )
+
+    with TestClient(create_app()) as client:
+        upload = _upload_document(client, title="Initial upload title")
+        document_id = UUID(str(upload["document_id"]))
+        initial_job_id = UUID(str(upload["ingest_job_id"]))
+
+        initial_handled, _, _ = _run_worker(
+            regression_runtime,
+            primary_result=_make_parser_result(parsed_document=initial_document),
+        )
+        assert initial_handled.payload.ingest_job_id == initial_job_id
+
+        first_replacement = _replace_document(
+            client,
+            document_id=document_id,
+            title="Superseded replacement upload title",
+        )
+        second_replacement = _replace_document(
+            client,
+            document_id=document_id,
+            title="Newest replacement upload title",
+        )
+        first_replacement_job_id = UUID(str(first_replacement["ingest_job_id"]))
+        second_replacement_job_id = UUID(str(second_replacement["ingest_job_id"]))
+
+        first_replacement_job = client.get(f"/ingest-jobs/{first_replacement_job_id}")
+        second_replacement_job = client.get(f"/ingest-jobs/{second_replacement_job_id}")
+        pre_promotion_detail = client.get(f"/documents/{document_id}")
+
+        handled, _, _ = _run_worker(
+            regression_runtime,
+            primary_result=_make_parser_result(parsed_document=newest_document),
+        )
+        assert handled.payload.ingest_job_id == second_replacement_job_id
+
+        final_detail = client.get(f"/documents/{document_id}")
+        final_tables = client.get(f"/documents/{document_id}/tables")
+        final_second_replacement_job = client.get(f"/ingest-jobs/{second_replacement_job_id}")
+        mcp = _McpSession(client)
+        superseded_search = mcp.call_tool(
+            name="search_documents",
+            arguments={"query": "Superseded replacement upload title"},
+        )
+        final_search = mcp.call_tool(
+            name="search_documents",
+            arguments={"query": "Supersede Regression Final"},
+        )
+
+    assert first_replacement_job.status_code == 200
+    assert first_replacement_job.json()["status"] == "failed"
+    assert first_replacement_job.json()["failure_code"] == "superseded_by_newer_ingest_job"
+    assert second_replacement_job.status_code == 200
+    assert second_replacement_job.json()["status"] == "queued"
+    assert pre_promotion_detail.status_code == 200
+    assert pre_promotion_detail.json()["title"] == "Supersede Regression Original"
+    assert final_detail.status_code == 200
+    assert final_detail.json()["title"] == "Supersede Regression Final"
+    assert final_tables.json()["tables"][0]["caption"] == "supersede-final metrics"
+    assert final_second_replacement_job.json()["status"] == "ready"
+    assert superseded_search["documents"] == []
+    assert final_search["documents"][0]["document_id"] == str(document_id)
 
 
 def test_failed_replacement_preserves_previous_live_revision(
