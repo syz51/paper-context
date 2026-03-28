@@ -331,6 +331,7 @@ class _PaginationComputation:
 class _RankedSnapshotKey:
     fingerprint: str
     index_version: str | None
+    run_ids: tuple[uuid.UUID, ...]
     entity_kind: Literal["passages", "tables"]
     pagination_mode: PaginationMode
     max_rerank_candidates: int | None
@@ -408,6 +409,7 @@ class _RankedSnapshotCache:
         entity_kind: Literal["passages", "tables"],
         pagination_mode: PaginationMode,
         current_index_version: str | None,
+        current_run_ids: tuple[uuid.UUID, ...],
     ) -> None:
         with self._lock:
             stale_keys = [
@@ -416,7 +418,7 @@ class _RankedSnapshotCache:
                 if key.fingerprint == fingerprint
                 and key.entity_kind == entity_kind
                 and key.pagination_mode == pagination_mode
-                and key.index_version != current_index_version
+                and (key.index_version != current_index_version or key.run_ids != current_run_ids)
             ]
             for key in stale_keys:
                 self._entries.pop(key, None)
@@ -1862,6 +1864,7 @@ class RetrievalService:
             entity_kind=entity_kind,
             pagination_mode=controls.mode,
             current_index_version=snapshot_key.index_version,
+            current_run_ids=snapshot_key.run_ids,
         )
         snapshot = self._snapshot_cache.get(snapshot_key, now=now)
         metrics = get_metrics()
@@ -2007,6 +2010,7 @@ class RetrievalService:
         return _RankedSnapshotKey(
             fingerprint=fingerprint,
             index_version=active_runs.index_versions[0] if active_runs.index_versions else None,
+            run_ids=active_runs.run_ids,
             entity_kind=entity_kind,
             pagination_mode=controls.mode,
             max_rerank_candidates=controls.max_rerank_candidates,

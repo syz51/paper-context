@@ -1,6 +1,6 @@
 # Paper Context Test Strategy
 
-The test suite is organized around behavior boundaries: pure logic, app slices, real Postgres seams, contract stability, migrations, and deployment-shape regression checks.
+The test suite is organized around behavior boundaries: pure logic, app slices, real Postgres seams, contract stability, migrations, and regression checks for deployment shape plus end-to-end user journeys.
 
 ## Suite Taxonomy
 
@@ -9,7 +9,7 @@ The test suite is organized around behavior boundaries: pure logic, app slices, 
 - `integration`: real Postgres and PGMQ tests for queue flow, ingestion, retrieval, readiness, and MCP integration
 - `contract`: OpenAPI checks plus golden payload compatibility for HTTP and MCP contracts
 - `migration`: fresh-database Alembic upgrade smoke
-- `regression`: deployment-shape and smoke checks, including optional staging-only coverage
+- `regression`: deployment-shape checks plus end-to-end user-journey smoke/regression coverage, including optional staging-only tests
 
 ## Standard Commands
 
@@ -63,6 +63,9 @@ By default the suite can use the repo’s Compose `db` service. To point tests a
 
 Tests should remain especially strong around:
 
+- upload to queued job to ready document to MCP retrieval end to end
+- replacement success switching HTTP and MCP reads to the new active revision
+- replacement failure preserving the previous ready revision for reads and retrieval
 - active-revision reads after replacement
 - failure rollback that preserves the previous ready revision
 - queue redelivery without duplicate canonical state
@@ -75,7 +78,7 @@ Tests should remain especially strong around:
 - `unit-slice`: fast PR-blocking logic and app tests with coverage reporting in CI
 - `contract`: schema and golden-response compatibility
 - `integration-postgres`: real Postgres and migration coverage
-- `regression-smoke`: deployment and non-staging regression checks
+- `regression-smoke`: deployment-shape and end-to-end regression checks, plus non-staging smoke coverage
 
 The Postgres lane uses `pytest-xdist` with `-n 2 --dist=loadfile` to keep runtime reasonable without over-parallelizing shared infrastructure.
 

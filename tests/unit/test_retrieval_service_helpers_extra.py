@@ -275,6 +275,7 @@ def test_ranked_snapshot_cache_invalidates_mismatched_index_versions() -> None:
     service = _service()
     fingerprint = "fingerprint"
     now = datetime.now(UTC)
+    stale_run_id = uuid4()
     stale_key = service._snapshot_key(
         fingerprint=fingerprint,
         entity_kind="passages",
@@ -285,7 +286,7 @@ def test_ranked_snapshot_cache_invalidates_mismatched_index_versions() -> None:
             entity_kind="passages",
             limit=2,
         ),
-        active_runs=_ActiveRunSelection(run_ids=(uuid4(),), index_versions=("mvp-v0",)),
+        active_runs=_ActiveRunSelection(run_ids=(stale_run_id,), index_versions=("mvp-v0",)),
     )
     result = service._candidate_to_passage_result(
         _passage_candidate(
@@ -312,9 +313,59 @@ def test_ranked_snapshot_cache_invalidates_mismatched_index_versions() -> None:
         entity_kind="passages",
         pagination_mode="exact",
         current_index_version="mvp-v1",
+        current_run_ids=(uuid4(),),
     )
 
     assert service._snapshot_cache.get(stale_key, now=now) is None
+
+
+def test_ranked_snapshot_cache_invalidates_mismatched_active_runs() -> None:
+    service = _service()
+    fingerprint = "fingerprint"
+    now = datetime.now(UTC)
+    stale_run_id = uuid4()
+    fresh_run_id = uuid4()
+    key = service._snapshot_key(
+        fingerprint=fingerprint,
+        entity_kind="passages",
+        controls=service._pagination_controls(
+            mode="exact",
+            max_rerank_candidates=None,
+            max_expansion_rounds=None,
+            entity_kind="passages",
+            limit=2,
+        ),
+        active_runs=_ActiveRunSelection(run_ids=(stale_run_id,), index_versions=("mvp-v1",)),
+    )
+    result = service._candidate_to_passage_result(
+        _passage_candidate(
+            entity_id=uuid4(),
+            retrieval_index_run_id=stale_run_id,
+            index_version="mvp-v1",
+            text="stale",
+            modes={"sparse"},
+            score_hint=0.5,
+        )
+    )
+    service._snapshot_cache.set(
+        key,
+        results=(result,),
+        exact=True,
+        truncated=False,
+        warnings=(),
+        has_more_results=False,
+        now=now,
+    )
+
+    service._snapshot_cache.invalidate_mismatched_index_version(
+        fingerprint=fingerprint,
+        entity_kind="passages",
+        pagination_mode="exact",
+        current_index_version="mvp-v1",
+        current_run_ids=(fresh_run_id,),
+    )
+
+    assert service._snapshot_cache.get(key, now=now) is None
 
 
 def test_connection_requires_factory() -> None:

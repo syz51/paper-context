@@ -49,7 +49,7 @@ markers = [
 	"slice: in-process FastAPI and service-slice tests.",
 	"integration: multi-component tests against real infrastructure seams.",
 	"contract: schema and golden-response compatibility checks.",
-	"regression: deployment-shape and smoke/regression checks.",
+	"regression: deployment-shape plus end-to-end user-journey regression checks.",
 	"migration: schema migration smoke coverage.",
 	"slow: comparatively expensive tests.",
 	"requires_postgres: requires a real Postgres/PGMQ database.",
