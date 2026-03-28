@@ -7,10 +7,11 @@ The ingestion pipeline is implemented and revision-aware. The worker always buil
 `POST /documents`:
 
 - validates the upload as a non-empty PDF
+- checks PDF magic bytes before accepting the file
 - enforces the configured upload limit
 - stages the source file into local artifact storage
 - creates `documents`, `document_revisions`, `ingest_jobs`, and `document_artifacts` rows
-- enqueues a minimal PGMQ payload containing document and job identifiers
+- enqueues a minimal PGMQ payload containing document and job identifiers, plus trace headers when present
 
 `POST /documents/{document_id}/replace`:
 
@@ -18,6 +19,7 @@ The ingestion pipeline is implemented and revision-aware. The worker always buil
 - creates a new revision and ingest job
 - stages a new source artifact for that revision
 - supersedes older queued jobs for the same document when appropriate
+- deletes queued messages for superseded jobs so stale work does not stay in the queue
 
 The document stays pointed at its previous active revision until the replacement finishes successfully.
 
@@ -53,10 +55,12 @@ Worker behavior:
 
 - claims one message through PGMQ
 - locks the matching ingest job and revision
+- takes an advisory lock for the ingest job before doing real work
 - extends the lease during long-running stages
-- archives completed messages
-- skips duplicate work for terminal jobs
+- archives completed messages only after processing succeeds
+- skips duplicate work for terminal jobs and archives their stale messages
 - fails superseded jobs explicitly
+- leaves claimed messages unarchived when processing is deferred for retry
 
 If a newer job exists for the same document, an older queued or in-flight job can be marked failed with `superseded_by_newer_ingest_job`.
 
@@ -88,6 +92,20 @@ If fallback succeeds:
 - downstream retrieval results preserve the fallback warning state
 
 If fallback cannot recover stable structure and provenance, the job is failed rather than downgraded into blob-text indexing.
+
+The worker does not run `pdfplumber` after a primary `fail`; fallback is specifically a degraded-structure recovery path.
+
+### Parser isolation
+
+The default worker wiring runs parsers in bounded subprocesses.
+
+Current bounds come from settings:
+
+- timeout: `120` seconds
+- memory limit: `2048` MB
+- output limit: `32` MB
+
+This keeps parser failures machine-readable and prevents parser crashes or output floods from taking down the worker process.
 
 ## Metadata Handling
 
@@ -187,6 +205,8 @@ The worker fails the job with explicit machine-readable codes for cases such as:
 - superseded ingest job
 
 Failure preserves already-written artifacts when useful for debugging and keeps warnings attached to the job.
+
+Subprocess parser failures can also surface machine-readable failure codes for launch, timeout, protocol, or output-limit violations.
 
 ## Non-Goals
 

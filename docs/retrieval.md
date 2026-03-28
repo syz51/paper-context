@@ -96,10 +96,11 @@ The primary retrieval units are passages and tables. Parent expansion adds only 
 Context-pack behavior:
 
 - starts from reranked passages
-- attaches relevant tables
+- attaches fresh top table hits for the same query
 - attaches parent section metadata
 - includes supporting sibling passages when needed
 - remains bounded rather than dumping full documents
+- returns the underlying passage pagination cursor as `next_cursor`
 
 When the parent expansion must be trimmed, the pack includes `parent_context_truncated`.
 
@@ -109,6 +110,7 @@ Warnings are contract-level data and may appear on job records, retrieval items,
 
 Common warnings:
 
+- `bounded_pagination_truncated`
 - `parser_fallback_used`
 - `reduced_structure_confidence`
 - `metadata_low_confidence`
@@ -168,7 +170,7 @@ Consumers should propagate these warnings instead of hiding them.
 ### Passage context result
 
 - selected passage metadata
-- neighboring passages with `relationship`
+- bounded section passages with `relationship` values `selected` or `sibling`
 - pack-level warnings
 
 ### Context-pack result

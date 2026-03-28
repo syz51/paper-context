@@ -13,6 +13,12 @@ Input:
 - multipart `file`
 - optional form `title`
 
+Validation notes:
+
+- the file must be non-empty
+- the file must begin with PDF magic bytes
+- the configured upload byte limit is enforced before persistence
+
 Returns:
 
 - `document_id`
@@ -27,6 +33,8 @@ Input:
 
 - multipart `file`
 - optional form `title`
+
+Validation matches `POST /documents`: non-empty PDF uploads only, with the configured size limit enforced before staging completes.
 
 Returns:
 
@@ -156,7 +164,7 @@ Fields:
 - `total_messages`
 - `scrape_time`
 
-`operation_timings` reports recent observed timings for app and worker operations.
+`operation_timings` reports recent timings observed by the current app process. It is not a cross-process aggregate for the worker fleet.
 
 ## MCP Tools
 
@@ -178,7 +186,7 @@ Arguments:
 - `document_ids`
 - `publication_years`
 
-Use this for document-level narrowing before passage or table retrieval.
+`search_documents` is document-level narrowing before passage or table retrieval. It uses Postgres full-text search over document title, abstract, and authors rather than vector retrieval.
 
 ### `search_passages`
 
@@ -304,7 +312,7 @@ Arguments:
 Returns:
 
 - selected passage metadata
-- bounded neighboring passages
+- bounded section passages whose `relationship` is `selected` or `sibling`
 - warning propagation
 
 ### `build_context_pack`
@@ -327,6 +335,8 @@ Returns:
 - `provenance`
 - `warnings`
 - `next_cursor`
+
+`next_cursor` is the passage-search cursor for continuing the pack. Table inclusion is a fresh bounded table search for the same query, not an independently paged table stream.
 
 This is the preferred default tool for downstream consumers.
 

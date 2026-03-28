@@ -10,22 +10,23 @@ Use this doc set when you need to understand how Paper Context works today:
 - retrieval indexing and provenance guarantees
 - test coverage and next-step hardening work
 
-Current defaults:
+Environment assumptions:
 
-- parser: Docling first, `pdfplumber` fallback
-- queue: PGMQ
-- storage: Postgres + pgvector plus local filesystem artifacts
-- API surface: FastAPI
-- MCP transport: FastMCP Streamable HTTP mounted at `/mcp`
-- dense model: `voyage-4-large`
-- reranker: `zerank-2`
-- retrieval shape: passage and table retrieval plus bounded context packs
+- Python `3.14`
+- `uv` for local commands
+- Docker only for the repo-managed Postgres service, Compose bring-up, or Postgres-backed test lanes
 
 Important current caveats:
 
 - metadata enrichment is still intentionally minimal and defaults to a no-op enricher
 - provider-backed retrieval is optional; deterministic fallbacks are used when API keys are absent
 - older document revisions are retained, while all user-facing reads resolve through `documents.active_revision_id`
+- production Compose assumes an external Postgres instead of starting `db` itself
+
+Compatibility backstop:
+
+- the code remains the final authority
+- the HTTP and MCP payloads documented here are also pinned by contract goldens under `tests/contract/golden/`
 
 ## Quick Links
 

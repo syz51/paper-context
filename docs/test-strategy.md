@@ -13,12 +13,16 @@ The test suite is organized around behavior boundaries: pure logic, app slices, 
 
 ## Standard Commands
 
+Local commands:
+
 - `uv run pre-commit run --all-files`
 - `uv run pyright`
 - `uv run pytest -m "unit or slice"`
 - `uv run pytest -m "integration or migration" -n 2 --dist=loadfile`
 - `uv run pytest -m contract`
 - `uv run pytest -m "regression and not staging_only"`
+
+These are the narrowest repo-standard commands for local verification. CI uses the same lane names, but some lanes add artifact capture or coverage flags.
 
 ## What Contract Tests Cover
 
@@ -37,6 +41,8 @@ Contract tests currently check more than health endpoints. They include:
   - `build_context_pack`
 
 Golden files live under `tests/contract/golden/`.
+
+Those goldens are the compatibility backstop for the documented HTTP and MCP payloads.
 
 ## Postgres-Backed Integration Coverage
 
@@ -66,7 +72,7 @@ Tests should remain especially strong around:
 ## CI Lanes
 
 - `static-checks`: pre-commit and type checking
-- `unit-slice`: fast PR-blocking logic and app tests with coverage
+- `unit-slice`: fast PR-blocking logic and app tests with coverage reporting in CI
 - `contract`: schema and golden-response compatibility
 - `integration-postgres`: real Postgres and migration coverage
 - `regression-smoke`: deployment and non-staging regression checks

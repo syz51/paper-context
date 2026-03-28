@@ -23,14 +23,26 @@ Still intentionally limited:
 - Provider-backed retrieval is optional; without API keys the runtime uses deterministic embeddings and a heuristic reranker
 - The project is still a self-hosted MVP, not a polished multi-tenant product or answer-generation app
 
+## Environment Requirements
+
+- Python `3.14` as pinned in `.python-version`
+- `uv` for dependency management and local commands
+- Docker only when you want the repo-managed Postgres service, full Compose bring-up, or the Postgres-backed integration lane
+
 ## Runtime Model
 
-The deployed runtime has four processes:
+Local development uses four processes:
 
 - `db`: Postgres with `pgvector` and `pgmq`
 - `migrate`: one-shot Alembic runner
 - `app`: FastAPI service, which mounts the MCP Streamable HTTP app at `/mcp`
 - `worker`: background ingestion and indexing loop
+
+Production Compose is intentionally different:
+
+- `docker-compose.prod.yml` runs `migrate`, `app`, and `worker`
+- it expects an external Postgres on `dokploy-network`
+- when `PAPER_CONTEXT_ENVIRONMENT=production`, database settings must include secure SSL mode, an application name, and non-null timeout and pool settings
 
 The core data model is revision-aware:
 
@@ -185,11 +197,13 @@ For most downstream consumers, `build_context_pack` is the best default entrypoi
 
 Important implemented behavior:
 
+- uploads must be non-empty PDFs; non-PDF files are rejected before staging
 - warnings such as `parser_fallback_used`, `reduced_structure_confidence`, `metadata_low_confidence`, and `parent_context_truncated` are part of the public retrieval contract
 - document reads always resolve against the active revision
 - retrieval results include `index_version`, `retrieval_index_run_id`, and `parser_source`
 - if a newer job supersedes an older queued or in-flight job for the same document, the older job is failed explicitly as superseded
 - replacement retains prior revisions; a failed replacement can leave the previous ready revision active
+- parser execution defaults to isolated subprocesses with timeout, memory, and output bounds
 
 ## CLI Commands
 

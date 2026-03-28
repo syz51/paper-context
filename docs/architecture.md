@@ -4,14 +4,18 @@ Paper Context is implemented as a self-hosted, revision-aware ingestion and retr
 
 ## Runtime Topology
 
-The deployed runtime consists of four processes:
+Local development uses four processes:
 
 - `db`: Postgres with the `vector` and `pgmq` extensions
 - `migrate`: one-shot Alembic runner
 - `app`: FastAPI service for HTTP endpoints and MCP mounting
 - `worker`: background ingestion and indexing loop
 
-In local and production Compose files, MCP is not a separate process. The FastMCP app is mounted by the FastAPI service at `/mcp`.
+Production Compose is narrower:
+
+- `migrate`, `app`, and `worker` run in `docker-compose.prod.yml`
+- Postgres is expected to exist outside this Compose file on `dokploy-network`
+- MCP is still not a separate process; FastMCP remains mounted by the FastAPI service at `/mcp`
 
 ## Service Responsibilities
 
@@ -33,7 +37,9 @@ It does not perform parsing or indexing inline.
 Owns:
 
 - queue claim, lease extension, archive, and redelivery behavior
+- advisory-lock based single-job processing
 - parser execution and structure gating
+- parser subprocess isolation when `PAPER_CONTEXT_PARSER__EXECUTION_MODE=subprocess`
 - canonical normalization
 - chunking and contextualized retrieval text generation
 - retrieval asset materialization
@@ -107,12 +113,21 @@ Future agent logic is downstream of this boundary. Agents can use MCP tools, but
   - canonical records, queue dispatch, filters, vectors, and search assets in one store
 - **Docling + `pdfplumber`**
   - primary parser plus deterministic fallback
+  - subprocess isolation is the default runtime mode, with timeout, memory, and output limits
 - **Voyage `voyage-4-large`**
   - default dense embedding model
 - **Zero Entropy `zerank-2`**
   - default reranker model
 
 When provider API keys are missing, the runtime uses deterministic embedding and heuristic reranking implementations so the system remains operable locally.
+
+## Production Runtime Guards
+
+When `PAPER_CONTEXT_ENVIRONMENT=production`, runtime settings enforce stricter database configuration:
+
+- secure SSL mode
+- explicit application name
+- non-null connection timeout, statement timeout, lock timeout, idle transaction timeout, and pool settings
 
 ## Out Of Scope
 
