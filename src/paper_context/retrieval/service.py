@@ -2437,7 +2437,7 @@ class RetrievalService:
         }
         limit_sql = self._candidate_limit_sql(params=params, limit=limit)
         query_sql = """
-            WITH candidate_assets AS (
+            WITH ranked_assets AS MATERIALIZED (
                 SELECT
                     assets.id,
                     assets.retrieval_index_run_id,
@@ -2445,7 +2445,7 @@ class RetrievalService:
                     ts_rank_cd(
                         assets.search_tsvector,
                         websearch_to_tsquery('english', :query)
-                    ) AS rank_score
+                    )::real AS rank_score
                 FROM retrieval_passage_assets assets
                 WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
                   AND assets.search_tsvector @@ websearch_to_tsquery('english', :query)
@@ -2453,21 +2453,23 @@ class RetrievalService:
                       :apply_document_filter = false
                       OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
                   )
-                  AND (
-                      CAST(:after_score AS double precision) IS NULL
-                      OR ts_rank_cd(
-                          assets.search_tsvector,
-                          websearch_to_tsquery('english', :query)
-                      ) < CAST(:after_score AS double precision)
-                      OR (
-                          ts_rank_cd(
-                              assets.search_tsvector,
-                              websearch_to_tsquery('english', :query)
-                          ) = CAST(:after_score AS double precision)
-                          AND assets.passage_id > CAST(:after_entity_id AS uuid)
-                      )
-                  )
-                ORDER BY rank_score DESC, assets.passage_id
+            ),
+            candidate_assets AS (
+                SELECT
+                    ranked_assets.id,
+                    ranked_assets.retrieval_index_run_id,
+                    ranked_assets.passage_id,
+                    ranked_assets.rank_score
+                FROM ranked_assets
+                WHERE (
+                    CAST(:after_score AS real) IS NULL
+                    OR ranked_assets.rank_score < CAST(:after_score AS real)
+                    OR (
+                        ranked_assets.rank_score = CAST(:after_score AS real)
+                        AND ranked_assets.passage_id > CAST(:after_entity_id AS uuid)
+                    )
+                )
+                ORDER BY ranked_assets.rank_score DESC, ranked_assets.passage_id
             """
         query_sql += limit_sql
         query_sql += """
@@ -2569,7 +2571,10 @@ class RetrievalService:
                     assets.id,
                     assets.retrieval_index_run_id,
                     assets.passage_id,
-                    1 - (assets.embedding <=> CAST(:query_embedding AS vector)) AS dense_score
+                    CAST(
+                        1 - (assets.embedding <=> CAST(:query_embedding AS vector))
+                        AS double precision
+                    ) AS dense_score
                 FROM retrieval_passage_assets assets
                 WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
                   AND assets.embedding IS NOT NULL
@@ -2579,11 +2584,15 @@ class RetrievalService:
                   )
                   AND (
                       CAST(:after_score AS double precision) IS NULL
-                      OR 1 - (assets.embedding <=> CAST(:query_embedding AS vector))
-                         < CAST(:after_score AS double precision)
-                      OR (
+                      OR CAST(
                           1 - (assets.embedding <=> CAST(:query_embedding AS vector))
-                              = CAST(:after_score AS double precision)
+                          AS double precision
+                      ) < CAST(:after_score AS double precision)
+                      OR (
+                          CAST(
+                              1 - (assets.embedding <=> CAST(:query_embedding AS vector))
+                              AS double precision
+                          ) = CAST(:after_score AS double precision)
                           AND assets.passage_id > CAST(:after_entity_id AS uuid)
                       )
                   )
@@ -2751,7 +2760,7 @@ class RetrievalService:
         }
         limit_sql = self._candidate_limit_sql(params=params, limit=limit)
         query_sql = """
-            WITH candidate_assets AS (
+            WITH ranked_assets AS MATERIALIZED (
                 SELECT
                     assets.id,
                     assets.retrieval_index_run_id,
@@ -2759,7 +2768,7 @@ class RetrievalService:
                     ts_rank_cd(
                         assets.search_tsvector,
                         websearch_to_tsquery('english', :query)
-                    ) AS rank_score
+                    )::real AS rank_score
                 FROM retrieval_table_assets assets
                 WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
                   AND assets.search_tsvector @@ websearch_to_tsquery('english', :query)
@@ -2767,21 +2776,23 @@ class RetrievalService:
                       :apply_document_filter = false
                       OR assets.document_id = ANY(CAST(:document_ids AS uuid[]))
                   )
-                  AND (
-                      CAST(:after_score AS double precision) IS NULL
-                      OR ts_rank_cd(
-                          assets.search_tsvector,
-                          websearch_to_tsquery('english', :query)
-                      ) < CAST(:after_score AS double precision)
-                      OR (
-                          ts_rank_cd(
-                              assets.search_tsvector,
-                              websearch_to_tsquery('english', :query)
-                          ) = CAST(:after_score AS double precision)
-                          AND assets.table_id > CAST(:after_entity_id AS uuid)
-                      )
-                  )
-                ORDER BY rank_score DESC, assets.table_id
+            ),
+            candidate_assets AS (
+                SELECT
+                    ranked_assets.id,
+                    ranked_assets.retrieval_index_run_id,
+                    ranked_assets.table_id,
+                    ranked_assets.rank_score
+                FROM ranked_assets
+                WHERE (
+                    CAST(:after_score AS real) IS NULL
+                    OR ranked_assets.rank_score < CAST(:after_score AS real)
+                    OR (
+                        ranked_assets.rank_score = CAST(:after_score AS real)
+                        AND ranked_assets.table_id > CAST(:after_entity_id AS uuid)
+                    )
+                )
+                ORDER BY ranked_assets.rank_score DESC, ranked_assets.table_id
             """
         query_sql += limit_sql
         query_sql += """
@@ -2889,7 +2900,10 @@ class RetrievalService:
                     assets.id,
                     assets.retrieval_index_run_id,
                     assets.table_id,
-                    1 - (assets.embedding <=> CAST(:query_embedding AS vector)) AS dense_score
+                    CAST(
+                        1 - (assets.embedding <=> CAST(:query_embedding AS vector))
+                        AS double precision
+                    ) AS dense_score
                 FROM retrieval_table_assets assets
                 WHERE assets.retrieval_index_run_id = ANY(CAST(:retrieval_index_run_ids AS uuid[]))
                   AND assets.embedding IS NOT NULL
@@ -2899,11 +2913,15 @@ class RetrievalService:
                   )
                   AND (
                       CAST(:after_score AS double precision) IS NULL
-                      OR 1 - (assets.embedding <=> CAST(:query_embedding AS vector))
-                         < CAST(:after_score AS double precision)
-                      OR (
+                      OR CAST(
                           1 - (assets.embedding <=> CAST(:query_embedding AS vector))
-                              = CAST(:after_score AS double precision)
+                          AS double precision
+                      ) < CAST(:after_score AS double precision)
+                      OR (
+                          CAST(
+                              1 - (assets.embedding <=> CAST(:query_embedding AS vector))
+                              AS double precision
+                          ) = CAST(:after_score AS double precision)
                           AND assets.table_id > CAST(:after_entity_id AS uuid)
                       )
                   )
@@ -3130,6 +3148,8 @@ class RetrievalService:
 
     def _row_to_passage_candidate(self, row: Any) -> _Candidate:
         warnings = tuple(cast(list[str], row["warnings"] or []))
+        sparse_rank_score = row.get("rank_score")
+        dense_score = row.get("dense_score")
         return _Candidate(
             entity_kind="passage",
             entity_id=row["passage_id"],
@@ -3144,8 +3164,8 @@ class RetrievalService:
             parser_source=row.get("parser_source"),
             warnings=warnings,
             rerank_text=row["contextualized_text"],
-            sparse_rank_score=row.get("rank_score"),
-            dense_score=row.get("dense_score"),
+            sparse_rank_score=None if sparse_rank_score is None else float(sparse_rank_score),
+            dense_score=None if dense_score is None else float(dense_score),
             passage_id=row["passage_id"],
             body_text=row["body_text"],
             chunk_ordinal=row["chunk_ordinal"],
@@ -3153,6 +3173,8 @@ class RetrievalService:
 
     def _row_to_table_candidate(self, row: Any) -> _Candidate:
         warnings = tuple(cast(list[str], row["warnings"] or []))
+        sparse_rank_score = row.get("rank_score")
+        dense_score = row.get("dense_score")
         headers = tuple(str(value) for value in cast(list[object], row["headers_json"] or []))
         table_rows = tuple(
             tuple(str(cell) for cell in cast(list[object], values))
@@ -3172,8 +3194,8 @@ class RetrievalService:
             parser_source=row.get("parser_source"),
             warnings=warnings,
             rerank_text=row.get("semantic_text") or row.get("search_text") or "",
-            sparse_rank_score=row.get("rank_score"),
-            dense_score=row.get("dense_score"),
+            sparse_rank_score=None if sparse_rank_score is None else float(sparse_rank_score),
+            dense_score=None if dense_score is None else float(dense_score),
             table_id=row["table_id"],
             caption=row["caption"],
             table_type=row["table_type"],

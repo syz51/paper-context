@@ -384,6 +384,50 @@ def test_search_tables_page_streams_sparse_expansion_with_search_after() -> None
     assert decode_cursor(page.next_cursor)["offset"] == 1
 
 
+def test_search_passages_page_streams_tied_sparse_scores_with_search_after() -> None:
+    service = _service()
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
+    run_id = UUID("88888888-8888-8888-8888-888888888888")
+    candidates = [
+        _passage_candidate(
+            passage_id=UUID(int=index + 1),
+            retrieval_index_run_id=run_id,
+            score=1.0,
+        )
+        for index in range(35)
+    ]
+
+    first_anchor = candidates[29]
+
+    def _slice_passages(*args, **kwargs):
+        del args
+        limit = kwargs["limit"]
+        after_score = kwargs["after_score"]
+        after_entity_id = kwargs["after_entity_id"]
+        if after_score is None:
+            return candidates[:limit]
+        assert after_score == first_anchor.sparse_rank_score
+        assert after_entity_id == first_anchor.entity_id
+        return candidates[30 : 30 + limit]
+
+    service._load_sparse_passage_candidates = MagicMock(side_effect=_slice_passages)  # type: ignore[method-assign]
+    page = service.search_passages_page(query="alpha", limit=1)
+
+    assert [item.passage_id for item in page.items] == [candidates[0].passage_id]
+    assert [
+        call.kwargs["after_score"]
+        for call in service._load_sparse_passage_candidates.call_args_list
+    ] == [
+        None,
+        first_anchor.sparse_rank_score,
+    ]
+    assert page.next_cursor is not None
+    assert decode_cursor(page.next_cursor)["offset"] == 1
+
+
 def test_get_table_returns_full_structured_payload() -> None:
     connection = MagicMock()
     result = MagicMock()
