@@ -17,10 +17,11 @@ from paper_context.models import (
     IngestJob,
     RetrievalIndexRun,
 )
+from paper_context.pagination import encode_cursor, fingerprint_payload
 from paper_context.retrieval import DocumentRetrievalIndexer, RetrievalService
 from paper_context.retrieval import service as retrieval_service_module
 from paper_context.retrieval.clients import EmbeddingBatch
-from paper_context.retrieval.types import RerankItem, RetrievalFilters
+from paper_context.retrieval.types import RerankItem, RetrievalError, RetrievalFilters
 
 pytestmark = [
     pytest.mark.integration,
@@ -2466,6 +2467,115 @@ def test_search_passages_page_reuses_ranked_snapshot_for_later_pages(
     assert len(reranker.calls) == 1
 
 
+def test_search_tables_page_reuses_ranked_snapshot_for_later_pages(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    first_table_id = uuid4()
+    second_table_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Snapshot reuse tables",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Tables",
+                heading_path=["Tables"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for index, table_id in enumerate((first_table_id, second_table_id), start=1):
+            connection.execute(
+                insert(DocumentTable).values(
+                    id=table_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    caption=f"Snapshot table {index}",
+                    table_type="lexical",
+                    headers_json=["A"],
+                    rows_json=[[str(index)]],
+                    page_start=1,
+                    page_end=1,
+                    artifact_id=None,
+                )
+            )
+            _insert_table_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                table_id=table_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text="snapshot table keyword",
+                embedding=_vector_string(13),
+            )
+
+    reranker = CountingReranker()
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+        embedding_client=FixedEmbeddingClient({"snapshot table keyword": _vector_values(13)}),
+        reranker_client=reranker,
+    )
+
+    first_page = service.search_tables_page(query="snapshot table keyword", limit=1)
+    second_page = service.search_tables_page(
+        query="snapshot table keyword",
+        limit=1,
+        cursor=first_page.next_cursor,
+    )
+
+    assert len(first_page.items) == 1
+    assert len(second_page.items) == 1
+    assert {first_page.items[0].table_id, second_page.items[0].table_id} == {
+        first_table_id,
+        second_table_id,
+    }
+    assert len(reranker.calls) == 1
+
+
 def test_search_passages_page_exact_mode_reranks_only_needed_prefix_per_page_chain(
     migrated_postgres_engine,
 ) -> None:
@@ -2790,6 +2900,226 @@ def test_search_passages_page_bounded_mode_exposes_truncation_metadata(
     assert page.next_cursor is not None
 
 
+def test_search_tables_page_bounded_mode_exposes_truncation_metadata(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    total_tables = retrieval_service_module.TABLE_SPARSE_CANDIDATES + 10
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Bounded pagination tables",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Tables",
+                heading_path=["Tables"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for index in range(total_tables):
+            table_id = UUID(int=30_000 + index)
+            connection.execute(
+                insert(DocumentTable).values(
+                    id=table_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    caption=f"Bounded table {index + 1}",
+                    table_type="lexical",
+                    headers_json=["A"],
+                    rows_json=[[str(index + 1)]],
+                    page_start=1,
+                    page_end=1,
+                    artifact_id=None,
+                )
+            )
+            _insert_table_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                table_id=table_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text="bounded table pagination keyword",
+            )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+    )
+
+    page = service.search_tables_page(
+        query="bounded table pagination keyword",
+        limit=2,
+        pagination_mode="bounded",
+        max_rerank_candidates=3,
+        max_expansion_rounds=1,
+    )
+
+    assert len(page.items) == 2
+    assert page.exact is False
+    assert page.truncated is True
+    assert page.warnings == ("bounded_pagination_truncated",)
+    assert page.next_cursor is not None
+
+
+def test_search_passages_page_rejects_legacy_cursor_integration(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    passage_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Legacy cursor passages",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Body",
+                heading_path=["Body"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        connection.execute(
+            insert(DocumentPassage).values(
+                id=passage_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                section_id=section_id,
+                chunk_ordinal=1,
+                body_text="Legacy cursor passage",
+                contextualized_text="Legacy cursor passage",
+                token_count=3,
+                page_start=1,
+                page_end=1,
+                provenance_offsets={"pages": [1], "charspans": [[0, 10]]},
+                artifact_id=None,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        _insert_passage_asset(
+            connection,
+            run_id=run_id,
+            revision_id=revision_id,
+            passage_id=passage_id,
+            document_id=document_id,
+            section_id=section_id,
+            publication_year=None,
+            search_text="legacy cursor keyword",
+            embedding=_vector_string(14),
+        )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+    )
+    fingerprint = fingerprint_payload(
+        {
+            "kind": "passages",
+            "query": "legacy cursor keyword",
+            "pagination_mode": "exact",
+            "max_rerank_candidates": None,
+            "max_expansion_rounds": None,
+            "filters": {"document_ids": [], "publication_years": []},
+        }
+    )
+    legacy_cursor = encode_cursor(
+        {
+            "kind": "passages",
+            "fingerprint": fingerprint,
+            "index_version": "mvp-v2",
+            "score": "3.0",
+            "entity_id": str(passage_id),
+        }
+    )
+
+    with pytest.raises(RetrievalError, match="cursor is no longer supported"):
+        service.search_passages_page(
+            query="legacy cursor keyword",
+            limit=1,
+            cursor=legacy_cursor,
+        )
+
+
 def test_search_tables_page_reaches_results_beyond_sparse_candidate_cap(
     migrated_postgres_engine,
 ) -> None:
@@ -2894,6 +3224,118 @@ def test_search_tables_page_reaches_results_beyond_sparse_candidate_cap(
 
     assert tuple(seen_table_ids) == expected_table_ids
     assert len(seen_table_ids) == total_tables
+
+
+def test_search_passages_page_reaches_results_beyond_dense_candidate_cap(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    total_passages = retrieval_service_module.PASSAGE_DENSE_CANDIDATES + 7
+    expected_passage_ids = tuple(UUID(int=40_000 + index) for index in range(total_passages))
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Dense-only pagination passages",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Body",
+                heading_path=["Body"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for index, passage_id in enumerate(expected_passage_ids, start=1):
+            connection.execute(
+                insert(DocumentPassage).values(
+                    id=passage_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    chunk_ordinal=index,
+                    body_text=f"Dense page passage {index}",
+                    contextualized_text=f"Dense page passage {index}",
+                    token_count=4,
+                    page_start=1,
+                    page_end=1,
+                    provenance_offsets={"pages": [1], "charspans": [[0, 10]]},
+                    artifact_id=None,
+                )
+            )
+            _insert_passage_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                passage_id=passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text=f"latent vector candidate {index}",
+                embedding=_vector_string(21),
+            )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+        embedding_client=FixedEmbeddingClient(
+            {"semantic-only pagination query": _vector_values(21)}
+        ),
+        reranker_client=IdentityReranker(),
+    )
+
+    seen_passage_ids: list[UUID] = []
+    cursor: str | None = None
+    while True:
+        page = service.search_passages_page(
+            query="semantic-only pagination query",
+            limit=4,
+            cursor=cursor,
+        )
+        seen_passage_ids.extend(item.passage_id for item in page.items)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+    assert tuple(seen_passage_ids) == expected_passage_ids
+    assert len(seen_passage_ids) == total_passages
 
 
 def test_detail_helpers_require_active_retrieval_provenance(

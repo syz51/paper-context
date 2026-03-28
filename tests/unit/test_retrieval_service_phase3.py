@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from paper_context.pagination import decode_cursor, encode_cursor, fingerprint_payload
+from paper_context.retrieval import service as retrieval_service_module
 from paper_context.retrieval.service import (
     RetrievalService,
     _ActiveRunSelection,
@@ -303,6 +304,36 @@ def test_search_passages_page_reuses_ranked_snapshot_on_later_pages() -> None:
     service._load_sparse_passage_candidates.assert_called_once()
 
 
+def test_search_tables_page_reuses_ranked_snapshot_on_later_pages() -> None:
+    reranker = _RecordingReranker()
+    service = _service(reranker_client=reranker)
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
+    run_id = UUID("67676767-6767-6767-6767-676767676767")
+    candidates = [
+        _table_candidate(
+            table_id=UUID(int=10_000 + index),
+            retrieval_index_run_id=run_id,
+        )
+        for index in range(3)
+    ]
+    service._load_sparse_table_candidates = MagicMock(return_value=candidates)  # type: ignore[method-assign]
+
+    first_page = service.search_tables_page(query="beta", limit=2)
+    second_page = service.search_tables_page(query="beta", limit=2, cursor=first_page.next_cursor)
+
+    assert [item.table_id for item in first_page.items] == [
+        candidates[0].table_id,
+        candidates[1].table_id,
+    ]
+    assert [item.table_id for item in second_page.items] == [candidates[2].table_id]
+    assert len(reranker.calls) == 1
+    assert len(reranker.calls[0]) == 3
+    service._load_sparse_table_candidates.assert_called_once()
+
+
 def test_search_passages_page_exact_mode_certifies_before_rerank() -> None:
     reranker = _RecordingReranker()
     service = _service(reranker_client=reranker)
@@ -427,6 +458,46 @@ def test_search_passages_page_bounded_mode_reranks_only_bounded_shortlist() -> N
     assert page.warnings == ("bounded_pagination_truncated",)
 
 
+def test_search_tables_page_bounded_mode_reranks_only_bounded_shortlist() -> None:
+    reranker = _RecordingReranker()
+    service = _service(reranker_client=reranker)
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
+    run_id = UUID("68686868-6868-6868-6868-686868686868")
+    candidates = [
+        _table_candidate(
+            table_id=UUID(int=20_000 + index),
+            retrieval_index_run_id=run_id,
+            score=float(100 - index),
+        )
+        for index in range(30)
+    ]
+
+    service._load_sparse_table_candidates = MagicMock(  # type: ignore[method-assign]
+        return_value=candidates
+    )
+
+    page = service.search_tables_page(
+        query="beta",
+        limit=2,
+        pagination_mode="bounded",
+        max_rerank_candidates=3,
+        max_expansion_rounds=1,
+    )
+
+    assert [item.table_id for item in page.items] == [
+        candidates[0].table_id,
+        candidates[1].table_id,
+    ]
+    assert len(reranker.calls) == 1
+    assert len(reranker.calls[0]) == 3
+    assert page.exact is False
+    assert page.truncated is True
+    assert page.warnings == ("bounded_pagination_truncated",)
+
+
 def test_search_tables_page_streams_sparse_expansion_with_search_after() -> None:
     service = _service()
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
@@ -471,6 +542,59 @@ def test_search_tables_page_streams_sparse_expansion_with_search_after() -> None
     ]
     assert page.next_cursor is not None
     assert decode_cursor(page.next_cursor)["offset"] == 20
+
+
+def test_search_tables_page_streams_dense_expansion_with_search_after() -> None:
+    service = _service()
+    service._embedding_client = object()  # type: ignore[assignment]
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
+    run_id = UUID("78787878-7878-7878-7878-787878787878")
+    candidates = [
+        _table_candidate(
+            table_id=UUID(int=30_000 + index),
+            retrieval_index_run_id=run_id,
+        )
+        for index in range(retrieval_service_module.TABLE_DENSE_CANDIDATES + 5)
+    ]
+    for candidate in candidates:
+        candidate.dense_score = 1.0
+
+    first_anchor = candidates[retrieval_service_module.TABLE_DENSE_CANDIDATES - 1]
+
+    def _slice_tables(*args, **kwargs):
+        del args
+        limit = kwargs["limit"]
+        after_score = kwargs["after_score"]
+        after_entity_id = kwargs["after_entity_id"]
+        if after_score is None:
+            return candidates[:limit]
+        assert after_score == first_anchor.dense_score
+        assert after_entity_id == first_anchor.entity_id
+        start = retrieval_service_module.TABLE_DENSE_CANDIDATES
+        return candidates[start : start + limit]
+
+    service._load_sparse_table_candidates = MagicMock(return_value=[])  # type: ignore[method-assign]
+    service._load_dense_table_candidates = MagicMock(side_effect=_slice_tables)  # type: ignore[method-assign]
+
+    page = service.search_tables_page(
+        query="beta",
+        limit=retrieval_service_module.TABLE_DENSE_CANDIDATES,
+    )
+
+    assert [item.table_id for item in page.items] == [
+        candidate.table_id
+        for candidate in candidates[: retrieval_service_module.TABLE_DENSE_CANDIDATES]
+    ]
+    assert page.next_cursor is not None
+    assert [
+        call.kwargs["after_score"] for call in service._load_dense_table_candidates.call_args_list
+    ] == [None, first_anchor.dense_score]
+    assert (
+        decode_cursor(page.next_cursor)["offset"] == retrieval_service_module.TABLE_DENSE_CANDIDATES
+    )
 
 
 def test_search_passages_page_streams_tied_sparse_scores_with_search_after() -> None:
