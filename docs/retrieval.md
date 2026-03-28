@@ -38,7 +38,7 @@ Behavior:
 - pagination is cursor-based and tied to query, filters, and index version
 - exact pagination uses versioned offset cursors and rejects legacy score/entity cursors
 - sparse and dense expansion advances by search-after anchors, not SQL `OFFSET`
-- exact pagination materializes and caches a ranked snapshot for the request fingerprint so later pages can reuse the same ordered state
+- exact pagination certifies and caches a ranked prefix for the request fingerprint, then extends that ordered prefix on demand for later pages
 - bounded pagination is explicit, opt-in, and exposes `exact`, `truncated`, and warning metadata
 
 ## Table Retrieval
@@ -64,7 +64,7 @@ Behavior:
 
 Sparse and dense candidates are fused and deduplicated before reranking. Result provenance preserves whether an item matched through sparse, dense, or both modes.
 
-Exact pagination now computes a stable ranked snapshot once per request fingerprint and active index version, then serves later pages from that cached ordered state until the snapshot expires or the active index version changes.
+Exact pagination now certifies and reranks only the exact page-chain prefix the current request needs, caches that ordered prefix by fingerprint and active index version, and extends the cached prefix on demand for later pages until the snapshot expires or the active index version changes.
 
 Bounded pagination keeps a hard ceiling on expansion rounds and rerank candidates. When the ceiling binds, the response sets `truncated=true`, `exact=false`, and includes `bounded_pagination_truncated`.
 

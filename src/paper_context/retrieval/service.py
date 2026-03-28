@@ -324,6 +324,7 @@ class _PaginationComputation:
     truncated: bool
     warnings: tuple[str, ...]
     stop_reason: str
+    has_more_results: bool
 
 
 @dataclass(frozen=True)
@@ -348,6 +349,7 @@ class _RankedSnapshot:
     exact: bool
     truncated: bool
     warnings: tuple[str, ...]
+    has_more_results: bool
 
 
 class _RankedSnapshotCache:
@@ -374,6 +376,7 @@ class _RankedSnapshotCache:
         exact: bool,
         truncated: bool,
         warnings: tuple[str, ...],
+        has_more_results: bool,
         now: datetime,
     ) -> None:
         retrieval_index_run_ids = tuple(
@@ -392,6 +395,7 @@ class _RankedSnapshotCache:
             exact=exact,
             truncated=truncated,
             warnings=warnings,
+            has_more_results=has_more_results,
         )
         with self._lock:
             self._prune_expired_locked(now=now)
@@ -1756,7 +1760,11 @@ class RetrievalService:
         fingerprint: str,
         controls: _PaginationControls,
     ) -> SearchPage[PassageResult]:
-        self._page_cursor_offset(cursor=cursor, kind="passages", fingerprint=fingerprint)
+        cursor_offset = self._page_cursor_offset(
+            cursor=cursor,
+            kind="passages",
+            fingerprint=fingerprint,
+        )
         return cast(
             SearchPage[PassageResult],
             self._search_ranked_page_with_connection(
@@ -1769,6 +1777,7 @@ class RetrievalService:
                 fingerprint=fingerprint,
                 controls=controls,
                 entity_kind="passages",
+                cursor_offset=cursor_offset,
                 sparse_base_limit=PASSAGE_SPARSE_CANDIDATES,
                 dense_base_limit=PASSAGE_DENSE_CANDIDATES,
                 load_sparse_candidates=self._load_sparse_passage_candidates,
@@ -1790,7 +1799,11 @@ class RetrievalService:
         fingerprint: str,
         controls: _PaginationControls,
     ) -> SearchPage[TableResult]:
-        self._page_cursor_offset(cursor=cursor, kind="tables", fingerprint=fingerprint)
+        cursor_offset = self._page_cursor_offset(
+            cursor=cursor,
+            kind="tables",
+            fingerprint=fingerprint,
+        )
         return cast(
             SearchPage[TableResult],
             self._search_ranked_page_with_connection(
@@ -1803,6 +1816,7 @@ class RetrievalService:
                 fingerprint=fingerprint,
                 controls=controls,
                 entity_kind="tables",
+                cursor_offset=cursor_offset,
                 sparse_base_limit=TABLE_SPARSE_CANDIDATES,
                 dense_base_limit=TABLE_DENSE_CANDIDATES,
                 load_sparse_candidates=self._load_sparse_table_candidates,
@@ -1823,6 +1837,7 @@ class RetrievalService:
         fingerprint: str,
         controls: _PaginationControls,
         entity_kind: Literal["passages", "tables"],
+        cursor_offset: int,
         sparse_base_limit: int,
         dense_base_limit: int,
         load_sparse_candidates: Callable[..., list[_Candidate]],
@@ -1850,14 +1865,25 @@ class RetrievalService:
         )
         snapshot = self._snapshot_cache.get(snapshot_key, now=now)
         metrics = get_metrics()
-        if snapshot is None:
-            metrics.increment("retrieval.pagination.snapshot_miss")
+        required_result_count = cursor_offset + max(limit, 0) + 1
+        needs_exact_prefix = (
+            controls.mode == "exact"
+            and snapshot is not None
+            and snapshot.has_more_results
+            and len(snapshot.results) < required_result_count
+        )
+        if snapshot is None or needs_exact_prefix:
+            if snapshot is None:
+                metrics.increment("retrieval.pagination.snapshot_miss")
+            else:
+                metrics.increment("retrieval.pagination.snapshot_extend")
             computation = self._compute_ranked_page_results(
                 connection,
                 query=query,
                 filtered_document_ids=filtered_document_ids,
                 active_runs=active_runs,
                 controls=controls,
+                target_result_count=required_result_count,
                 sparse_base_limit=sparse_base_limit,
                 dense_base_limit=dense_base_limit,
                 load_sparse_candidates=load_sparse_candidates,
@@ -1870,6 +1896,7 @@ class RetrievalService:
                 exact=computation.exact,
                 truncated=computation.truncated,
                 warnings=computation.warnings,
+                has_more_results=computation.has_more_results,
                 now=now,
             )
             snapshot = self._snapshot_cache.get(snapshot_key, now=now)
@@ -1888,6 +1915,7 @@ class RetrievalService:
             exact=snapshot.exact,
             truncated=snapshot.truncated,
             warnings=snapshot.warnings,
+            has_more_results=snapshot.has_more_results,
         )
 
     def _load_ranked_passage_results(
@@ -1993,6 +2021,7 @@ class RetrievalService:
         filtered_document_ids: tuple[uuid.UUID, ...] | None,
         active_runs: _ActiveRunSelection,
         controls: _PaginationControls,
+        target_result_count: int,
         sparse_base_limit: int,
         dense_base_limit: int,
         load_sparse_candidates: Callable[..., list[_Candidate]],
@@ -2012,6 +2041,7 @@ class RetrievalService:
         stop_reason = "streams_exhausted"
         ordered_candidates: list[_Candidate] | None = None
         rounds = 0
+        exact_target_count = max(target_result_count, 0)
 
         while not (state.sparse_exhausted and state.dense_exhausted):
             if (
@@ -2044,6 +2074,15 @@ class RetrievalService:
                     batch_limit=dense_batch_limit,
                     loader=load_dense_candidates,
                 )
+            if controls.mode == "exact" and exact_target_count > 0:
+                shortlist = self._certify_fused_shortlist(
+                    state=state,
+                    target_count=exact_target_count,
+                )
+                if shortlist is not None and len(shortlist) >= exact_target_count:
+                    ordered_candidates = shortlist
+                    stop_reason = "certified_page_target"
+                    break
             if (
                 controls.mode == "bounded"
                 and controls.max_rerank_candidates is not None
@@ -2062,7 +2101,7 @@ class RetrievalService:
             if controls.mode == "exact":
                 ordered_candidates = self._certify_fused_shortlist(
                     state=state,
-                    target_count=len(state.candidates),
+                    target_count=exact_target_count,
                 )
             if ordered_candidates is None:
                 ordered_candidates = self._ordered_fused_candidates(state.candidates.values())
@@ -2076,7 +2115,8 @@ class RetrievalService:
             truncated = True
             if stop_reason == "streams_exhausted":
                 stop_reason = "bounded_rerank_cap"
-        if controls.mode == "bounded" and not (state.sparse_exhausted and state.dense_exhausted):
+        all_candidates_exhausted = state.sparse_exhausted and state.dense_exhausted
+        if controls.mode == "bounded" and not all_candidates_exhausted:
             truncated = True
 
         reranked = self._rerank_candidates(query=query, candidates=ordered_candidates, limit=None)
@@ -2084,14 +2124,21 @@ class RetrievalService:
             tuple[PassageResult, ...] | tuple[TableResult, ...],
             tuple(candidate_to_result(candidate) for candidate in reranked),
         )
+        has_more_results = (
+            controls.mode == "exact"
+            and not all_candidates_exhausted
+            and exact_target_count > 0
+            and len(ordered_candidates) >= exact_target_count
+        ) or (len(state.candidates) > len(ordered_candidates))
         warnings = ("bounded_pagination_truncated",) if truncated else ()
-        exact = not truncated and state.sparse_exhausted and state.dense_exhausted
+        exact = not truncated and (controls.mode == "exact" or all_candidates_exhausted)
         return _PaginationComputation(
             results=results,
             exact=exact,
             truncated=truncated,
             warnings=warnings,
             stop_reason=stop_reason,
+            has_more_results=has_more_results,
         )
 
     def _expand_candidate_stream(
@@ -3633,6 +3680,7 @@ class RetrievalService:
         exact: bool,
         truncated: bool,
         warnings: tuple[str, ...],
+        has_more_results: bool,
     ) -> SearchPage[PassageResult] | SearchPage[TableResult]:
         index_version = self._page_index_version(results=results, active_runs=active_runs)
         ordered = tuple(
@@ -3663,7 +3711,10 @@ class RetrievalService:
 
         page_items = ordered[start_index : start_index + max(0, limit)]
         next_cursor: str | None = None
-        if start_index + limit < len(ordered) and page_items:
+        if page_items and (
+            start_index + limit < len(ordered)
+            or (start_index + len(page_items) == len(ordered) and has_more_results)
+        ):
             next_cursor = encode_cursor(
                 {
                     "cursor_version": PAGE_CURSOR_VERSION,

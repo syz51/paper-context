@@ -2466,6 +2466,114 @@ def test_search_passages_page_reuses_ranked_snapshot_for_later_pages(
     assert len(reranker.calls) == 1
 
 
+def test_search_passages_page_exact_mode_reranks_only_needed_prefix_per_page_chain(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    total_passages = 6
+    passage_ids = tuple(UUID(int=30_000 + index) for index in range(total_passages))
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Exact pagination prefix",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Body",
+                heading_path=["Body"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for index, passage_id in enumerate(passage_ids, start=1):
+            connection.execute(
+                insert(DocumentPassage).values(
+                    id=passage_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    chunk_ordinal=index,
+                    body_text=f"Exact pagination passage {index}",
+                    contextualized_text=f"Exact pagination passage {index}",
+                    token_count=3,
+                    page_start=1,
+                    page_end=1,
+                    provenance_offsets={"pages": [1], "charspans": [[0, 10]]},
+                    artifact_id=None,
+                )
+            )
+            _insert_passage_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                passage_id=passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text="exact pagination keyword",
+                embedding=_vector_string(16),
+            )
+
+    reranker = CountingReranker()
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+        embedding_client=FixedEmbeddingClient({"exact pagination keyword": _vector_values(16)}),
+        reranker_client=reranker,
+    )
+
+    first_page = service.search_passages_page(query="exact pagination keyword", limit=2)
+    second_page = service.search_passages_page(
+        query="exact pagination keyword",
+        limit=2,
+        cursor=first_page.next_cursor,
+    )
+
+    assert [item.passage_id for item in first_page.items] == list(passage_ids[:2])
+    assert [item.passage_id for item in second_page.items] == list(passage_ids[2:4])
+    assert first_page.next_cursor is not None
+    assert second_page.next_cursor is not None
+    assert [len(call) for call in reranker.calls] == [3, 5]
+
+
 def test_search_passages_page_reaches_results_beyond_sparse_candidate_cap(
     migrated_postgres_engine,
 ) -> None:

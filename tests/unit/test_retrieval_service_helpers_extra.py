@@ -257,6 +257,7 @@ def test_ranked_snapshot_cache_expires_entries() -> None:
         exact=True,
         truncated=False,
         warnings=(),
+        has_more_results=False,
         now=now,
     )
 
@@ -302,6 +303,7 @@ def test_ranked_snapshot_cache_invalidates_mismatched_index_versions() -> None:
         exact=True,
         truncated=False,
         warnings=(),
+        has_more_results=False,
         now=now,
     )
 
