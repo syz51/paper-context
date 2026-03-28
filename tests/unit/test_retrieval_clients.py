@@ -84,7 +84,9 @@ def test_post_json_preserves_query_string_in_request_path(
 
     class _FakeConnection:
         def __init__(self, *, host: str, port: int | None, timeout: int) -> None:
-            del host, port, timeout
+            captured["host"] = host
+            captured["port"] = port
+            captured["timeout"] = timeout
 
         def request(
             self,
@@ -93,14 +95,16 @@ def test_post_json_preserves_query_string_in_request_path(
             body: bytes,
             headers: dict[str, str],
         ) -> None:
-            del method, body, headers
+            captured["method"] = method
             captured["url"] = url
+            captured["body"] = body
+            captured["headers"] = headers
 
         def getresponse(self) -> _FakeResponse:
             return _FakeResponse(b'{"ok": true}')
 
         def close(self) -> None:
-            return None
+            captured["closed"] = True
 
     monkeypatch.setattr(clients.http_client, "HTTPSConnection", _FakeConnection)
 
@@ -110,7 +114,18 @@ def test_post_json_preserves_query_string_in_request_path(
         payload={"query": "paper"},
     )
 
+    assert captured["host"] == "example.com"
+    assert captured["port"] is None
+    assert captured["timeout"] == 30
+    assert captured["method"] == "POST"
     assert captured["url"] == "/api?version=1"
+    assert captured["body"] == b'{"query": "paper"}'
+    headers = {
+        key.lower(): value for key, value in cast(dict[str, str], captured["headers"]).items()
+    }
+    assert headers["authorization"] == "Bearer secret"
+    assert headers["content-type"] == "application/json"
+    assert captured["closed"] is True
 
 
 def test_post_json_wraps_http_and_url_errors(monkeypatch: pytest.MonkeyPatch) -> None:

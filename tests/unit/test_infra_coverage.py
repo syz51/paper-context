@@ -174,9 +174,12 @@ def test_connection_scope_rolls_back_on_error() -> None:
     connection.in_transaction.return_value = True
     engine = MagicMock(connect=MagicMock(return_value=connection))
 
-    with pytest.raises(RuntimeError, match="boom"):
+    def raise_inside_connection_scope() -> None:
         with connection_scope(engine):
             raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        raise_inside_connection_scope()
 
     connection.rollback.assert_called_once_with()
     connection.commit.assert_not_called()

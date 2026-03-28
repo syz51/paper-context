@@ -487,29 +487,33 @@ def test_build_retrieval_service_uses_database_driven_active_index_selection(
         )
     )
     captured: dict[str, object] = {}
+    engine = object()
 
-    monkeypatch.setattr(mcp_module, "get_settings", lambda: settings)
-    monkeypatch.setattr(mcp_module, "get_engine", lambda: object())
-    monkeypatch.setattr(
-        mcp_module,
-        "connection_scope",
-        lambda engine: nullcontext(engine),
-    )
-    monkeypatch.setattr(
-        mcp_module,
-        "DeterministicEmbeddingClient",
-        lambda *, model: SimpleNamespace(provider="deterministic", model=model),
-    )
-    monkeypatch.setattr(
-        mcp_module,
-        "HeuristicRerankerClient",
-        lambda *, model: SimpleNamespace(provider="deterministic", model=model),
-    )
-    monkeypatch.setattr(
-        mcp_module,
-        "RetrievalService",
-        lambda **kwargs: captured.update(kwargs) or SimpleNamespace(),
-    )
+    def fake_get_settings() -> SimpleNamespace:
+        return settings
+
+    def fake_get_engine() -> object:
+        return engine
+
+    def fake_connection_scope(engine_obj: object):
+        return nullcontext(engine_obj)
+
+    def fake_embedding_client(*, model: str) -> SimpleNamespace:
+        return SimpleNamespace(provider="deterministic", model=model)
+
+    def fake_reranker_client(*, model: str) -> SimpleNamespace:
+        return SimpleNamespace(provider="deterministic", model=model)
+
+    def fake_retrieval_service(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(mcp_module, "get_settings", fake_get_settings)
+    monkeypatch.setattr(mcp_module, "get_engine", fake_get_engine)
+    monkeypatch.setattr(mcp_module, "connection_scope", fake_connection_scope)
+    monkeypatch.setattr(mcp_module, "DeterministicEmbeddingClient", fake_embedding_client)
+    monkeypatch.setattr(mcp_module, "HeuristicRerankerClient", fake_reranker_client)
+    monkeypatch.setattr(mcp_module, "RetrievalService", fake_retrieval_service)
 
     mcp_module._build_retrieval_service()
 
