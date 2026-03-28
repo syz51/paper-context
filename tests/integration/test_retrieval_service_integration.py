@@ -104,6 +104,21 @@ class IdentityReranker:
         ]
 
 
+class CountingReranker(IdentityReranker):
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def rerank(
+        self,
+        *,
+        query: str,
+        documents: list[str],
+        top_n: int | None = None,
+    ) -> list[RerankItem]:
+        self.calls.append(list(documents))
+        return super().rerank(query=query, documents=documents, top_n=top_n)
+
+
 def _insert_run(
     connection,
     *,
@@ -2341,6 +2356,116 @@ def test_phase3_retrieval_helpers_support_cursor_table_detail_and_passage_contex
     assert context.warnings == ("parser_fallback_used",)
 
 
+def test_search_passages_page_reuses_ranked_snapshot_for_later_pages(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    first_passage_id = uuid4()
+    second_passage_id = uuid4()
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Snapshot reuse passages",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Body",
+                heading_path=["Body"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for chunk_ordinal, passage_id in enumerate((first_passage_id, second_passage_id), start=1):
+            connection.execute(
+                insert(DocumentPassage).values(
+                    id=passage_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    chunk_ordinal=chunk_ordinal,
+                    body_text=f"Snapshot passage {chunk_ordinal}",
+                    contextualized_text=f"Snapshot passage {chunk_ordinal}",
+                    token_count=3,
+                    page_start=1,
+                    page_end=1,
+                    provenance_offsets={"pages": [1], "charspans": [[0, 10]]},
+                    artifact_id=None,
+                )
+            )
+            _insert_passage_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                passage_id=passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text="snapshot passage keyword",
+                embedding=_vector_string(12),
+            )
+
+    reranker = CountingReranker()
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+        embedding_client=FixedEmbeddingClient({"snapshot passage keyword": _vector_values(12)}),
+        reranker_client=reranker,
+    )
+
+    first_page = service.search_passages_page(query="snapshot passage keyword", limit=1)
+    second_page = service.search_passages_page(
+        query="snapshot passage keyword",
+        limit=1,
+        cursor=first_page.next_cursor,
+    )
+
+    assert len(first_page.items) == 1
+    assert len(second_page.items) == 1
+    assert {first_page.items[0].passage_id, second_page.items[0].passage_id} == {
+        first_passage_id,
+        second_passage_id,
+    }
+    assert len(reranker.calls) == 1
+
+
 def test_search_passages_page_reaches_results_beyond_sparse_candidate_cap(
     migrated_postgres_engine,
 ) -> None:
@@ -2447,6 +2572,114 @@ def test_search_passages_page_reaches_results_beyond_sparse_candidate_cap(
 
     assert tuple(seen_passage_ids) == expected_passage_ids
     assert len(seen_passage_ids) == total_passages
+
+
+def test_search_passages_page_bounded_mode_exposes_truncation_metadata(
+    migrated_postgres_engine,
+) -> None:
+    now = datetime.now(UTC)
+    document_id = uuid4()
+    revision_id = uuid4()
+    section_id = uuid4()
+    ingest_job_id = uuid4()
+    total_passages = retrieval_service_module.PASSAGE_SPARSE_CANDIDATES + 10
+
+    with migrated_postgres_engine.begin() as connection:
+        _insert_revisioned_document(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            revision_number=1,
+            title="Bounded pagination passages",
+            created_at=now,
+            updated_at=now,
+        )
+        connection.execute(
+            insert(IngestJob).values(
+                id=ingest_job_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                status="ready",
+                trigger="upload",
+                warnings=[],
+                created_at=now,
+                started_at=now,
+                finished_at=now,
+            )
+        )
+        connection.execute(
+            insert(DocumentSection).values(
+                id=section_id,
+                document_id=document_id,
+                revision_id=revision_id,
+                heading="Body",
+                heading_path=["Body"],
+                ordinal=1,
+                page_start=1,
+                page_end=1,
+            )
+        )
+        run_id = _insert_run(
+            connection,
+            document_id=document_id,
+            revision_id=revision_id,
+            ingest_job_id=ingest_job_id,
+            index_version="mvp-v2",
+            parser_source="docling",
+            is_active=True,
+            activated_at=now,
+            created_at=now,
+        )
+        for index in range(total_passages):
+            passage_id = UUID(int=20_000 + index)
+            connection.execute(
+                insert(DocumentPassage).values(
+                    id=passage_id,
+                    document_id=document_id,
+                    revision_id=revision_id,
+                    section_id=section_id,
+                    chunk_ordinal=index + 1,
+                    body_text=f"Bounded passage {index + 1}",
+                    contextualized_text=f"Bounded passage {index + 1}",
+                    token_count=3,
+                    page_start=1,
+                    page_end=1,
+                    provenance_offsets={"pages": [1], "charspans": [[0, 10]]},
+                    artifact_id=None,
+                )
+            )
+            _insert_passage_asset(
+                connection,
+                run_id=run_id,
+                revision_id=revision_id,
+                passage_id=passage_id,
+                document_id=document_id,
+                section_id=section_id,
+                publication_year=None,
+                search_text="bounded pagination keyword",
+                embedding=_vector_string(8),
+            )
+
+    service = RetrievalService(
+        connection_factory=lambda: connection_scope(migrated_postgres_engine),
+        active_index_version="mvp-v2",
+        embedding_client=FixedEmbeddingClient({"bounded pagination keyword": _vector_values(8)}),
+        reranker_client=IdentityReranker(),
+    )
+
+    page = service.search_passages_page(
+        query="bounded pagination keyword",
+        limit=2,
+        pagination_mode="bounded",
+        max_rerank_candidates=3,
+        max_expansion_rounds=1,
+    )
+
+    assert len(page.items) == 2
+    assert page.exact is False
+    assert page.truncated is True
+    assert page.warnings == ("bounded_pagination_truncated",)
+    assert page.next_cursor is not None
 
 
 def test_search_tables_page_reaches_results_beyond_sparse_candidate_cap(

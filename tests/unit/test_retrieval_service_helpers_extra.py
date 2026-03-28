@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import UUID, uuid4
@@ -220,6 +220,99 @@ def test_health_summary_reports_configuration_states() -> None:
         "reranker_provider": "stub-reranker",
         "active_index_version": "index-v2",
     }
+
+
+def test_ranked_snapshot_cache_expires_entries() -> None:
+    service = _service()
+    fingerprint = "fingerprint"
+    active_runs = _ActiveRunSelection(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    controls = service._pagination_controls(
+        mode="exact",
+        max_rerank_candidates=None,
+        max_expansion_rounds=None,
+        entity_kind="passages",
+        limit=2,
+    )
+    key = service._snapshot_key(
+        fingerprint=fingerprint,
+        entity_kind="passages",
+        controls=controls,
+        active_runs=active_runs,
+    )
+    result = service._candidate_to_passage_result(
+        _passage_candidate(
+            entity_id=uuid4(),
+            retrieval_index_run_id=uuid4(),
+            index_version="mvp-v1",
+            text="cached",
+            modes={"sparse"},
+            score_hint=0.5,
+        )
+    )
+    now = datetime.now(UTC)
+
+    service._snapshot_cache.set(
+        key,
+        results=(result,),
+        exact=True,
+        truncated=False,
+        warnings=(),
+        now=now,
+    )
+
+    assert service._snapshot_cache.get(key, now=now) is not None
+    assert (
+        service._snapshot_cache.get(
+            key,
+            now=now + timedelta(seconds=301),
+        )
+        is None
+    )
+
+
+def test_ranked_snapshot_cache_invalidates_mismatched_index_versions() -> None:
+    service = _service()
+    fingerprint = "fingerprint"
+    now = datetime.now(UTC)
+    stale_key = service._snapshot_key(
+        fingerprint=fingerprint,
+        entity_kind="passages",
+        controls=service._pagination_controls(
+            mode="exact",
+            max_rerank_candidates=None,
+            max_expansion_rounds=None,
+            entity_kind="passages",
+            limit=2,
+        ),
+        active_runs=_ActiveRunSelection(run_ids=(uuid4(),), index_versions=("mvp-v0",)),
+    )
+    result = service._candidate_to_passage_result(
+        _passage_candidate(
+            entity_id=uuid4(),
+            retrieval_index_run_id=uuid4(),
+            index_version="mvp-v0",
+            text="stale",
+            modes={"sparse"},
+            score_hint=0.5,
+        )
+    )
+    service._snapshot_cache.set(
+        stale_key,
+        results=(result,),
+        exact=True,
+        truncated=False,
+        warnings=(),
+        now=now,
+    )
+
+    service._snapshot_cache.invalidate_mismatched_index_version(
+        fingerprint=fingerprint,
+        entity_kind="passages",
+        pagination_mode="exact",
+        current_index_version="mvp-v1",
+    )
+
+    assert service._snapshot_cache.get(stale_key, now=now) is None
 
 
 def test_connection_requires_factory() -> None:
@@ -669,7 +762,7 @@ def test_certify_fused_shortlist_stops_before_sparse_exhaustion_when_boundary_is
         for index in range(8)
     ]
 
-    service._merge_candidate_batch(state=state, mode="sparse", offset=0, batch=batch)
+    service._merge_candidate_batch(state=state, mode="sparse", batch=batch)
     state.sparse_count = len(batch)
 
     shortlist = service._certify_fused_shortlist(state=state, target_count=3)
@@ -704,9 +797,9 @@ def test_certify_fused_shortlist_waits_when_partial_candidate_can_still_enter() 
         modes={"dense"},
     )
 
-    service._merge_candidate_batch(state=state, mode="sparse", offset=0, batch=sparse_batch)
+    service._merge_candidate_batch(state=state, mode="sparse", batch=sparse_batch)
     state.sparse_count = len(sparse_batch)
-    service._merge_candidate_batch(state=state, mode="dense", offset=0, batch=[dense_only])
+    service._merge_candidate_batch(state=state, mode="dense", batch=[dense_only])
     state.dense_count = 1
 
     assert service._certify_fused_shortlist(state=state, target_count=2) is None

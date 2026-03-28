@@ -116,6 +116,9 @@ class _RetrievalServiceStub:
                 ),
             ),
             next_cursor="passages-cursor",
+            exact=True,
+            truncated=False,
+            warnings=(),
         )
         preview = SimpleNamespace(
             headers=("Metric", "Value"), rows=(("Sharpe", "1.2"),), row_count=1
@@ -142,6 +145,9 @@ class _RetrievalServiceStub:
                 ),
             ),
             next_cursor="tables-cursor",
+            exact=True,
+            truncated=False,
+            warnings=(),
         )
         self.table_response = SimpleNamespace(
             table_id=self.table_id,
@@ -258,13 +264,47 @@ class _RetrievalServiceStub:
         )
 
     def search_passages_page(
-        self, *, query: str, filters, cursor: str | None = None, limit: int = 8
+        self,
+        *,
+        query: str,
+        filters,
+        cursor: str | None = None,
+        limit: int = 8,
+        pagination_mode: str = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
     ):
-        del query, filters, cursor, limit
+        del (
+            query,
+            filters,
+            cursor,
+            limit,
+            pagination_mode,
+            max_rerank_candidates,
+            max_expansion_rounds,
+        )
         return self.search_passages_response
 
-    def search_tables_page(self, *, query: str, filters, cursor: str | None = None, limit: int = 5):
-        del query, filters, cursor, limit
+    def search_tables_page(
+        self,
+        *,
+        query: str,
+        filters,
+        cursor: str | None = None,
+        limit: int = 5,
+        pagination_mode: str = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
+    ):
+        del (
+            query,
+            filters,
+            cursor,
+            limit,
+            pagination_mode,
+            max_rerank_candidates,
+            max_expansion_rounds,
+        )
         return self.search_tables_response
 
     def get_table(self, *, table_id: UUID):

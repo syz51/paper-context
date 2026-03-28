@@ -188,12 +188,23 @@ Arguments:
 - `filters`
 - `cursor`
 - `limit`
+- `pagination_mode`
+- `max_rerank_candidates`
+- `max_expansion_rounds`
+
+`pagination_mode` supports:
+
+- `exact`
+- `bounded`
 
 Returns:
 
 - `query`
 - `passages`
 - `next_cursor`
+- `exact`
+- `truncated`
+- `warnings`
 
 Each passage result includes:
 
@@ -220,12 +231,23 @@ Arguments:
 - `filters`
 - `cursor`
 - `limit`
+- `pagination_mode`
+- `max_rerank_candidates`
+- `max_expansion_rounds`
+
+`pagination_mode` supports:
+
+- `exact`
+- `bounded`
 
 Returns:
 
 - `query`
 - `tables`
 - `next_cursor`
+- `exact`
+- `truncated`
+- `warnings`
 
 Each table result includes:
 

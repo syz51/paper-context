@@ -93,8 +93,20 @@ class _RetrievalServiceStub:
         self.get_table_calls: list[UUID] = []
         self.get_passage_context_calls: list[dict[str, object]] = []
         self.build_context_pack_calls: list[dict[str, object]] = []
-        self.search_passages_response = SimpleNamespace(items=(), next_cursor="passages-cursor")
-        self.search_tables_response = SimpleNamespace(items=(), next_cursor="tables-cursor")
+        self.search_passages_response = SimpleNamespace(
+            items=(),
+            next_cursor="passages-cursor",
+            exact=True,
+            truncated=False,
+            warnings=(),
+        )
+        self.search_tables_response = SimpleNamespace(
+            items=(),
+            next_cursor="tables-cursor",
+            exact=True,
+            truncated=False,
+            warnings=(),
+        )
         self.table_response = SimpleNamespace(
             table_id=UUID("22222222-2222-2222-2222-222222222222"),
             document_id=UUID("11111111-1111-1111-1111-111111111111"),
@@ -151,16 +163,50 @@ class _RetrievalServiceStub:
         )
 
     def search_passages_page(
-        self, *, query: str, filters, cursor: str | None = None, limit: int = 8
+        self,
+        *,
+        query: str,
+        filters,
+        cursor: str | None = None,
+        limit: int = 8,
+        pagination_mode: str = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
     ):
         self.search_passages_calls.append(
-            {"query": query, "filters": filters, "cursor": cursor, "limit": limit}
+            {
+                "query": query,
+                "filters": filters,
+                "cursor": cursor,
+                "limit": limit,
+                "pagination_mode": pagination_mode,
+                "max_rerank_candidates": max_rerank_candidates,
+                "max_expansion_rounds": max_expansion_rounds,
+            }
         )
         return self.search_passages_response
 
-    def search_tables_page(self, *, query: str, filters, cursor: str | None = None, limit: int = 5):
+    def search_tables_page(
+        self,
+        *,
+        query: str,
+        filters,
+        cursor: str | None = None,
+        limit: int = 5,
+        pagination_mode: str = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
+    ):
         self.search_tables_calls.append(
-            {"query": query, "filters": filters, "cursor": cursor, "limit": limit}
+            {
+                "query": query,
+                "filters": filters,
+                "cursor": cursor,
+                "limit": limit,
+                "pagination_mode": pagination_mode,
+                "max_rerank_candidates": max_rerank_candidates,
+                "max_expansion_rounds": max_expansion_rounds,
+            }
         )
         return self.search_tables_response
 
@@ -249,8 +295,14 @@ def test_registered_mcp_tools_delegate_to_shared_services(
     assert outline_response == documents.outline_response
     assert passages_response.query == "beta"
     assert passages_response.next_cursor == "passages-cursor"
+    assert passages_response.exact is True
+    assert passages_response.truncated is False
+    assert passages_response.warnings == []
     assert tables_response.query == "gamma"
     assert tables_response.next_cursor == "tables-cursor"
+    assert tables_response.exact is True
+    assert tables_response.truncated is False
+    assert tables_response.warnings == []
     assert table_response.table_id == retrieval.table_response.table_id
     assert (
         context_response.passage.passage_id == retrieval.passage_context_response.passage.passage_id
@@ -266,6 +318,9 @@ def test_registered_mcp_tools_delegate_to_shared_services(
             "filters": RetrievalFilters(),
             "cursor": None,
             "limit": 8,
+            "pagination_mode": "exact",
+            "max_rerank_candidates": None,
+            "max_expansion_rounds": None,
         }
     ]
     assert retrieval.search_tables_calls == [
@@ -274,6 +329,9 @@ def test_registered_mcp_tools_delegate_to_shared_services(
             "filters": RetrievalFilters(),
             "cursor": None,
             "limit": 5,
+            "pagination_mode": "exact",
+            "max_rerank_candidates": None,
+            "max_expansion_rounds": None,
         }
     ]
     assert retrieval.get_table_calls == [UUID("22222222-2222-2222-2222-222222222222")]

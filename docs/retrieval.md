@@ -12,7 +12,7 @@ Every retrieval request follows the same broad sequence:
 4. run dense retrieval
 5. fuse sparse and dense candidates
 6. rerank the fused set
-7. assemble bounded result pages or context packs
+7. assemble result pages or context packs
 
 Current public filters are intentionally narrow:
 
@@ -36,8 +36,10 @@ Behavior:
 - dense search runs over passage embeddings in `retrieval_passage_assets`
 - final results return canonical `body_text`, not contextualized text
 - pagination is cursor-based and tied to query, filters, and index version
-- exact page retrieval certifies the fused shortlist needed for the requested cursor window before reranking
-- exact page retrieval advances sparse and dense candidate streams incrementally instead of refetching widened prefixes
+- exact pagination uses versioned offset cursors and rejects legacy score/entity cursors
+- sparse and dense expansion advances by search-after anchors, not SQL `OFFSET`
+- exact pagination materializes and caches a ranked snapshot for the request fingerprint so later pages can reuse the same ordered state
+- bounded pagination is explicit, opt-in, and exposes `exact`, `truncated`, and warning metadata
 
 ## Table Retrieval
 
@@ -56,13 +58,15 @@ Behavior:
 - dense search uses table embeddings in `retrieval_table_assets`
 - result previews are bounded row samples, not the full table body
 - `get_table` is the follow-up call for full structured rows
-- exact page retrieval uses the same shortlist certification and incremental candidate expansion rules as passages
+- exact and bounded pagination follow the same cursor, anchor, and snapshot rules as passages
 
 ## Fusion And Reranking
 
 Sparse and dense candidates are fused and deduplicated before reranking. Result provenance preserves whether an item matched through sparse, dense, or both modes.
 
-For exact paginated search, the service first certifies the fused shortlist required for the current cursor offset and page size, then reranks that shortlist once. This keeps the default path exact without reranking every widened prefix.
+Exact pagination now computes a stable ranked snapshot once per request fingerprint and active index version, then serves later pages from that cached ordered state until the snapshot expires or the active index version changes.
+
+Bounded pagination keeps a hard ceiling on expansion rounds and rerank candidates. When the ceiling binds, the response sets `truncated=true`, `exact=false`, and includes `bounded_pagination_truncated`.
 
 Default model settings:
 
@@ -79,7 +83,7 @@ Rules:
 
 - results in one response must not mix index versions
 - result cursors are bound to the index version that produced them
-- paginated cursors are opaque and carry the next absolute offset for exact replay of the requested window
+- paginated cursors are opaque, versioned, and carry the next absolute offset for exact replay of the requested window
 - a revision can have multiple historical runs, but one active run
 - changing model or chunking policy requires a new run and versioned activation
 
@@ -178,6 +182,13 @@ Consumers should propagate these warnings instead of hiding them.
 - `provenance`
 - `warnings`
 - `next_cursor`
+
+### Paginated search metadata
+
+- `next_cursor`
+- `exact`
+- `truncated`
+- page-level `warnings`
 
 ## Out Of Scope
 

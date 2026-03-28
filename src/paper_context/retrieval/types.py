@@ -8,6 +8,7 @@ from typing import Literal, Protocol, TypeVar
 EmbeddingInputType = Literal["query", "document"]
 RetrievalMode = Literal["sparse", "dense"]
 ContextRelationship = Literal["selected", "sibling"]
+PaginationMode = Literal["exact", "bounded"]
 
 
 class RetrievalError(RuntimeError):
@@ -218,3 +219,6 @@ class SearchPage[TResult]:
     items: tuple[TResult, ...]
     next_cursor: str | None = None
     index_version: str | None = None
+    exact: bool = True
+    truncated: bool = False
+    warnings: tuple[str, ...] = ()

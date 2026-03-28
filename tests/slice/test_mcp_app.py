@@ -106,10 +106,16 @@ class _RetrievalServiceStub:
         self.search_passages_response = search_passages_response or SimpleNamespace(
             items=(),
             next_cursor=None,
+            exact=True,
+            truncated=False,
+            warnings=(),
         )
         self.search_tables_response = search_tables_response or SimpleNamespace(
             items=(),
             next_cursor=None,
+            exact=True,
+            truncated=False,
+            warnings=(),
         )
         self.table_response = table_response
         self.passage_context_response = passage_context_response
@@ -121,16 +127,50 @@ class _RetrievalServiceStub:
         self.build_context_pack_calls: list[dict[str, object]] = []
 
     def search_passages_page(
-        self, *, query: str, filters, cursor: str | None = None, limit: int = 8
+        self,
+        *,
+        query: str,
+        filters,
+        cursor: str | None = None,
+        limit: int = 8,
+        pagination_mode: str = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
     ):
         self.search_passages_calls.append(
-            {"query": query, "filters": filters, "cursor": cursor, "limit": limit}
+            {
+                "query": query,
+                "filters": filters,
+                "cursor": cursor,
+                "limit": limit,
+                "pagination_mode": pagination_mode,
+                "max_rerank_candidates": max_rerank_candidates,
+                "max_expansion_rounds": max_expansion_rounds,
+            }
         )
         return self.search_passages_response
 
-    def search_tables_page(self, *, query: str, filters, cursor: str | None = None, limit: int = 5):
+    def search_tables_page(
+        self,
+        *,
+        query: str,
+        filters,
+        cursor: str | None = None,
+        limit: int = 5,
+        pagination_mode: str = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
+    ):
         self.search_tables_calls.append(
-            {"query": query, "filters": filters, "cursor": cursor, "limit": limit}
+            {
+                "query": query,
+                "filters": filters,
+                "cursor": cursor,
+                "limit": limit,
+                "pagination_mode": pagination_mode,
+                "max_rerank_candidates": max_rerank_candidates,
+                "max_expansion_rounds": max_expansion_rounds,
+            }
         )
         return self.search_tables_response
 
@@ -423,11 +463,18 @@ def test_mcp_mount_serves_real_streamable_http_tool_calls(
     )
     retrieval = _RetrievalServiceStub(
         search_passages_response=SimpleNamespace(
-            items=(passage_item,), next_cursor="passages-cursor-1"
+            items=(passage_item,),
+            next_cursor="passages-cursor-1",
+            exact=True,
+            truncated=False,
+            warnings=(),
         ),
         search_tables_response=SimpleNamespace(
             items=(table_item,),
             next_cursor="tables-cursor-1",
+            exact=True,
+            truncated=False,
+            warnings=(),
         ),
         table_response=TableDetailResponse(
             table_id=table_id,
@@ -533,6 +580,9 @@ def test_mcp_mount_serves_real_streamable_http_tool_calls(
                         }
                     ],
                     "next_cursor": "passages-cursor-1",
+                    "exact": True,
+                    "truncated": False,
+                    "warnings": [],
                 },
             ),
             (
@@ -566,6 +616,9 @@ def test_mcp_mount_serves_real_streamable_http_tool_calls(
                         }
                     ],
                     "next_cursor": "tables-cursor-1",
+                    "exact": True,
+                    "truncated": False,
+                    "warnings": [],
                 },
             ),
             (
@@ -617,10 +670,26 @@ def test_mcp_mount_serves_real_streamable_http_tool_calls(
         {"document_id": document_id},
     ]
     assert retrieval.search_passages_calls == [
-        {"query": "beta", "filters": RetrievalFilters(), "cursor": None, "limit": 8}
+        {
+            "query": "beta",
+            "filters": RetrievalFilters(),
+            "cursor": None,
+            "limit": 8,
+            "pagination_mode": "exact",
+            "max_rerank_candidates": None,
+            "max_expansion_rounds": None,
+        }
     ]
     assert retrieval.search_tables_calls == [
-        {"query": "gamma", "filters": RetrievalFilters(), "cursor": None, "limit": 5}
+        {
+            "query": "gamma",
+            "filters": RetrievalFilters(),
+            "cursor": None,
+            "limit": 5,
+            "pagination_mode": "exact",
+            "max_rerank_candidates": None,
+            "max_expansion_rounds": None,
+        }
     ]
     assert retrieval.get_table_calls == [table_id]
     assert retrieval.get_passage_context_calls == [

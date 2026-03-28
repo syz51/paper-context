@@ -24,7 +24,8 @@ The MVP implementation is complete enough to shift the roadmap from phase delive
 - table queries return structured table hits when relevant
 - context packs remain bounded and provenance-rich
 - one result page or pack never mixes index versions
-- exact paginated retrieval certifies and reranks only the shortlist needed for the requested page window
+- exact paginated retrieval uses versioned offset cursors, search-after candidate streaming, and ranked snapshot reuse for later pages
+- bounded pagination is explicit and discloses truncation when its cost ceiling binds
 
 ### Interface stability
 

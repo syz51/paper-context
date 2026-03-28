@@ -132,6 +132,9 @@ class PassageSearchResponse(BaseModel):
     query: str
     passages: list[PassageResultModel] = Field(default_factory=list)
     next_cursor: str | None = None
+    exact: bool = True
+    truncated: bool = False
+    warnings: list[str] = Field(default_factory=list)
 
 
 class TableResultModel(BaseModel):
@@ -157,6 +160,9 @@ class TableSearchResponse(BaseModel):
     query: str
     tables: list[TableResultModel] = Field(default_factory=list)
     next_cursor: str | None = None
+    exact: bool = True
+    truncated: bool = False
+    warnings: list[str] = Field(default_factory=list)
 
 
 class ContextPassageModel(BaseModel):

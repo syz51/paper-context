@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from fastmcp import FastMCP
 
 from paper_context.config import get_settings
@@ -71,17 +73,26 @@ def create_server(
         filters: RetrievalFiltersInput | None = None,
         cursor: str | None = None,
         limit: int = 8,
+        pagination_mode: Literal["exact", "bounded"] = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
     ) -> PassageSearchResponse:
         page = retrieval.search_passages_page(
             query=query,
             filters=_to_retrieval_filters(filters),
             cursor=cursor,
             limit=_clamp_limit(limit, maximum=8),
+            pagination_mode=pagination_mode,
+            max_rerank_candidates=max_rerank_candidates,
+            max_expansion_rounds=max_expansion_rounds,
         )
         return PassageSearchResponse(
             query=query,
             passages=[_to_passage_model(item) for item in page.items],
             next_cursor=page.next_cursor,
+            exact=page.exact,
+            truncated=page.truncated,
+            warnings=list(page.warnings),
         )
 
     @mcp.tool
@@ -90,17 +101,26 @@ def create_server(
         filters: RetrievalFiltersInput | None = None,
         cursor: str | None = None,
         limit: int = 5,
+        pagination_mode: Literal["exact", "bounded"] = "exact",
+        max_rerank_candidates: int | None = None,
+        max_expansion_rounds: int | None = None,
     ) -> TableSearchResponse:
         page = retrieval.search_tables_page(
             query=query,
             filters=_to_retrieval_filters(filters),
             cursor=cursor,
             limit=_clamp_limit(limit, maximum=5),
+            pagination_mode=pagination_mode,
+            max_rerank_candidates=max_rerank_candidates,
+            max_expansion_rounds=max_expansion_rounds,
         )
         return TableSearchResponse(
             query=query,
             tables=[_to_table_model(item) for item in page.items],
             next_cursor=page.next_cursor,
+            exact=page.exact,
+            truncated=page.truncated,
+            warnings=list(page.warnings),
         )
 
     @mcp.tool

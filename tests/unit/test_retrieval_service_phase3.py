@@ -8,7 +8,12 @@ from uuid import UUID, uuid4
 import pytest
 
 from paper_context.pagination import decode_cursor, encode_cursor, fingerprint_payload
-from paper_context.retrieval.service import RetrievalService, _ActiveRunSelection, _Candidate
+from paper_context.retrieval.service import (
+    RetrievalService,
+    _ActiveRunSelection,
+    _Candidate,
+    _PaginationComputation,
+)
 from paper_context.retrieval.types import (
     PassageResult,
     RerankItem,
@@ -80,6 +85,7 @@ def _passage_candidate(
         chunk_ordinal=1,
     )
     candidate.score = score
+    candidate.sparse_rank_score = score
     return candidate
 
 
@@ -109,6 +115,7 @@ def _table_candidate(
         preview=TablePreview(headers=("A",), rows=(("1",),), row_count=1),
     )
     candidate.score = score
+    candidate.sparse_rank_score = score
     return candidate
 
 
@@ -156,8 +163,17 @@ def test_search_passages_page_returns_cursor_bound_to_index_version() -> None:
         score=1.0,
         retrieval_index_run_id=run_id,
     )
-    service._load_certified_page_candidates = MagicMock(  # type: ignore[method-assign]
-        side_effect=[[passage_a, passage_b, passage_c], [passage_a, passage_b, passage_c]]
+    service._compute_ranked_page_results = MagicMock(  # type: ignore[method-assign]
+        return_value=_PaginationComputation(
+            results=tuple(
+                service._candidate_to_passage_result(candidate)
+                for candidate in (passage_a, passage_b, passage_c)
+            ),
+            exact=True,
+            truncated=False,
+            warnings=(),
+            stop_reason="streams_exhausted",
+        )
     )
 
     first_page = service.search_passages_page(query="alpha", limit=2)
@@ -171,14 +187,12 @@ def test_search_passages_page_returns_cursor_bound_to_index_version() -> None:
     ]
     assert first_page.next_cursor is not None
     first_cursor = decode_cursor(first_page.next_cursor)
+    assert first_cursor["cursor_version"] == 2
     assert first_cursor["index_version"] == "mvp-v1"
     assert first_cursor["kind"] == "passages"
     assert first_cursor["offset"] == 2
     assert [item.passage_id for item in second_page.items] == [passage_c.passage_id]
-    assert [
-        call.kwargs["cursor_offset"]
-        for call in service._load_certified_page_candidates.call_args_list
-    ] == [0, 2]
+    service._compute_ranked_page_results.assert_called_once()
 
 
 def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
@@ -198,8 +212,16 @@ def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
         score=2.0,
         retrieval_index_run_id=run_id,
     )
-    service._load_certified_page_candidates = MagicMock(  # type: ignore[method-assign]
-        side_effect=[[table_a, table_b], [table_a, table_b]]
+    service._compute_ranked_page_results = MagicMock(  # type: ignore[method-assign]
+        return_value=_PaginationComputation(
+            results=tuple(
+                service._candidate_to_table_result(candidate) for candidate in (table_a, table_b)
+            ),
+            exact=True,
+            truncated=False,
+            warnings=(),
+            stop_reason="streams_exhausted",
+        )
     )
 
     first_page = service.search_tables_page(query="beta", limit=1)
@@ -208,41 +230,28 @@ def test_search_tables_page_returns_cursor_bound_to_index_version() -> None:
     assert [item.table_id for item in first_page.items] == [table_a.table_id]
     assert first_page.next_cursor is not None
     first_cursor = decode_cursor(first_page.next_cursor)
+    assert first_cursor["cursor_version"] == 2
     assert first_cursor["index_version"] == "mvp-v1"
     assert first_cursor["kind"] == "tables"
     assert first_cursor["offset"] == 1
     assert [item.table_id for item in second_page.items] == [table_b.table_id]
     assert first_page.items[0].preview.headers == ("A",)
-    assert [
-        call.kwargs["cursor_offset"]
-        for call in service._load_certified_page_candidates.call_args_list
-    ] == [0, 1]
+    service._compute_ranked_page_results.assert_called_once()
 
 
-def test_search_passages_page_legacy_cursor_uses_widening_fallback() -> None:
+def test_search_passages_page_rejects_legacy_cursor() -> None:
     service = _service()
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
     service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
         return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
     )
-    passage_a = _passage(
-        passage_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
-        score=3.0,
-        retrieval_index_run_id=UUID("44444444-4444-4444-4444-444444444444"),
-    )
-    passage_b = _passage(
-        passage_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
-        score=2.0,
-        retrieval_index_run_id=UUID("44444444-4444-4444-4444-444444444444"),
-    )
-    service._load_ranked_passage_results = MagicMock(  # type: ignore[method-assign]
-        return_value=([passage_a, passage_b], 0, 0)
-    )
-    service._load_certified_page_candidates = MagicMock()  # type: ignore[method-assign]
     fingerprint = fingerprint_payload(
         {
             "kind": "passages",
             "query": "alpha",
+            "pagination_mode": "exact",
+            "max_rerank_candidates": None,
+            "max_expansion_rounds": None,
             "filters": {"document_ids": [], "publication_years": []},
         }
     )
@@ -252,18 +261,15 @@ def test_search_passages_page_legacy_cursor_uses_widening_fallback() -> None:
             "fingerprint": fingerprint,
             "index_version": "mvp-v1",
             "score": "3.0",
-            "entity_id": str(passage_a.passage_id),
+            "entity_id": str(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")),
         }
     )
 
-    page = service.search_passages_page(query="alpha", limit=1, cursor=legacy_cursor)
-
-    assert [item.passage_id for item in page.items] == [passage_b.passage_id]
-    service._load_ranked_passage_results.assert_called_once()
-    service._load_certified_page_candidates.assert_not_called()
+    with pytest.raises(RetrievalError, match="cursor is no longer supported"):
+        service.search_passages_page(query="alpha", limit=1, cursor=legacy_cursor)
 
 
-def test_search_passages_page_reranks_only_certified_shortlist() -> None:
+def test_search_passages_page_reuses_ranked_snapshot_on_later_pages() -> None:
     reranker = _RecordingReranker()
     service = _service(reranker_client=reranker)
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
@@ -276,18 +282,53 @@ def test_search_passages_page_reranks_only_certified_shortlist() -> None:
             passage_id=UUID(int=index + 1),
             retrieval_index_run_id=run_id,
         )
+        for index in range(3)
+    ]
+    service._load_sparse_passage_candidates = MagicMock(return_value=candidates)  # type: ignore[method-assign]
+
+    first_page = service.search_passages_page(query="alpha", limit=2)
+    second_page = service.search_passages_page(
+        query="alpha", limit=2, cursor=first_page.next_cursor
+    )
+
+    assert [item.passage_id for item in first_page.items] == [
+        candidates[0].passage_id,
+        candidates[1].passage_id,
+    ]
+    assert [item.passage_id for item in second_page.items] == [candidates[2].passage_id]
+    assert len(reranker.calls) == 1
+    assert len(reranker.calls[0]) == 3
+    service._load_sparse_passage_candidates.assert_called_once()
+
+
+def test_search_passages_page_bounded_mode_reranks_only_bounded_shortlist() -> None:
+    reranker = _RecordingReranker()
+    service = _service(reranker_client=reranker)
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
+    run_id = UUID("66666666-6666-6666-6666-666666666666")
+    candidates = [
+        _passage_candidate(
+            passage_id=UUID(int=index + 1),
+            retrieval_index_run_id=run_id,
+            score=float(100 - index),
+        )
         for index in range(30)
     ]
 
-    def _slice_passages(*args, **kwargs):
-        del args
-        limit = kwargs["limit"]
-        offset = kwargs["offset"]
-        return candidates[offset : offset + limit]
+    service._load_sparse_passage_candidates = MagicMock(  # type: ignore[method-assign]
+        return_value=candidates
+    )
 
-    service._load_sparse_passage_candidates = MagicMock(side_effect=_slice_passages)  # type: ignore[method-assign]
-
-    page = service.search_passages_page(query="alpha", limit=2)
+    page = service.search_passages_page(
+        query="alpha",
+        limit=2,
+        pagination_mode="bounded",
+        max_rerank_candidates=3,
+        max_expansion_rounds=1,
+    )
 
     assert [item.passage_id for item in page.items] == [
         candidates[0].passage_id,
@@ -295,14 +336,12 @@ def test_search_passages_page_reranks_only_certified_shortlist() -> None:
     ]
     assert len(reranker.calls) == 1
     assert len(reranker.calls[0]) == 3
-    assert [
-        call.kwargs["offset"] for call in service._load_sparse_passage_candidates.call_args_list
-    ] == [0]
-    assert page.next_cursor is not None
-    assert decode_cursor(page.next_cursor)["offset"] == 2
+    assert page.exact is False
+    assert page.truncated is True
+    assert page.warnings == ("bounded_pagination_truncated",)
 
 
-def test_search_tables_page_streams_sparse_expansion_with_offsets() -> None:
+def test_search_tables_page_streams_sparse_expansion_with_search_after() -> None:
     service = _service()
     service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
     service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
@@ -313,41 +352,36 @@ def test_search_tables_page_streams_sparse_expansion_with_offsets() -> None:
         _table_candidate(
             table_id=UUID(int=10_000 + index),
             retrieval_index_run_id=run_id,
+            score=float(100 - index),
         )
         for index in range(25)
     ]
 
+    first_anchor = candidates[19]
+
     def _slice_tables(*args, **kwargs):
         del args
         limit = kwargs["limit"]
-        offset = kwargs["offset"]
-        return candidates[offset : offset + limit]
+        after_score = kwargs["after_score"]
+        after_entity_id = kwargs["after_entity_id"]
+        if after_score is None:
+            return candidates[:limit]
+        assert after_score == first_anchor.sparse_rank_score
+        assert after_entity_id == first_anchor.entity_id
+        return candidates[20 : 20 + limit]
 
     service._load_sparse_table_candidates = MagicMock(side_effect=_slice_tables)  # type: ignore[method-assign]
-    fingerprint = fingerprint_payload(
-        {
-            "kind": "tables",
-            "query": "beta",
-            "filters": {"document_ids": [], "publication_years": []},
-        }
-    )
-    cursor = encode_cursor(
-        {
-            "kind": "tables",
-            "fingerprint": fingerprint,
-            "index_version": "mvp-v1",
-            "offset": 20,
-        }
-    )
+    page = service.search_tables_page(query="beta", limit=1)
 
-    page = service.search_tables_page(query="beta", limit=1, cursor=cursor)
-
-    assert [item.table_id for item in page.items] == [candidates[20].table_id]
+    assert [item.table_id for item in page.items] == [candidates[0].table_id]
     assert [
-        call.kwargs["offset"] for call in service._load_sparse_table_candidates.call_args_list
-    ] == [0, 20]
+        call.kwargs["after_score"] for call in service._load_sparse_table_candidates.call_args_list
+    ] == [
+        None,
+        first_anchor.sparse_rank_score,
+    ]
     assert page.next_cursor is not None
-    assert decode_cursor(page.next_cursor)["offset"] == 21
+    assert decode_cursor(page.next_cursor)["offset"] == 1
 
 
 def test_get_table_returns_full_structured_payload() -> None:
@@ -531,15 +565,18 @@ def test_paginate_ranked_results_rejects_bad_cursor_variants() -> None:
             cursor="not-a-valid-cursor",
             active_runs=active_runs,
             fingerprint="fingerprint",
+            exact=True,
+            truncated=False,
+            warnings=(),
         )
 
     mismatched_cursor = encode_cursor(
         {
+            "cursor_version": 2,
             "kind": "tables",
             "fingerprint": "fingerprint",
             "index_version": "mvp-v1",
-            "score": "2.0",
-            "entity_id": str(results[0].passage_id),
+            "offset": 0,
         }
     )
     with pytest.raises(RetrievalError, match="cursor does not match request"):
@@ -550,15 +587,18 @@ def test_paginate_ranked_results_rejects_bad_cursor_variants() -> None:
             cursor=mismatched_cursor,
             active_runs=active_runs,
             fingerprint="fingerprint",
+            exact=True,
+            truncated=False,
+            warnings=(),
         )
 
     stale_cursor = encode_cursor(
         {
+            "cursor_version": 2,
             "kind": "passages",
             "fingerprint": "fingerprint",
             "index_version": "mvp-v0",
-            "score": "2.0",
-            "entity_id": str(results[0].passage_id),
+            "offset": 0,
         }
     )
     with pytest.raises(RetrievalError, match="index version is no longer active"):
@@ -569,10 +609,14 @@ def test_paginate_ranked_results_rejects_bad_cursor_variants() -> None:
             cursor=stale_cursor,
             active_runs=active_runs,
             fingerprint="fingerprint",
+            exact=True,
+            truncated=False,
+            warnings=(),
         )
 
     invalid_offset_cursor = encode_cursor(
         {
+            "cursor_version": 2,
             "kind": "passages",
             "fingerprint": "fingerprint",
             "index_version": "mvp-v1",
@@ -587,4 +631,7 @@ def test_paginate_ranked_results_rejects_bad_cursor_variants() -> None:
             cursor=invalid_offset_cursor,
             active_runs=active_runs,
             fingerprint="fingerprint",
+            exact=True,
+            truncated=False,
+            warnings=(),
         )

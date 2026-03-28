@@ -18,5 +18,8 @@
       "warnings": ["parser_fallback_used"]
     }
   ],
-  "next_cursor": "passages-cursor"
+  "next_cursor": "passages-cursor",
+  "exact": true,
+  "truncated": false,
+  "warnings": []
 }
