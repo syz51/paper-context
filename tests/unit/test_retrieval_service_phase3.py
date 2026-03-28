@@ -301,6 +301,50 @@ def test_search_passages_page_reuses_ranked_snapshot_on_later_pages() -> None:
     service._load_sparse_passage_candidates.assert_called_once()
 
 
+def test_search_passages_page_exact_mode_certifies_before_rerank() -> None:
+    reranker = _RecordingReranker()
+    service = _service(reranker_client=reranker)
+    service._resolve_filtered_document_ids = MagicMock(return_value=None)  # type: ignore[method-assign]
+    service._resolve_active_run_selection = MagicMock(  # type: ignore[method-assign]
+        return_value=SimpleNamespace(run_ids=(uuid4(),), index_versions=("mvp-v1",))
+    )
+    run_id = UUID("12121212-1212-1212-1212-121212121212")
+    candidates = [
+        _passage_candidate(
+            passage_id=UUID(int=index + 1),
+            retrieval_index_run_id=run_id,
+            score=float(100 - index),
+        )
+        for index in range(6)
+    ]
+    service._load_sparse_passage_candidates = MagicMock(  # type: ignore[method-assign]
+        return_value=candidates
+    )
+    certified_lengths: list[int] = []
+    certify_shortlist = service._certify_fused_shortlist
+
+    def _record_certify(*, state, target_count):
+        assert reranker.calls == []
+        shortlist = certify_shortlist(state=state, target_count=target_count)
+        assert shortlist is not None
+        certified_lengths.append(len(shortlist))
+        return shortlist
+
+    service._certify_fused_shortlist = MagicMock(side_effect=_record_certify)  # type: ignore[method-assign]
+
+    page = service.search_passages_page(query="alpha", limit=2)
+
+    assert [item.passage_id for item in page.items] == [
+        candidates[0].passage_id,
+        candidates[1].passage_id,
+    ]
+    assert certified_lengths == [len(candidates)]
+    assert len(reranker.calls) == 1
+    assert len(reranker.calls[0]) == certified_lengths[0]
+    assert page.exact is True
+    assert page.truncated is False
+
+
 def test_search_passages_page_bounded_mode_reranks_only_bounded_shortlist() -> None:
     reranker = _RecordingReranker()
     service = _service(reranker_client=reranker)

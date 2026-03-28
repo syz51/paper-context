@@ -805,6 +805,87 @@ def test_certify_fused_shortlist_waits_when_partial_candidate_can_still_enter() 
     assert service._certify_fused_shortlist(state=state, target_count=2) is None
 
 
+def test_certify_fused_shortlist_waits_when_unseen_dense_candidate_can_tie_boundary() -> None:
+    service = _service(reranker_client=None)
+    run_id = uuid4()
+    state = _CandidateExpansionState(sparse_exhausted=True)
+    sparse_batch = [
+        _passage_candidate(
+            entity_id=UUID(int=index + 1),
+            retrieval_index_run_id=run_id,
+            index_version="mvp-v1",
+            text=f"sparse-{index}",
+            modes={"sparse"},
+        )
+        for index in range(2)
+    ]
+
+    service._merge_candidate_batch(state=state, mode="sparse", batch=sparse_batch)
+    state.sparse_count = len(sparse_batch)
+    state.dense_count = 1
+
+    assert service._certify_fused_shortlist(state=state, target_count=2) is None
+
+
+def test_candidate_limits_expand_for_rerank_budget_and_filtered_dense_queries() -> None:
+    service = _service(reranker_client=None)
+
+    assert service._initial_sparse_candidate_limit(base_limit=20, result_limit=None) == 20
+    assert service._initial_sparse_candidate_limit(base_limit=20, result_limit=8) == 32
+    assert (
+        service._initial_dense_candidate_limit(
+            base_limit=20,
+            result_limit=8,
+            filtered_document_ids=None,
+        )
+        == 32
+    )
+    assert (
+        service._initial_dense_candidate_limit(
+            base_limit=20,
+            result_limit=8,
+            filtered_document_ids=(uuid4(),),
+        )
+        == 64
+    )
+
+
+def test_candidate_fused_score_upper_bound_accounts_for_missing_streams() -> None:
+    service = _service(reranker_client=None)
+    candidate = _passage_candidate(
+        entity_id=uuid4(),
+        retrieval_index_run_id=uuid4(),
+        index_version="mvp-v1",
+        text="candidate",
+        modes={"sparse"},
+        score_hint=0.5,
+    )
+    active_state = _CandidateExpansionState(
+        sparse_count=3,
+        dense_count=5,
+        sparse_exhausted=False,
+        dense_exhausted=False,
+    )
+    exhausted_state = _CandidateExpansionState(
+        sparse_count=3,
+        dense_count=5,
+        sparse_exhausted=True,
+        dense_exhausted=True,
+    )
+
+    assert service._candidate_fused_score_upper_bound(
+        candidate=candidate,
+        state=active_state,
+    ) == pytest.approx(0.5 + service._rrf_rank_score(6))
+    assert service._candidate_fused_score_upper_bound(
+        candidate=candidate,
+        state=exhausted_state,
+    ) == pytest.approx(0.5)
+    assert service._unseen_fused_score_upper_bound(state=active_state) == pytest.approx(
+        service._rrf_rank_score(4) + service._rrf_rank_score(6)
+    )
+
+
 def test_row_and_result_conversions_round_trip() -> None:
     passage_row = {
         "passage_id": uuid4(),

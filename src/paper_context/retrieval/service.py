@@ -2059,7 +2059,13 @@ class RetrievalService:
                     break
 
         if ordered_candidates is None:
-            ordered_candidates = self._ordered_fused_candidates(state.candidates.values())
+            if controls.mode == "exact":
+                ordered_candidates = self._certify_fused_shortlist(
+                    state=state,
+                    target_count=len(state.candidates),
+                )
+            if ordered_candidates is None:
+                ordered_candidates = self._ordered_fused_candidates(state.candidates.values())
         truncated = False
         if (
             controls.mode == "bounded"
