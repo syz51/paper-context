@@ -15,6 +15,7 @@ dependencies = [
 	"fastmcp>=3.1.1",
 	"orjson>=3.10,<4.0",
 	"pdfplumber>=0.11.9",
+	"pygments",
 	"psycopg[binary]>=3.2,<4.0",
 	"pydantic-settings>=2.7,<3.0",
 	"python-multipart>=0.0.20,<1.0",
@@ -36,6 +37,9 @@ dev = [
 
 [project.scripts]
 paper-context = "paper_context.cli:main"
+
+[tool.uv.sources]
+pygments = { git = "https://github.com/pygments/pygments", rev = "24b8aa76c6cd6d70f39c6dd605cce319c98e2ccc" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/paper_context"]
